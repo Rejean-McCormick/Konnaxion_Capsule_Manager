@@ -19,11 +19,18 @@ profile:
   default: false
 
 network:
-  profile: private_tunnel
+  network_profile: private_tunnel
   exposure_mode: vpn
   public_mode_enabled: false
   public_mode_duration_hours: null
   public_mode_expires_at: null
+
+exposure:
+  mode: vpn
+  public_allowed: false
+  requires_expiration: false
+  tunnel_required: true
+  tunnel_public: false
 
 host:
   bind_address: "0.0.0.0"
@@ -38,6 +45,8 @@ host:
     - 6379
     - 5555
     - 8000
+    - 2375
+    - 2376
 
 routing:
   entrypoint: traefik
@@ -46,6 +55,21 @@ routing:
     "/api/": django-api
     "/admin/": django-api
     "/media/": media-nginx
+
+entrypoints:
+  traefik:
+    enabled: true
+    public: false
+    vpn: true
+    ports:
+      http:
+        port: 80
+        enabled: true
+        optional: true
+        redirect_to_https: true
+      https:
+        port: 443
+        enabled: true
 
 tunnel:
   required: true
@@ -109,21 +133,40 @@ docker:
     - celerybeat
     - flower
     - media-nginx
+    - kx-agent
   forbidden:
     privileged_containers: true
     host_network: true
     docker_socket_mount: true
     unknown_images: true
 
+canonical_env:
+  KX_NETWORK_PROFILE: private_tunnel
+  KX_EXPOSURE_MODE: vpn
+  KX_PUBLIC_MODE_ENABLED: "false"
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_REQUIRE_SIGNED_CAPSULE: "true"
+  KX_GENERATE_SECRETS_ON_INSTALL: "true"
+  KX_ALLOW_UNKNOWN_IMAGES: "false"
+  KX_ALLOW_PRIVILEGED_CONTAINERS: "false"
+  KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
+  KX_ALLOW_HOST_NETWORK: "false"
+  KX_BACKUP_ENABLED: "true"
+  KX_HOST: ""
+
 environment:
   KX_NETWORK_PROFILE: private_tunnel
   KX_EXPOSURE_MODE: vpn
   KX_PUBLIC_MODE_ENABLED: "false"
   KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_REQUIRE_SIGNED_CAPSULE: "true"
+  KX_GENERATE_SECRETS_ON_INSTALL: "true"
   KX_ALLOW_UNKNOWN_IMAGES: "false"
   KX_ALLOW_PRIVILEGED_CONTAINERS: "false"
   KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
   KX_ALLOW_HOST_NETWORK: "false"
+  KX_BACKUP_ENABLED: "true"
+  KX_HOST: ""
 
 security_gate:
   required: true
@@ -144,6 +187,20 @@ security_gate:
     - firewall_enabled
     - admin_surface_private
     - backup_configured
+  warn_checks:
+    - firewall_enabled
+    - admin_surface_private
+    - backup_configured
+
+backup:
+  enabled: true
+  root: /opt/konnaxion/backups
+  retention:
+    daily_days: 14
+    weekly_weeks: 8
+    monthly_months: 12
+    pre_update_count: 5
+    pre_restore_count: 5
 
 operator_notes:
   - Use this profile for authenticated VPN/private tunnel access only.

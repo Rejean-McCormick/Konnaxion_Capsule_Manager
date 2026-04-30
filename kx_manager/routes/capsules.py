@@ -12,27 +12,49 @@ Canonical responsibilities exposed here:
 - verify a capsule before import/start
 - import a signed ``.kxcap`` file through the Agent
 - delete or forget capsule records when the Agent allows it
+
+Important implementation note:
+This module intentionally does not use FastAPI ``File`` or ``UploadFile``.
+Those require ``python-multipart`` at route-registration time. Instead, the
+import route accepts the raw request body as bytes and reads the capsule
+filename from query/header metadata.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import unquote
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kx_shared.konnaxion_constants import (
     CAPSULE_EXTENSION,
     DEFAULT_CHANNEL,
-    DEFAULT_NETWORK_PROFILE,
     DEFAULT_EXPOSURE_MODE,
+    DEFAULT_NETWORK_PROFILE,
+    ExposureMode,
     NetworkProfile,
 )
 
 
 router = APIRouter(prefix="/capsules", tags=["capsules"])
+
+
+SAFE_CAPSULE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+CONTENT_DISPOSITION_FILENAME_RE = re.compile(
+    r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?',
+    re.IGNORECASE,
+)
+
+
+def enum_value(value: Any) -> str:
+    """Return `.value` for enum-like values, otherwise string."""
+
+    return str(getattr(value, "value", value))
 
 
 class AgentClientProtocol(Protocol):
@@ -90,235 +112,420 @@ class CapsuleDetail(CapsuleSummary):
 class CapsuleVerifyRequest(BaseModel):
     """Request to verify a capsule path known to the Agent."""
 
-    path: str = Field(..., min_length=1)
+    capsule_path: str = Field(..., min_length=1)
 
-    @field_validator("path")
+    @field_validator("capsule_path")
     @classmethod
-    def validate_capsule_extension(cls, value: str) -> str:
-        """Require the canonical ``.kxcap`` extension."""
-
-        if not value.endswith(CAPSULE_EXTENSION):
-            raise ValueError(f"capsule path must end with {CAPSULE_EXTENSION}")
+    def validate_capsule_path(cls, value: str) -> str:
+        path = Path(value)
+        if path.suffix != CAPSULE_EXTENSION:
+            raise ValueError(f"Capsule path must end with {CAPSULE_EXTENSION}")
         return value
 
 
 class CapsuleVerifyResponse(BaseModel):
-    """Verification result returned by the Agent."""
+    """Verification result returned by the Manager API."""
 
-    ok: bool
+    model_config = ConfigDict(extra="allow")
+
+    ok: bool = False
+    valid: bool = False
     capsule_id: str | None = None
     capsule_version: str | None = None
-    signature_status: str | None = None
-    checksum_status: str | None = None
-    manifest_status: str | None = None
+    filename: str | None = None
+    signed: bool | None = None
+    checksums_valid: bool | None = None
+    manifest_valid: bool | None = None
     security_status: str | None = None
-    errors: list[str] = Field(default_factory=list)
+    errors: list[Any] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
 class CapsuleImportResponse(BaseModel):
-    """Import result returned after Agent-side capsule import."""
+    """Capsule import response returned by the Manager API."""
 
-    ok: bool
-    capsule_id: str
-    capsule_version: str | None = None
-    imported: bool = True
-    verified: bool = True
-    message: str | None = None
-    warnings: list[str] = Field(default_factory=list)
+    model_config = ConfigDict(extra="allow")
+
+    ok: bool = True
+    capsule: CapsuleSummary | None = None
+    capsule_id: str | None = None
+    action_id: str | None = None
+    message: str = "Capsule import accepted."
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 class CapsuleDeleteResponse(BaseModel):
-    """Delete/forget result."""
+    """Capsule delete/forget response."""
 
-    ok: bool
+    model_config = ConfigDict(extra="allow")
+
+    ok: bool = True
     capsule_id: str
-    deleted: bool = False
-    message: str | None = None
-
-
-class CapsuleImportOptions(BaseModel):
-    """Import options normalized by the route layer."""
-
-    channel: str = DEFAULT_CHANNEL
-    network_profile: str = Field(default_factory=lambda: DEFAULT_NETWORK_PROFILE.value)
-    exposure_mode: str = Field(default_factory=lambda: DEFAULT_EXPOSURE_MODE.value)
-
-    @field_validator("network_profile")
-    @classmethod
-    def validate_network_profile(cls, value: str) -> str:
-        """Require a canonical network profile."""
-
-        allowed = {profile.value for profile in NetworkProfile}
-        if value not in allowed:
-            raise ValueError(
-                f"network_profile must be one of: {', '.join(sorted(allowed))}"
-            )
-        return value
-
-
-def _agent(request: Request) -> AgentClientProtocol:
-    """Return the configured Agent client or raise a clear API error."""
-
-    client = getattr(request.app.state, "agent_client", None)
-    if client is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Konnaxion Agent client is not configured",
-        )
-    return client
-
-
-def _ensure_kxcap_filename(filename: str | None) -> str:
-    """Validate uploaded capsule filename."""
-
-    if not filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="capsule filename is required",
-        )
-
-    clean_name = Path(filename).name
-    if not clean_name.endswith(CAPSULE_EXTENSION):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"capsule file must use the canonical {CAPSULE_EXTENSION} extension",
-        )
-
-    return clean_name
-
-
-def _agent_error(exc: Exception) -> HTTPException:
-    """Convert lower-level Agent/client failures to HTTP errors."""
-
-    message = str(exc) or exc.__class__.__name__
-    lowered = message.lower()
-
-    if "not found" in lowered:
-        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message)
-
-    if "signature" in lowered or "checksum" in lowered or "security" in lowered:
-        return HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=message,
-        )
-
-    if "forbidden" in lowered or "not allowed" in lowered:
-        return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=message)
-
-    return HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        detail=f"Konnaxion Agent request failed: {message}",
-    )
+    message: str = "Capsule delete accepted."
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("", response_model=list[CapsuleSummary])
-async def list_capsules(request: Request) -> list[Mapping[str, Any]]:
-    """List capsules already imported into the local Manager/Agent state."""
+@router.get("/", response_model=list[CapsuleSummary])
+async def list_capsules(request: Request) -> list[CapsuleSummary]:
+    """List imported Konnaxion Capsules."""
 
-    try:
-        return await _agent(request).list_capsules()
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - boundary wrapper
-        raise _agent_error(exc) from exc
+    agent = get_agent_client(request)
+    payload = await agent.list_capsules()
+
+    if not isinstance(payload, list):
+        raise agent_response_error("Agent list_capsules response must be a list.")
+
+    return [CapsuleSummary(**as_mapping(item)) for item in payload]
 
 
 @router.get("/{capsule_id}", response_model=CapsuleDetail)
-async def get_capsule(capsule_id: str, request: Request) -> Mapping[str, Any]:
-    """Return details for one imported capsule."""
+async def get_capsule(
+    capsule_id: str,
+    request: Request,
+) -> CapsuleDetail:
+    """Return metadata for one imported Konnaxion Capsule."""
 
-    try:
-        return await _agent(request).get_capsule(capsule_id)
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - boundary wrapper
-        raise _agent_error(exc) from exc
+    capsule_id = validate_capsule_id(capsule_id)
+    agent = get_agent_client(request)
+
+    payload = await agent.get_capsule(capsule_id)
+    return CapsuleDetail(**as_mapping(payload))
 
 
 @router.post("/verify", response_model=CapsuleVerifyResponse)
 async def verify_capsule(
-    payload: CapsuleVerifyRequest,
+    request_body: CapsuleVerifyRequest,
     request: Request,
-) -> Mapping[str, Any]:
-    """Verify a capsule path already readable by the Agent.
+) -> CapsuleVerifyResponse:
+    """Verify a capsule path already available to the Agent."""
 
-    Upload verification should use ``POST /capsules/import`` because uploaded
-    bytes must be handed to the Agent before verification.
-    """
+    agent = get_agent_client(request)
+    payload = await agent.verify_capsule_path(request_body.capsule_path)
 
-    try:
-        return await _agent(request).verify_capsule_path(payload.path)
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - boundary wrapper
-        raise _agent_error(exc) from exc
+    data = as_mapping(payload)
+    data.setdefault("ok", bool(data.get("valid", False)))
+    data.setdefault("valid", bool(data.get("ok", False)))
+
+    return CapsuleVerifyResponse(**data)
 
 
-@router.post("/import", response_model=CapsuleImportResponse)
+@router.post(
+    "/import",
+    response_model=CapsuleImportResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def import_capsule(
     request: Request,
-    file: UploadFile = File(...),
-    channel: str = DEFAULT_CHANNEL,
-    network_profile: str = DEFAULT_NETWORK_PROFILE.value,
-    exposure_mode: str = DEFAULT_EXPOSURE_MODE.value,
-) -> Mapping[str, Any]:
-    """Import a signed ``.kxcap`` upload through the Konnaxion Agent."""
+    filename: str | None = Query(
+        default=None,
+        description=(
+            "Capsule filename. Required unless X-KX-Filename or "
+            "Content-Disposition filename is provided."
+        ),
+    ),
+    channel: str = Query(default=DEFAULT_CHANNEL),
+    network_profile: str = Query(default=enum_value(DEFAULT_NETWORK_PROFILE)),
+    exposure_mode: str = Query(default=enum_value(DEFAULT_EXPOSURE_MODE)),
+) -> CapsuleImportResponse:
+    """
+    Import an uploaded signed `.kxcap` through the Agent.
 
-    filename = _ensure_kxcap_filename(file.filename)
+    The request body must be the raw `.kxcap` bytes.
 
-    try:
-        options = CapsuleImportOptions(
-            channel=channel,
-            network_profile=network_profile,
-            exposure_mode=exposure_mode,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
+    Filename resolution order:
+    1. `filename` query parameter
+    2. `X-KX-Filename` request header
+    3. `Content-Disposition` filename
+    """
 
-    content = await file.read()
+    resolved_filename = resolve_upload_filename(request, filename)
+    validate_capsule_filename(resolved_filename)
+
+    normalized_channel = validate_channel(channel)
+    normalized_network_profile = validate_network_profile(network_profile)
+    normalized_exposure_mode = validate_exposure_mode(exposure_mode)
+
+    content = await request.body()
     if not content:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="uploaded capsule is empty",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "empty_capsule_upload",
+                "message": "Capsule import body cannot be empty.",
+            },
         )
 
-    try:
-        return await _agent(request).import_capsule_upload(
-            filename=filename,
-            content=content,
-            channel=options.channel,
-            network_profile=options.network_profile,
-            exposure_mode=options.exposure_mode,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - boundary wrapper
-        raise _agent_error(exc) from exc
+    agent = get_agent_client(request)
+
+    payload = await agent.import_capsule_upload(
+        filename=resolved_filename,
+        content=content,
+        channel=normalized_channel,
+        network_profile=normalized_network_profile,
+        exposure_mode=normalized_exposure_mode,
+    )
+
+    data = as_mapping(payload)
+    data.setdefault("ok", True)
+    data.setdefault("message", "Capsule import accepted.")
+
+    if data.get("capsule") is not None and not isinstance(data["capsule"], CapsuleSummary):
+        data["capsule"] = CapsuleSummary(**as_mapping(data["capsule"]))
+
+    return CapsuleImportResponse(**data)
 
 
 @router.delete("/{capsule_id}", response_model=CapsuleDeleteResponse)
-async def delete_capsule(capsule_id: str, request: Request) -> Mapping[str, Any]:
+async def delete_capsule(
+    capsule_id: str,
+    request: Request,
+) -> CapsuleDeleteResponse:
     """Delete or forget an imported capsule through the Agent."""
 
+    capsule_id = validate_capsule_id(capsule_id)
+    agent = get_agent_client(request)
+
+    payload = await agent.delete_capsule(capsule_id)
+    data = as_mapping(payload)
+
+    data.setdefault("ok", True)
+    data.setdefault("capsule_id", capsule_id)
+    data.setdefault("message", "Capsule delete accepted.")
+
+    return CapsuleDeleteResponse(**data)
+
+
+def get_agent_client(request: Request) -> AgentClientProtocol:
+    """Return the Agent client attached to the FastAPI app state."""
+
+    agent = getattr(request.app.state, "agent_client", None)
+
+    if agent is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "ok": False,
+                "error": "agent_client_missing",
+                "message": (
+                    "Konnaxion Agent client is not attached to "
+                    "request.app.state.agent_client."
+                ),
+            },
+        )
+
+    return agent
+
+
+def resolve_upload_filename(request: Request, explicit_filename: str | None) -> str:
+    """Resolve a raw-body upload filename from query/header metadata."""
+
+    if explicit_filename:
+        return explicit_filename.strip()
+
+    header_filename = request.headers.get("X-KX-Filename")
+    if header_filename:
+        return header_filename.strip()
+
+    content_disposition = request.headers.get("Content-Disposition", "")
+    match = CONTENT_DISPOSITION_FILENAME_RE.search(content_disposition)
+    if match:
+        return unquote(match.group(1)).strip()
+
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "ok": False,
+            "error": "missing_capsule_filename",
+            "message": (
+                "Capsule filename is required. Provide ?filename=..., "
+                "X-KX-Filename, or Content-Disposition filename."
+            ),
+        },
+    )
+
+
+def validate_capsule_filename(filename: str) -> str:
+    """Validate a user-supplied capsule filename."""
+
+    normalized = filename.strip().replace("\\", "/")
+    basename = normalized.rsplit("/", maxsplit=1)[-1]
+
+    if not basename:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_capsule_filename",
+                "message": "Capsule filename cannot be empty.",
+            },
+        )
+
+    if basename != filename.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_capsule_filename",
+                "message": "Capsule filename must not include directories.",
+            },
+        )
+
+    if not basename.endswith(CAPSULE_EXTENSION):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_capsule_extension",
+                "message": f"Capsule filename must end with {CAPSULE_EXTENSION}.",
+            },
+        )
+
+    forbidden_tokens = ("..", "/", "\\", "\x00", "$", "`", ";", "|", "&")
+    if any(token in basename for token in forbidden_tokens):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "unsafe_capsule_filename",
+                "message": "Capsule filename contains a forbidden token.",
+            },
+        )
+
+    return basename
+
+
+def validate_capsule_id(capsule_id: str) -> str:
+    """Validate a capsule ID used in route path parameters."""
+
+    normalized = capsule_id.strip()
+
+    if normalized.endswith(CAPSULE_EXTENSION):
+        normalized = normalized[: -len(CAPSULE_EXTENSION)]
+
+    if not SAFE_CAPSULE_ID_RE.fullmatch(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_capsule_id",
+                "message": (
+                    "Capsule ID may only contain letters, numbers, dots, "
+                    "underscores, and hyphens."
+                ),
+            },
+        )
+
+    return normalized
+
+
+def validate_channel(channel: str) -> str:
+    """Validate a capsule channel value."""
+
+    normalized = channel.strip() or DEFAULT_CHANNEL
+
+    if not SAFE_CAPSULE_ID_RE.fullmatch(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_channel",
+                "message": (
+                    "Channel may only contain letters, numbers, dots, "
+                    "underscores, and hyphens."
+                ),
+            },
+        )
+
+    return normalized
+
+
+def validate_network_profile(value: str) -> str:
+    """Validate a canonical network profile."""
+
+    normalized = value.strip() or enum_value(DEFAULT_NETWORK_PROFILE)
+
     try:
-        return await _agent(request).delete_capsule(capsule_id)
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - boundary wrapper
-        raise _agent_error(exc) from exc
+        return NetworkProfile(normalized).value
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in NetworkProfile)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_network_profile",
+                "message": f"Invalid network profile. Allowed: {allowed}.",
+            },
+        ) from exc
+
+
+def validate_exposure_mode(value: str) -> str:
+    """Validate a canonical exposure mode."""
+
+    normalized = value.strip() or enum_value(DEFAULT_EXPOSURE_MODE)
+
+    try:
+        return ExposureMode(normalized).value
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in ExposureMode)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_exposure_mode",
+                "message": f"Invalid exposure mode. Allowed: {allowed}.",
+            },
+        ) from exc
+
+
+def as_mapping(value: Any) -> dict[str, Any]:
+    """Normalize an Agent response object into a dictionary."""
+
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+
+    if isinstance(value, Mapping):
+        return dict(value)
+
+    raise agent_response_error("Agent response must be a JSON object.")
+
+
+def agent_response_error(message: str) -> HTTPException:
+    """Return a 502 error for invalid Agent response contracts."""
+
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail={
+            "ok": False,
+            "error": "invalid_agent_response",
+            "message": message,
+        },
+    )
 
 
 __all__ = [
+    "AgentClientProtocol",
     "CapsuleDeleteResponse",
     "CapsuleDetail",
-    "CapsuleImportOptions",
     "CapsuleImportResponse",
     "CapsuleSummary",
     "CapsuleVerifyRequest",
     "CapsuleVerifyResponse",
+    "agent_response_error",
+    "as_mapping",
+    "delete_capsule",
+    "enum_value",
+    "get_agent_client",
+    "get_capsule",
+    "import_capsule",
+    "list_capsules",
+    "resolve_upload_filename",
     "router",
+    "validate_capsule_filename",
+    "validate_capsule_id",
+    "validate_channel",
+    "validate_exposure_mode",
+    "validate_network_profile",
+    "verify_capsule",
 ]

@@ -158,11 +158,19 @@ class PolicyReport:
 
     @property
     def blocking_findings(self) -> tuple[PolicyFinding, ...]:
-        return tuple(finding for finding in self.findings if finding.severity == PolicySeverity.BLOCK.value)
+        return tuple(
+            finding
+            for finding in self.findings
+            if finding.severity == PolicySeverity.BLOCK.value
+        )
 
     @property
     def warnings(self) -> tuple[PolicyFinding, ...]:
-        return tuple(finding for finding in self.findings if finding.severity == PolicySeverity.WARN.value)
+        return tuple(
+            finding
+            for finding in self.findings
+            if finding.severity == PolicySeverity.WARN.value
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -201,12 +209,15 @@ class RuntimeSecurityPolicy:
         int(ALLOWED_ENTRY_PORTS["http_redirect"]),
         int(ALLOWED_ENTRY_PORTS["https"]),
     )
-    forbidden_public_ports: tuple[int, ...] = tuple(sorted(int(port) for port in FORBIDDEN_PUBLIC_PORTS))
+    forbidden_public_ports: tuple[int, ...] = tuple(
+        sorted(int(port) for port in FORBIDDEN_PUBLIC_PORTS)
+    )
     canonical_services: tuple[str, ...] = tuple(CANONICAL_DOCKER_SERVICES)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "RuntimeSecurityPolicy":
         """Build policy from KX_* environment values."""
+
         merged = dict(KX_ENV_DEFAULTS)
         if env:
             merged.update({key: str(value) for key, value in env.items()})
@@ -302,6 +313,8 @@ INTERNAL_ONLY_SERVICES = frozenset(
 
 
 def enum_value(value: Any) -> str:
+    """Return enum .value when available, otherwise stable string."""
+
     if isinstance(value, Enum):
         return str(value.value)
     return str(value)
@@ -309,6 +322,7 @@ def enum_value(value: Any) -> str:
 
 def parse_bool(value: Any, *, default: bool, field_name: str = "value") -> bool:
     """Parse common boolean environment string values."""
+
     if value is None:
         return default
 
@@ -326,6 +340,7 @@ def parse_bool(value: Any, *, default: bool, field_name: str = "value") -> bool:
 
 def make_report(findings: Iterable[PolicyFinding]) -> PolicyReport:
     """Create an aggregate report from findings."""
+
     collected = tuple(findings)
     accepted = not any(finding.severity == PolicySeverity.BLOCK.value for finding in collected)
 
@@ -350,6 +365,7 @@ def finding(
     status: SecurityGateStatus | str | None = None,
 ) -> PolicyFinding:
     """Create a normalized policy finding."""
+
     sev = enum_value(severity)
     default_status = (
         SecurityGateStatus.FAIL_BLOCKING.value
@@ -379,6 +395,7 @@ def parse_compose_port(port: Any) -> tuple[int | None, int | None]:
         {"published": 443, "target": 443}
         {"mode": "host", "published": "443", "target": "443"}
     """
+
     if isinstance(port, Mapping):
         published = port.get("published")
         target = port.get("target")
@@ -412,6 +429,7 @@ def validate_network_exposure_policy(
     public_mode_expires_at: str | None = None,
 ) -> PolicyReport:
     """Validate network profile and exposure mode compatibility."""
+
     profile = enum_value(network_profile)
     exposure = enum_value(exposure_mode)
     findings: list[PolicyFinding] = []
@@ -448,7 +466,11 @@ def validate_network_exposure_policy(
             )
         )
 
-    if public_mode_enabled and not public_mode_expires_at and profile == NetworkProfile.PUBLIC_TEMPORARY.value:
+    if (
+        public_mode_enabled
+        and not public_mode_expires_at
+        and profile == NetworkProfile.PUBLIC_TEMPORARY.value
+    ):
         findings.append(
             finding(
                 SecurityGateCheck.ADMIN_SURFACE_PRIVATE,
@@ -458,7 +480,10 @@ def validate_network_exposure_policy(
             )
         )
 
-    if profile == NetworkProfile.PUBLIC_TEMPORARY.value and exposure != ExposureMode.TEMPORARY_TUNNEL.value:
+    if (
+        profile == NetworkProfile.PUBLIC_TEMPORARY.value
+        and exposure != ExposureMode.TEMPORARY_TUNNEL.value
+    ):
         findings.append(
             finding(
                 SecurityGateCheck.ADMIN_SURFACE_PRIVATE,
@@ -492,6 +517,7 @@ def validate_env_policy(
     use their own canonical prefixes. This function only validates KX security
     posture when those keys are present.
     """
+
     policy = policy or RuntimeSecurityPolicy.from_env(env)
     findings: list[PolicyFinding] = []
 
@@ -549,7 +575,9 @@ def validate_env_policy(
         field_name="KX_PUBLIC_MODE_ENABLED",
     )
     network_report = validate_network_exposure_policy(
-        network_profile=str(env.get("KX_NETWORK_PROFILE", enum_value(DEFAULT_NETWORK_PROFILE))),
+        network_profile=str(
+            env.get("KX_NETWORK_PROFILE", enum_value(DEFAULT_NETWORK_PROFILE))
+        ),
         exposure_mode=str(env.get("KX_EXPOSURE_MODE", enum_value(DEFAULT_EXPOSURE_MODE))),
         public_mode_enabled=public_mode_enabled,
         public_mode_expires_at=empty_to_none(env.get("KX_PUBLIC_MODE_EXPIRES_AT")),
@@ -560,8 +588,11 @@ def validate_env_policy(
 
 
 def empty_to_none(value: Any) -> str | None:
+    """Return None for empty strings and None-like values."""
+
     if value is None:
         return None
+
     text = str(value).strip()
     return text or None
 
@@ -570,6 +601,8 @@ def validate_required_services(
     services: Mapping[str, Any],
     policy: RuntimeSecurityPolicy,
 ) -> list[PolicyFinding]:
+    """Validate canonical required service names for a full runtime Compose file."""
+
     findings: list[PolicyFinding] = []
     service_names = set(services.keys())
     canonical_names = set(policy.canonical_services)
@@ -626,6 +659,7 @@ def validate_service_runtime_policy(
     policy: RuntimeSecurityPolicy,
 ) -> list[PolicyFinding]:
     """Validate one Compose service against Konnaxion runtime policy."""
+
     findings: list[PolicyFinding] = []
 
     if service.get("privileged") is True and not policy.allow_privileged_containers:
@@ -789,15 +823,19 @@ def image_allowed(image: str, allowed_images: Sequence[str]) -> bool:
         konnaxion/*
         postgres:16-alpine
     """
+
     for allowed in allowed_images:
         if allowed.endswith("*") and image.startswith(allowed[:-1]):
             return True
         if image == allowed:
             return True
+
     return False
 
 
 def normalize_list(value: Any) -> list[str]:
+    """Normalize Compose scalar/list/mapping values into a list of strings."""
+
     if value is None:
         return []
     if isinstance(value, Mapping):
@@ -807,13 +845,112 @@ def normalize_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def validate_runtime_policy(
+    runtime: Mapping[str, Any],
+    policy: RuntimeSecurityPolicy | None = None,
+    *,
+    require_complete_compose: bool = False,
+) -> PolicyReport:
+    """
+    Validate runtime policy and raise on blocking findings.
+
+    This is the public compatibility API expected by tests and other modules.
+    It accepts a Compose-like mapping:
+
+        {"services": {"django-api": {"privileged": True}}}
+
+    By default, partial service maps are allowed so unit tests and targeted
+    policy checks can validate one service at a time. Set
+    `require_complete_compose=True` to require the complete canonical runtime
+    service set.
+    """
+
+    policy = policy or RuntimeSecurityPolicy()
+
+    services = runtime.get("services")
+    if not isinstance(services, Mapping):
+        report = make_report(
+            [
+                finding(
+                    SecurityGateCheck.MANIFEST_SCHEMA,
+                    "runtime policy input must contain a services mapping",
+                    field="services",
+                    value=services,
+                )
+            ]
+        )
+        assert_policy_accepts(report)
+        return report
+
+    findings: list[PolicyFinding] = []
+
+    if require_complete_compose:
+        findings.extend(validate_required_services(services, policy))
+    else:
+        service_names = set(str(name) for name in services.keys())
+        aliases = service_names & FORBIDDEN_SERVICE_ALIASES
+        if aliases:
+            findings.append(
+                finding(
+                    SecurityGateCheck.MANIFEST_SCHEMA,
+                    f"forbidden non-canonical service aliases found: {sorted(aliases)}",
+                    field="services",
+                    value=sorted(aliases),
+                )
+            )
+
+    for service_name, service in services.items():
+        if not isinstance(service, Mapping):
+            findings.append(
+                finding(
+                    SecurityGateCheck.MANIFEST_SCHEMA,
+                    "service definition must be a mapping",
+                    service=str(service_name),
+                    field="services",
+                    value=service,
+                )
+            )
+            continue
+
+        findings.extend(
+            validate_service_runtime_policy(
+                str(service_name),
+                service,
+                policy,
+            )
+        )
+
+    env = runtime.get("env") or runtime.get("environment")
+    if isinstance(env, Mapping):
+        findings.extend(validate_env_policy(env, policy).findings)
+
+    networks = runtime.get("networks", {})
+    if isinstance(networks, Mapping):
+        for network_name in ("kx-private", "kx-data"):
+            network_spec = networks.get(network_name)
+            if isinstance(network_spec, Mapping) and network_spec.get("internal") is not True:
+                findings.append(
+                    finding(
+                        SecurityGateCheck.DANGEROUS_PORTS_BLOCKED,
+                        f"{network_name} must be internal",
+                        field=f"networks.{network_name}.internal",
+                        value=network_spec.get("internal"),
+                    )
+                )
+
+    report = make_report(findings)
+    assert_policy_accepts(report)
+    return report
+
+
 def validate_compose_policy(
     compose: Mapping[str, Any],
     policy: RuntimeSecurityPolicy | None = None,
 ) -> PolicyReport:
     """
-    Validate a Docker Compose mapping against Konnaxion security policy.
+    Validate a complete Docker Compose mapping against Konnaxion security policy.
     """
+
     policy = policy or RuntimeSecurityPolicy()
 
     services = compose.get("services")
@@ -872,6 +1009,7 @@ def validate_capsule_acceptance_policy(
     policy: RuntimeSecurityPolicy | None = None,
 ) -> PolicyReport:
     """Validate high-level capsule acceptance policy."""
+
     policy = policy or RuntimeSecurityPolicy()
     findings: list[PolicyFinding] = []
 
@@ -910,6 +1048,7 @@ def validate_capsule_acceptance_policy(
 
 def merge_reports(*reports: PolicyReport) -> PolicyReport:
     """Merge multiple policy reports into one aggregate report."""
+
     findings: list[PolicyFinding] = []
     for report in reports:
         findings.extend(report.findings)
@@ -923,6 +1062,7 @@ def report_to_security_gate_checks(report: PolicyReport) -> dict[str, str]:
     Checks not present in the report are omitted; the Security Gate aggregator
     can merge this with concrete check results from verifier/firewall/secrets.
     """
+
     statuses: dict[str, str] = {}
     for item in report.findings:
         current = statuses.get(item.check)
@@ -934,6 +1074,7 @@ def report_to_security_gate_checks(report: PolicyReport) -> dict[str, str]:
 
 def assert_policy_accepts(report: PolicyReport) -> None:
     """Raise PolicyError if a report contains blocking findings."""
+
     if not report.accepted:
         messages = "; ".join(finding.message for finding in report.blocking_findings)
         raise PolicyError(messages or "security policy rejected the input")
@@ -965,5 +1106,6 @@ __all__ = [
     "validate_env_policy",
     "validate_network_exposure_policy",
     "validate_required_services",
+    "validate_runtime_policy",
     "validate_service_runtime_policy",
 ]

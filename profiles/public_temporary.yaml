@@ -9,72 +9,100 @@
 #   - Requires expiration.
 #   - Public traffic enters only through Traefik.
 #   - Internal services are never exposed directly.
+#   - Public mode must auto-disable when expired.
 
 schema_version: kx-network-profile/v1
-profile: public_temporary
-display_name: Public temporary
-description: Short-lived public tunnel exposure for controlled demos.
 
-default: false
-enabled_by_default: false
+profile:
+  name: public_temporary
+  label: Public temporary
+  description: Short-lived public tunnel exposure for controlled demos.
+  default: false
+  enabled_by_default: false
 
 network:
-  profile: public_temporary
-  exposure_mode: temporary_tunnel
+  network_profile: public_temporary
+  bind_scope: public_tunnel
+  binding: public_tunnel
+  bind_hosts:
+    - 0.0.0.0
+  allow_lan: true
+  allow_vpn: false
+  allow_tunnel: true
+  allow_public_internet: true
+
+exposure:
+  mode: temporary_tunnel
+  public_allowed: true
+  requires_expiration: true
   public_mode_enabled: true
-  require_public_mode_expiration: true
+  public_mode_expires_at: "<REQUIRED_ON_ENABLE>"
   public_mode_duration_hours_default: 2
   public_mode_duration_hours_max: 24
-  public_mode_expires_at: null
+  auto_disable_public_mode_on_expiry: true
 
 host:
   bind_address: 0.0.0.0
   generated_host_required: true
   allowed_host_source: generated_from_profile
+  host_placeholder: "<GENERATED_FROM_PROFILE>"
 
 entrypoints:
   traefik:
+    enabled: true
     service: traefik
     public: true
+    lan: true
+    loopback_only: false
     ports:
       - 80
       - 443
 
 routing:
-  - path: /
-    service: frontend-next
-  - path: /api/
-    service: django-api
-  - path: /admin/
-    service: django-api
-  - path: /media/
-    service: media-nginx
+  enabled: true
+  host: "<GENERATED_FROM_PROFILE>"
+  routes:
+    "/":
+      service: frontend-next
+      internal_port: 3000
+    "/api/":
+      service: django-api
+      internal_port: 5000
+    "/admin/":
+      service: django-api
+      internal_port: 5000
+    "/media/":
+      service: media-nginx
+      internal_port: 80
 
-allowed_public_ports:
-  - 80
-  - 443
-
-restricted_admin_ports:
-  - 22
-
-forbidden_public_ports:
-  - 3000
-  - 5000
-  - 5432
-  - 6379
-  - 5555
-  - 8000
-
-forbidden_public_services:
-  - frontend-next
-  - django-api
-  - postgres
-  - redis
-  - celeryworker
-  - celerybeat
-  - flower
-  - media-nginx
-  - kx-agent
+services:
+  public_entrypoint:
+    - traefik
+  direct_public_access_allowed: false
+  routed_services:
+    - frontend-next
+    - django-api
+    - media-nginx
+  internal_only:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+    - kx-agent
+  forbidden_public:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+    - kx-agent
 
 service_exposure:
   traefik: public
@@ -88,9 +116,90 @@ service_exposure:
   media-nginx: internal
   kx-agent: local_only
 
+ports:
+  allowed_entry_ports:
+    - 80
+    - 443
+  restricted_admin_ports:
+    - 22
+  forbidden_public_ports:
+    - 3000
+    - 5000
+    - 5432
+    - 6379
+    - 5555
+    - 8000
+  docker_daemon_tcp_public: false
+  docker_socket_mount_allowed: false
+
+firewall:
+  mode: deny_by_default
+  allow_inbound:
+    - port: 80
+      protocol: tcp
+      source: public
+      purpose: http_redirect_to_https
+    - port: 443
+      protocol: tcp
+      source: public
+      purpose: https_traefik
+  deny_public_inbound:
+    - port: 22
+      protocol: tcp
+      purpose: ssh_not_public_for_temporary_profile
+    - port: 3000
+      protocol: tcp
+      purpose: frontend_next_direct_forbidden
+    - port: 5000
+      protocol: tcp
+      purpose: django_api_direct_forbidden
+    - port: 5432
+      protocol: tcp
+      purpose: postgres_forbidden
+    - port: 6379
+      protocol: tcp
+      purpose: redis_forbidden
+    - port: 5555
+      protocol: tcp
+      purpose: flower_forbidden
+    - port: 8000
+      protocol: tcp
+      purpose: django_dev_server_forbidden
+  deny_all_other_inbound: true
+
+security:
+  require_signed_capsule: true
+  require_security_gate: true
+  allow_unknown_images: false
+  allow_privileged_containers: false
+  allow_host_network: false
+  allow_docker_socket_mount: false
+  require_firewall_check: true
+  require_admin_surface_private: true
+  require_https: true
+  require_tunnel_expiration: true
+  auto_disable_public_mode_on_expiry: true
+
 security_gate:
   required: true
   blocking: true
+  blocking_checks:
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - firewall_enabled
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
+    - admin_surface_private
+    - backup_configured
+  warn_checks: []
   checks:
     capsule_signature: required
     image_checksums: required
@@ -120,9 +229,34 @@ runtime_policy:
   require_tunnel_expiration: true
   auto_disable_public_mode_on_expiry: true
 
-environment:
+canonical_env:
   KX_NETWORK_PROFILE: public_temporary
   KX_EXPOSURE_MODE: temporary_tunnel
   KX_PUBLIC_MODE_ENABLED: "true"
   KX_PUBLIC_MODE_EXPIRES_AT: "<REQUIRED_ON_ENABLE>"
   KX_HOST: "<GENERATED_FROM_PROFILE>"
+  KX_REQUIRE_SIGNED_CAPSULE: "true"
+  KX_GENERATE_SECRETS_ON_INSTALL: "true"
+  KX_ALLOW_UNKNOWN_IMAGES: "false"
+  KX_ALLOW_PRIVILEGED_CONTAINERS: "false"
+  KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
+  KX_ALLOW_HOST_NETWORK: "false"
+  KX_BACKUP_ENABLED: "true"
+
+backup:
+  enabled: true
+  root: /opt/konnaxion/backups
+  retention:
+    daily_days: 14
+    weekly_weeks: 8
+    monthly_months: 12
+    pre_update_count: 5
+    pre_restore_count: 5
+
+operator_notes:
+  - This profile is for controlled short-lived public demos only.
+  - This profile must never be enabled by default.
+  - Public mode requires an explicit expiration timestamp.
+  - Public traffic must enter only through Traefik on ports 80 and 443.
+  - Internal service ports must remain private.
+  - The runtime must disable public mode when the expiration time is reached.

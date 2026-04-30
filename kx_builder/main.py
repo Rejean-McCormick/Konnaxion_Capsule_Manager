@@ -15,11 +15,11 @@ bootstrap before optional CLI frameworks are installed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from pathlib import Path
 import argparse
 import json
 import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from kx_shared.konnaxion_constants import (
@@ -27,15 +27,15 @@ from kx_shared.konnaxion_constants import (
     BUILDER_NAME,
     CAPSULE_EXTENSION,
     CAPSULE_FILENAME_PATTERN,
-    DEFAULT_CHANNEL,
     DEFAULT_CAPSULE_ID,
     DEFAULT_CAPSULE_VERSION,
+    DEFAULT_CHANNEL,
     DEFAULT_NETWORK_PROFILE,
     PARAM_VERSION,
 )
 from kx_shared.validation import (
-    ValidationIssue,
     ValidationFailed,
+    ValidationIssue,
     raise_if_issues,
     validate_capsule_filename,
     validate_capsule_id,
@@ -91,7 +91,8 @@ class BuilderCliError(RuntimeError):
 
 
 def build_capsule(request: BuildRequest) -> BuildResult:
-    """Build a Konnaxion Capsule.
+    """
+    Build a Konnaxion Capsule.
 
     This function delegates to optional builder modules when available. In early
     bootstrap mode, it performs validation and fails with a precise message
@@ -153,6 +154,7 @@ def verify_capsule(capsule_path: Path, *, strict: bool = False) -> VerifyResult:
     if issues:
         if strict:
             raise ValidationFailed(issues)
+
         return VerifyResult(
             ok=False,
             capsule_path=str(capsule_path),
@@ -166,8 +168,10 @@ def verify_capsule(capsule_path: Path, *, strict: bool = False) -> VerifyResult:
             message=f"Capsule file does not exist: {capsule_path}",
             field="capsule_path",
         )
+
         if strict:
             raise ValidationFailed((issue,))
+
         return VerifyResult(
             ok=False,
             capsule_path=str(capsule_path),
@@ -194,10 +198,12 @@ def verify_capsule(capsule_path: Path, *, strict: bool = False) -> VerifyResult:
         ) from exc
 
     result = agent_verify_capsule(capsule_path, strict=strict)
+    passed = bool(getattr(result, "passed", False))
+
     return VerifyResult(
-        ok=bool(getattr(result, "passed", False)),
+        ok=passed,
         capsule_path=str(capsule_path),
-        message="Capsule verification passed." if getattr(result, "passed", False) else "Capsule verification failed.",
+        message="Capsule verification passed." if passed else "Capsule verification failed.",
         issues=tuple(asdict(issue) for issue in getattr(result, "issues", ())),
     )
 
@@ -209,14 +215,24 @@ def create_parser() -> argparse.ArgumentParser:
         prog="kx-builder",
         description=f"{BUILDER_NAME} command-line entrypoint.",
     )
-    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON output.")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON output.",
+    )
 
     subparsers = parser.add_subparsers(dest="command_group", required=True)
 
-    capsule = subparsers.add_parser("capsule", help="Build or verify Konnaxion Capsule artifacts.")
+    capsule = subparsers.add_parser(
+        "capsule",
+        help="Build or verify Konnaxion Capsule artifacts.",
+    )
     capsule_sub = capsule.add_subparsers(dest="capsule_command", required=True)
 
-    build = capsule_sub.add_parser("build", help="Build a signed Konnaxion Capsule.")
+    build = capsule_sub.add_parser(
+        "build",
+        help="Build a signed Konnaxion Capsule.",
+    )
     build.add_argument(
         "--source-dir",
         default=".",
@@ -266,9 +282,20 @@ def create_parser() -> argparse.ArgumentParser:
         help="Overwrite existing output file.",
     )
 
-    verify = capsule_sub.add_parser("verify", help="Verify a Konnaxion Capsule.")
-    verify.add_argument("capsule", type=Path, help="Path to .kxcap file.")
-    verify.add_argument("--strict", action="store_true", help="Raise/fail on blocking issues.")
+    verify = capsule_sub.add_parser(
+        "verify",
+        help="Verify a Konnaxion Capsule.",
+    )
+    verify.add_argument(
+        "capsule",
+        type=Path,
+        help="Path to .kxcap file.",
+    )
+    verify.add_argument(
+        "--strict",
+        action="store_true",
+        help="Raise/fail on blocking issues.",
+    )
 
     return parser
 
@@ -297,9 +324,11 @@ def run(argv: Sequence[str] | None = None) -> int:
     except ValidationFailed as exc:
         _print_error("Validation failed.", issues=exc.issues, json_output=args.json)
         return 2
+
     except BuilderCliError as exc:
         _print_error(str(exc), json_output=args.json)
         return exc.exit_code
+
     except KeyboardInterrupt:
         _print_error("Interrupted.", json_output=args.json)
         return 130
@@ -313,6 +342,7 @@ def main() -> None:
 
 def _build_request_from_args(args: argparse.Namespace) -> BuildRequest:
     output = args.output
+
     if output is None:
         filename = CAPSULE_FILENAME_PATTERN.format(
             channel=args.channel,
@@ -384,6 +414,7 @@ def _normalize_verify_result(capsule_path: Path, result: Any) -> VerifyResult:
             item if isinstance(item, Mapping) else asdict(item)
             for item in raw_issues
         )
+
         return VerifyResult(
             ok=bool(result.get("ok", result.get("passed", False))),
             capsule_path=str(result.get("capsule_path", capsule_path)),
@@ -393,6 +424,7 @@ def _normalize_verify_result(capsule_path: Path, result: Any) -> VerifyResult:
 
     passed = bool(getattr(result, "passed", False))
     raw_issues = getattr(result, "issues", ())
+
     return VerifyResult(
         ok=passed,
         capsule_path=str(capsule_path),
@@ -419,6 +451,7 @@ def _print_result(result: BuildResult | VerifyResult, *, json_output: bool) -> N
     status = "OK" if result.ok else "FAILED"
     print(f"{status}: {result.message or 'Capsule verification finished.'}")
     print(f"capsule={result.capsule_path}")
+
     if result.issues:
         print("issues:")
         for issue in result.issues:
@@ -447,15 +480,23 @@ def _print_error(
         return
 
     print(f"ERROR: {message}", file=sys.stderr)
+
     for issue in issues:
         print(f"- {issue.code}: {issue.message}", file=sys.stderr)
 
 
 def _date_from_capsule_id(capsule_id: str) -> str:
     parts = capsule_id.rsplit("-", maxsplit=1)
+
     if len(parts) == 2 and parts[1]:
         return parts[1]
+
     return "2026.04.30"
+
+
+# Compatibility alias for pyproject entrypoint:
+# kx-builder = "kx_builder.main:app"
+app = main
 
 
 if __name__ == "__main__":

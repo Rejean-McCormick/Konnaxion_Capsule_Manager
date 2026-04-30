@@ -5,10 +5,11 @@
 #
 # Rules:
 #   - Public mode is disabled.
+#   - LAN access is disabled.
+#   - Tunnel access is disabled.
 #   - No host ports are published.
-#   - Traefik entrypoints are disabled by the Agent-rendered runtime.
+#   - Traefik public entrypoints are disabled by the Agent-rendered runtime.
 #   - Internal service ports remain internal only.
-#   - No tunnel is allowed.
 #   - No automatic certificate or public DNS workflow is allowed.
 #
 # Canonical values:
@@ -21,16 +22,8 @@ schema_version: kx-network-profile/v1
 profile:
   name: offline
   display_name: Offline
-  description: "No external network exposure. Runtime services are isolated and not reachable from LAN or Internet."
+  description: No external network exposure. Runtime services are isolated and not reachable from LAN or Internet.
   default: false
-
-canonical_env:
-  KX_NETWORK_PROFILE: offline
-  KX_EXPOSURE_MODE: private
-  KX_PUBLIC_MODE_ENABLED: "false"
-  KX_PUBLIC_MODE_DURATION_HOURS: ""
-  KX_PUBLIC_MODE_EXPIRES_AT: ""
-  KX_HOST: ""
 
 exposure:
   mode: private
@@ -40,14 +33,61 @@ exposure:
   temporary_public_allowed: false
   requires_expiration: false
 
+canonical_env:
+  KX_NETWORK_PROFILE: offline
+  KX_EXPOSURE_MODE: private
+  KX_PUBLIC_MODE_ENABLED: "false"
+  KX_PUBLIC_MODE_DURATION_HOURS: ""
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_HOST: ""
+
 routing:
+  enabled: false
   traefik_enabled: false
   public_entrypoint_enabled: false
+  lan_entrypoint_enabled: false
+  tunnel_entrypoint_enabled: false
   allowed_external_paths: []
   hostnames: []
+  routes: {}
   tls:
     enabled: false
     certificate_source: none
+    public_dns_required: false
+
+entrypoints:
+  traefik:
+    enabled: false
+    public: false
+    lan: false
+    tunnel: false
+    ports: []
+
+services:
+  public_entrypoint: null
+  direct_public_access_allowed: false
+  routed_services: []
+  internal_only:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+    - kx-agent
+  forbidden_public:
+    - traefik
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+    - kx-agent
 
 ports:
   publish:
@@ -62,6 +102,8 @@ ports:
     - 6379
     - 5555
     - 8000
+  docker_daemon_tcp_public: false
+  docker_socket_mount_allowed: false
 
 firewall:
   policy: deny_all_inbound
@@ -69,28 +111,32 @@ firewall:
   deny_inbound:
     - port: 80
       protocol: tcp
-      reason: "Offline profile does not publish HTTP."
+      reason: Offline profile does not publish HTTP.
     - port: 443
       protocol: tcp
-      reason: "Offline profile does not publish HTTPS."
+      reason: Offline profile does not publish HTTPS.
+    - port: 22
+      protocol: tcp
+      reason: Offline profile does not publish SSH.
     - port: 3000
       protocol: tcp
-      reason: "Next.js direct port must never be public."
+      reason: Next.js direct port must never be public.
     - port: 5000
       protocol: tcp
-      reason: "Django/Gunicorn direct port must never be public."
+      reason: Django/Gunicorn direct port must never be public.
     - port: 5432
       protocol: tcp
-      reason: "PostgreSQL must never be public."
+      reason: PostgreSQL must never be public.
     - port: 6379
       protocol: tcp
-      reason: "Redis must never be public."
+      reason: Redis must never be public.
     - port: 5555
       protocol: tcp
-      reason: "Flower dashboard must never be public."
+      reason: Flower dashboard must never be public.
     - port: 8000
       protocol: tcp
-      reason: "Django development server must never be public."
+      reason: Django development server must never be public.
+  deny_all_other_inbound: true
 
 compose_overrides:
   traefik:
@@ -119,14 +165,23 @@ compose_overrides:
       expose:
         - 6379
       publish_ports: []
+    celeryworker:
+      expose: []
+      publish_ports: []
+    celerybeat:
+      expose: []
+      publish_ports: []
     flower:
+      enabled: false
       expose:
         - 5555
       publish_ports: []
-      enabled: false
     media-nginx:
       expose:
-        - 8080
+        - 80
+      publish_ports: []
+    kx-agent:
+      expose: []
       publish_ports: []
 
 security_gate:
@@ -144,6 +199,10 @@ security_gate:
     - no_privileged_containers
     - no_host_network
     - allowed_images_only
+  warn_checks:
+    - firewall_enabled
+    - admin_surface_private
+    - backup_configured
   expected_results:
     capsule_signature: PASS
     image_checksums: PASS
@@ -161,7 +220,14 @@ security_gate:
     admin_surface_private: PASS
     backup_configured: PASS
 
+backup:
+  enabled: true
+  root: /opt/konnaxion/backups
+  pre_update_backup_required: true
+  pre_restore_backup_required: true
+
 operator_notes:
-  - "Use this profile for disconnected demos, maintenance, or isolated restore validation."
-  - "The instance may run internally, but the Manager must not expose a user-facing URL."
-  - "Switch to intranet_private or local_only when operator access is required."
+  - Use this profile for disconnected demos, maintenance, or isolated restore validation.
+  - The instance may run internally, but the Manager must not expose a user-facing URL.
+  - Switch to local_only when loopback operator access is required.
+  - Switch to intranet_private when LAN operator access is required.

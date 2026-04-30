@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -81,6 +82,7 @@ def capsule_root(tmp_path: Path) -> Path:
                 "capsule_version: 2026.04.30-demo.1",
                 "app_name: Konnaxion",
                 "app_version: v14",
+                "param_version: kx-param-2026.04.30",
                 "channel: demo",
                 "services:",
                 "  - traefik",
@@ -124,9 +126,23 @@ def capsule_root(tmp_path: Path) -> Path:
     )
 
     (root / "profiles" / "intranet_private.yaml").write_text(
-        "profile:\n  name: intranet_private\nnetwork:\n  exposure_mode: private\n",
+        "\n".join(
+            [
+                "schema_version: kx-network-profile/v1",
+                "profile:",
+                "  name: intranet_private",
+                "  default: true",
+                "exposure:",
+                "  mode: private",
+                "canonical_env:",
+                "  KX_NETWORK_PROFILE: intranet_private",
+                "  KX_EXPOSURE_MODE: private",
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
+
     (root / "env-templates" / "django.env.template").write_text(
         "DJANGO_SECRET_KEY=<GENERATED_ON_INSTALL>\n",
         encoding="utf-8",
@@ -135,6 +151,15 @@ def capsule_root(tmp_path: Path) -> Path:
         "POSTGRES_PASSWORD=<GENERATED_ON_INSTALL>\n",
         encoding="utf-8",
     )
+    (root / "env-templates" / "redis.env.template").write_text(
+        "REDIS_URL=redis://redis:6379/0\n",
+        encoding="utf-8",
+    )
+    (root / "env-templates" / "frontend.env.template").write_text(
+        "NEXT_PUBLIC_API_BASE=<GENERATED_FROM_PROFILE>\n",
+        encoding="utf-8",
+    )
+
     (root / "healthchecks" / "http.yaml").write_text(
         "routes:\n  - /\n  - /api/\n",
         encoding="utf-8",
@@ -151,8 +176,12 @@ def capsule_root(tmp_path: Path) -> Path:
         "#!/usr/bin/env sh\npython manage.py migrate\n",
         encoding="utf-8",
     )
-    (root / "images" / "frontend-next.oci.tar").write_bytes(b"frontend image placeholder")
-    (root / "images" / "django-api.oci.tar").write_bytes(b"django image placeholder")
+    (root / "images" / "frontend-next.oci.tar").write_bytes(
+        b"frontend image placeholder"
+    )
+    (root / "images" / "django-api.oci.tar").write_bytes(
+        b"django image placeholder"
+    )
 
     write_checksums_file(root)
     (root / SIGNATURE_FILENAME).write_bytes(b"signature placeholder")
@@ -182,9 +211,9 @@ def test_sha256_file_is_deterministic(tmp_path: Path) -> None:
 def test_parse_checksums_text_accepts_sha256sum_format() -> None:
     text = (
         "# comment\n"
-        "a" * 64
+        + ("a" * 64)
         + "  manifest.yaml\n"
-        + "b" * 64
+        + ("b" * 64)
         + " *docker-compose.capsule.yml\n"
     )
 
@@ -203,9 +232,9 @@ def test_parse_checksums_text_rejects_invalid_digest() -> None:
 
 def test_parse_checksums_text_rejects_duplicate_paths() -> None:
     text = (
-        "a" * 64
+        ("a" * 64)
         + "  manifest.yaml\n"
-        + "b" * 64
+        + ("b" * 64)
         + "  manifest.yaml\n"
     )
 
@@ -229,7 +258,9 @@ def test_checksum_paths_must_be_safe(relative_path: str) -> None:
         normalize_relative_path(relative_path)
 
 
-def test_build_checksum_entries_excludes_checksum_and_signature(capsule_root: Path) -> None:
+def test_build_checksum_entries_excludes_checksum_and_signature(
+    capsule_root: Path,
+) -> None:
     entries = build_checksum_entries(capsule_root)
     paths = {entry.relative_path for entry in entries}
 
@@ -251,7 +282,9 @@ def test_format_checksums_is_deterministic() -> None:
     ]
 
 
-def test_verify_capsule_checksums_passes_for_untampered_capsule(capsule_root: Path) -> None:
+def test_verify_capsule_checksums_passes_for_untampered_capsule(
+    capsule_root: Path,
+) -> None:
     report = verify_capsule_checksums(capsule_root)
 
     assert report.ok is True
@@ -306,8 +339,9 @@ def test_capsule_policy_rejects_secret_bearing_paths(
     """
     Verification policy must reject these paths.
 
-    This test uses the verifier module when available. Until that module exists,
-    it documents the expected policy without failing checksum-only test runs.
+    This test uses the verifier module when available. Until that module exists
+    or supports policy-level secret rejection, it is skipped instead of blocking
+    checksum-only development.
     """
 
     secret_file = capsule_root / relative_path
@@ -340,7 +374,7 @@ def test_optional_capsule_verifier_accepts_valid_capsule(capsule_root: Path) -> 
     Integration test for `kx_agent.capsules.verifier`.
 
     The checksum tests above always run. This test activates once the verifier
-    module is generated.
+    module exposes `verify_extracted_capsule`.
     """
 
     verifier = import_optional_verifier()
@@ -400,7 +434,7 @@ def test_optional_capsule_archive_verifier_accepts_kxcap_file(
         pytest.fail("Verifier returned unsupported result type.")
 
 
-def import_optional_verifier():
+def import_optional_verifier() -> Any | None:
     try:
         return importlib.import_module("kx_agent.capsules.verifier")
     except ModuleNotFoundError:

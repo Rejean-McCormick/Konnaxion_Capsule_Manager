@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import uuid
@@ -39,11 +38,12 @@ from kx_agent.audit import (
 )
 from kx_shared.konnaxion_constants import (
     CAPSULE_EXTENSION,
+    KX_BACKUPS_ROOT,
     KX_CAPSULES_DIR,
     KX_INSTANCES_DIR,
     KX_ROOT,
-    RollbackStatus,
     InstanceState,
+    RollbackStatus,
     capsule_path,
     instance_compose_file,
     instance_root,
@@ -74,7 +74,7 @@ class RollbackError(RuntimeError):
 
 
 class RollbackSafetyError(RollbackError):
-    """Rollback rejected by safety checks."""
+    """Rollback safety preflight failed."""
 
 
 class RollbackCommandError(RollbackError):
@@ -151,12 +151,13 @@ class RollbackContext:
     target_capsule_id: CapsuleID
     target_capsule_version: CapsuleVersion
     target_capsule_file: Path
-    current_pointer_file: Path
-    previous_pointer_file: Path
+    instance_dir: Path
+    state_dir: Path
+    compose_file: Path
     rollback_state_file: Path
     rollback_history_file: Path
-    compose_file: Path
-    state_dir: Path
+    current_pointer_file: Path
+    previous_pointer_file: Path
     restore_data: bool = False
     backup_id: BackupID | None = None
     requested_by: str = "system"
@@ -187,6 +188,7 @@ SecurityGateRunner = Callable[[InstanceID], Any]
 HealthcheckRunner = Callable[[InstanceID], Any]
 DataRestoreRunner = Callable[[InstanceID, BackupID], Any]
 MigrationRunner = Callable[[InstanceID], Any]
+RollbackCommandRunner = Callable[["RollbackCommand", bool], "RollbackCommandResult"]
 
 
 def utc_now() -> datetime:
@@ -228,33 +230,22 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     with tempfile.NamedTemporaryFile(
         "w",
         delete=False,
-        dir=str(path.parent),
         encoding="utf-8",
-        prefix=f".{path.name}.",
-    ) as tmp:
-        tmp.write(encoded)
-        tmp.write("\n")
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
+        dir=str(path.parent),
+    ) as handle:
+        handle.write(encoded)
+        handle.write("\n")
+        temp_name = handle.name
 
-    tmp_path.replace(path)
+    os.replace(temp_name, path)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        default=_json_default,
-        separators=(",", ":"),
-    )
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=_json_default)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(encoded)
         handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -262,50 +253,50 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
     loaded = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
-        raise RollbackError(f"invalid JSON object in {path}")
+        raise RollbackSafetyError(f"JSON file must contain an object: {path}")
     return loaded
 
 
-def _safe_resolve_under(path: Path, root: Path) -> Path:
-    resolved_path = path.expanduser().resolve(strict=False)
-    resolved_root = root.expanduser().resolve(strict=False)
+def _safe_resolve_under(path: Path, root: Path | os.PathLike[str]) -> Path:
+    """Resolve path and require it to stay under root."""
+
+    resolved_path = Path(os.fspath(path)).resolve()
+    resolved_root = Path(os.fspath(root)).resolve()
+
     try:
         resolved_path.relative_to(resolved_root)
     except ValueError as exc:
-        raise RollbackSafetyError(f"path must be under {resolved_root}: {resolved_path}") from exc
+        raise RollbackSafetyError(
+            f"path must be under {resolved_root}: {resolved_path}"
+        ) from exc
+
     return resolved_path
 
 
-def validate_capsule_file(path: Path) -> Path:
-    """Validate target capsule file path and extension."""
-
-    resolved = _safe_resolve_under(path, KX_CAPSULES_DIR)
-    if resolved.suffix != CAPSULE_EXTENSION:
-        raise RollbackSafetyError(f"capsule file must end with {CAPSULE_EXTENSION}: {resolved}")
-    if not resolved.exists():
-        raise FileNotFoundError(f"target capsule does not exist: {resolved}")
-    if not resolved.is_file():
-        raise RollbackSafetyError(f"target capsule is not a file: {resolved}")
-    return resolved
-
-
-def resolve_target_capsule_file(
-    capsule_id: CapsuleID | str,
-    explicit_path: Path | str | None = None,
-) -> Path:
-    """Resolve the target capsule file from capsule id or explicit path."""
-
-    if explicit_path is not None:
-        return validate_capsule_file(Path(explicit_path))
-
-    return validate_capsule_file(capsule_path(str(capsule_id)))
+def _make_step_result(
+    step: RollbackStep,
+    status: RollbackStatus,
+    message: str,
+    started_at: datetime,
+    *,
+    command_results: Sequence[RollbackCommandResult] = (),
+    metadata: Mapping[str, Any] | None = None,
+) -> RollbackStepResult:
+    return RollbackStepResult(
+        step=step,
+        status=status,
+        message=message,
+        started_at=started_at,
+        completed_at=utc_now(),
+        command_results=tuple(command_results),
+        metadata=dict(metadata or {}),
+    )
 
 
 def pointer_to_dict(pointer: CapsulePointer) -> dict[str, Any]:
     """Serialize a capsule pointer."""
 
     return {
-        "schema_version": ROLLBACK_SCHEMA_VERSION,
         "capsule_id": str(pointer.capsule_id),
         "capsule_version": str(pointer.capsule_version),
         "capsule_file": str(pointer.capsule_file),
@@ -313,30 +304,61 @@ def pointer_to_dict(pointer: CapsulePointer) -> dict[str, Any]:
     }
 
 
-def pointer_from_dict(payload: Mapping[str, Any]) -> CapsulePointer:
+def pointer_from_dict(data: Mapping[str, Any]) -> CapsulePointer:
     """Deserialize a capsule pointer."""
 
+    updated_at_raw = data.get("updated_at")
+    updated_at = (
+        datetime.fromisoformat(str(updated_at_raw).replace("Z", "+00:00"))
+        if updated_at_raw
+        else utc_now()
+    )
+
     return CapsulePointer(
-        capsule_id=CapsuleID(str(payload["capsule_id"])),
-        capsule_version=CapsuleVersion(str(payload["capsule_version"])),
-        capsule_file=Path(str(payload["capsule_file"])),
-        updated_at=datetime.fromisoformat(str(payload["updated_at"]).replace("Z", "+00:00")),
+        capsule_id=CapsuleID(str(data["capsule_id"])),
+        capsule_version=CapsuleVersion(str(data["capsule_version"])),
+        capsule_file=Path(str(data["capsule_file"])),
+        updated_at=updated_at,
     )
 
 
 def read_capsule_pointer(path: Path) -> CapsulePointer | None:
-    """Read a capsule pointer file if it exists."""
+    """Read a capsule pointer file."""
 
-    payload = _read_json(path)
-    if payload is None:
+    data = _read_json(path)
+    if data is None:
         return None
-    return pointer_from_dict(payload)
+    return pointer_from_dict(data)
 
 
 def write_capsule_pointer(path: Path, pointer: CapsulePointer) -> None:
-    """Write a capsule pointer atomically."""
+    """Write a capsule pointer file."""
 
     _atomic_write_json(path, pointer_to_dict(pointer))
+
+
+def resolve_target_capsule_file(capsule_id: CapsuleID | str) -> Path:
+    """Resolve a target capsule id to the canonical capsule path."""
+
+    return Path(os.fspath(capsule_path(str(capsule_id))))
+
+
+def validate_capsule_file(path: Path) -> None:
+    """Validate rollback target capsule exists, is canonical, and stays under capsule root."""
+
+    if path.suffix != CAPSULE_EXTENSION:
+        raise RollbackSafetyError(f"target capsule must end with {CAPSULE_EXTENSION}: {path}")
+
+    _safe_resolve_under(path, KX_CAPSULES_DIR)
+
+    if not path.exists():
+        raise RollbackSafetyError(f"target capsule does not exist: {path}")
+
+    if not path.is_file():
+        raise RollbackSafetyError(f"target capsule is not a file: {path}")
+
+    if path.stat().st_size <= 0:
+        raise RollbackSafetyError(f"target capsule is empty: {path}")
 
 
 def build_rollback_context(
@@ -344,61 +366,75 @@ def build_rollback_context(
     instance_id: InstanceID | str,
     target_capsule_id: CapsuleID | str,
     target_capsule_version: CapsuleVersion | str,
-    target_capsule_file: Path | str | None = None,
+    target_capsule_file: Path | None = None,
     rollback_id: RollbackID | str | None = None,
     restore_data: bool = False,
     backup_id: BackupID | str | None = None,
     requested_by: str = "system",
 ) -> RollbackContext:
-    """Build a fully resolved rollback context."""
+    """Build a rollback context from canonical ids."""
 
-    instance = InstanceID(str(instance_id))
-    capsule = CapsuleID(str(target_capsule_id))
-    capsule_version = CapsuleVersion(str(target_capsule_version))
-    resolved_state_dir = instance_state_dir(str(instance))
-    resolved_target_capsule_file = resolve_target_capsule_file(capsule, target_capsule_file)
+    resolved_instance_id = InstanceID(str(instance_id))
+    resolved_capsule_id = CapsuleID(str(target_capsule_id))
+    resolved_capsule_version = CapsuleVersion(str(target_capsule_version))
+    resolved_rollback_id = (
+        RollbackID(str(rollback_id))
+        if rollback_id is not None
+        else new_rollback_id(resolved_instance_id)
+    )
+    resolved_capsule_file = target_capsule_file or resolve_target_capsule_file(resolved_capsule_id)
+    resolved_backup_id = BackupID(str(backup_id)) if backup_id is not None else None
 
-    if restore_data and backup_id is None:
+    if restore_data and resolved_backup_id is None:
         raise RollbackSafetyError("restore_data rollback requires backup_id")
 
+    root = Path(os.fspath(instance_root(str(resolved_instance_id))))
+    state = Path(os.fspath(instance_state_dir(str(resolved_instance_id))))
+
     return RollbackContext(
-        rollback_id=RollbackID(str(rollback_id)) if rollback_id else new_rollback_id(instance),
-        instance_id=instance,
-        target_capsule_id=capsule,
-        target_capsule_version=capsule_version,
-        target_capsule_file=resolved_target_capsule_file,
-        current_pointer_file=resolved_state_dir / CURRENT_CAPSULE_POINTER,
-        previous_pointer_file=resolved_state_dir / PREVIOUS_CAPSULE_POINTER,
-        rollback_state_file=resolved_state_dir / ROLLBACK_STATE_FILENAME,
-        rollback_history_file=resolved_state_dir / ROLLBACK_HISTORY_FILENAME,
-        compose_file=instance_compose_file(str(instance)),
-        state_dir=resolved_state_dir,
+        rollback_id=resolved_rollback_id,
+        instance_id=resolved_instance_id,
+        target_capsule_id=resolved_capsule_id,
+        target_capsule_version=resolved_capsule_version,
+        target_capsule_file=Path(resolved_capsule_file),
+        instance_dir=root,
+        state_dir=state,
+        compose_file=Path(os.fspath(instance_compose_file(str(resolved_instance_id)))),
+        rollback_state_file=state / ROLLBACK_STATE_FILENAME,
+        rollback_history_file=state / ROLLBACK_HISTORY_FILENAME,
+        current_pointer_file=state / CURRENT_CAPSULE_POINTER,
+        previous_pointer_file=state / PREVIOUS_CAPSULE_POINTER,
         restore_data=restore_data,
-        backup_id=BackupID(str(backup_id)) if backup_id is not None else None,
+        backup_id=resolved_backup_id,
         requested_by=requested_by,
     )
 
 
 def validate_rollback_context(context: RollbackContext) -> None:
-    """Validate rollback context before running commands."""
+    """Validate rollback context before execution."""
 
-    _safe_resolve_under(context.state_dir, KX_INSTANCES_DIR)
-    _safe_resolve_under(context.current_pointer_file, KX_INSTANCES_DIR)
-    _safe_resolve_under(context.previous_pointer_file, KX_INSTANCES_DIR)
+    if not str(context.instance_id).strip():
+        raise RollbackSafetyError("instance_id is required")
+
+    if not str(context.target_capsule_id).strip():
+        raise RollbackSafetyError("target_capsule_id is required")
+
+    if not str(context.target_capsule_version).strip():
+        raise RollbackSafetyError("target_capsule_version is required")
+
     validate_capsule_file(context.target_capsule_file)
 
     if context.restore_data and context.backup_id is None:
         raise RollbackSafetyError("restore_data rollback requires backup_id")
 
-    if str(context.target_capsule_id).strip() == "":
-        raise RollbackSafetyError("target_capsule_id must not be empty")
+    if context.instance_dir.exists() and not context.instance_dir.is_dir():
+        raise RollbackSafetyError(f"instance path is not a directory: {context.instance_dir}")
 
-    if str(context.target_capsule_version).strip() == "":
-        raise RollbackSafetyError("target_capsule_version must not be empty")
+    context.state_dir.mkdir(parents=True, exist_ok=True)
 
 
 def build_stop_runtime_commands(context: RollbackContext) -> tuple[RollbackCommand, ...]:
-    """Build safe commands to stop the existing runtime."""
+    """Build safe commands to stop the runtime."""
 
     if not context.compose_file.exists():
         return ()
@@ -413,7 +449,7 @@ def build_stop_runtime_commands(context: RollbackContext) -> tuple[RollbackComma
 
 
 def build_start_runtime_commands(context: RollbackContext) -> tuple[RollbackCommand, ...]:
-    """Build safe commands to start the runtime after rollback."""
+    """Build safe commands to start the runtime."""
 
     if not context.compose_file.exists():
         return ()
@@ -458,17 +494,30 @@ def run_commands(
     commands: Sequence[RollbackCommand],
     *,
     dry_run: bool = False,
+    command_runner: RollbackCommandRunner | None = None,
 ) -> tuple[RollbackCommandResult, ...]:
-    """Run commands in order, stopping at first failure."""
+    """Run commands in order, stopping at first failure.
+
+    `command_runner` exists so unit tests and higher-level Agent orchestration can
+    inject a safe executor without touching Docker or the host runtime. When no
+    runner is supplied, the real subprocess-backed `run_command` is used.
+    """
 
     results: list[RollbackCommandResult] = []
+
     for command in commands:
-        result = run_command(command, dry_run=dry_run)
+        if command_runner is None:
+            result = run_command(command, dry_run=dry_run)
+        else:
+            result = command_runner(command, dry_run)
+
         results.append(result)
+
         if not result.ok:
             raise RollbackCommandError(
                 f"command failed: {' '.join(command.argv)}: {result.stderr.strip()}"
             )
+
     return tuple(results)
 
 
@@ -500,26 +549,6 @@ def write_rollback_state(
     _append_jsonl(context.rollback_history_file, payload)
 
 
-def _make_step_result(
-    step: RollbackStep,
-    status: RollbackStatus,
-    message: str,
-    started_at: datetime,
-    *,
-    command_results: Sequence[RollbackCommandResult] = (),
-    metadata: Mapping[str, Any] | None = None,
-) -> RollbackStepResult:
-    return RollbackStepResult(
-        step=step,
-        status=status,
-        message=message,
-        started_at=started_at,
-        completed_at=utc_now(),
-        command_results=tuple(command_results),
-        metadata=dict(metadata or {}),
-    )
-
-
 def _audit(
     logger: AuditLogger,
     *,
@@ -528,11 +557,11 @@ def _audit(
     message: str,
     severity: AuditSeverity = AuditSeverity.INFO,
     metadata: Mapping[str, Any] | None = None,
-    error: BaseException | str | None = None,
+    error: BaseException | None = None,
 ) -> None:
     audit_agent_action(
-        action="rollback_instance",
-        category=AuditCategory.ROLLBACK,
+        action="rollback",
+        category=AuditCategory.BACKUP,
         outcome=outcome,
         severity=severity,
         message=message,
@@ -541,6 +570,7 @@ def _audit(
         correlation_id=str(context.rollback_id),
         metadata={
             "rollback_id": str(context.rollback_id),
+            "target_capsule_id": str(context.target_capsule_id),
             "target_capsule_version": str(context.target_capsule_version),
             "restore_data": context.restore_data,
             "backup_id": str(context.backup_id) if context.backup_id is not None else None,
@@ -552,11 +582,10 @@ def _audit(
 
 
 def preflight_rollback(context: RollbackContext) -> RollbackStepResult:
-    """Run local rollback preflight checks."""
+    """Run rollback preflight validation."""
 
     started_at = utc_now()
     validate_rollback_context(context)
-
     current_pointer = read_capsule_pointer(context.current_pointer_file)
 
     metadata = {
@@ -575,20 +604,42 @@ def preflight_rollback(context: RollbackContext) -> RollbackStepResult:
     )
 
 
-def stop_runtime(context: RollbackContext, *, dry_run: bool = False) -> RollbackStepResult:
-    """Stop the current runtime if a compose file exists."""
+def stop_runtime(
+    context: RollbackContext,
+    *,
+    dry_run: bool = False,
+    execute_commands: bool = True,
+    command_runner: RollbackCommandRunner | None = None,
+) -> RollbackStepResult:
+    """Stop the current runtime if a compose file exists.
+
+    Set `execute_commands=False` for orchestration/unit-test flows that should
+    verify command construction without touching Docker.
+    """
 
     started_at = utc_now()
     commands = build_stop_runtime_commands(context)
-    results = run_commands(commands, dry_run=dry_run) if commands else ()
+    effective_dry_run = dry_run or not execute_commands
+    results = (
+        run_commands(commands, dry_run=effective_dry_run, command_runner=command_runner)
+        if commands
+        else ()
+    )
+
+    if not commands:
+        message = "No runtime compose file found; stop skipped"
+    elif effective_dry_run:
+        message = "Runtime stop command planned"
+    else:
+        message = "Runtime stopped"
 
     return _make_step_result(
         RollbackStep.STOP_RUNTIME,
         RollbackStatus.RUNNING,
-        "Runtime stopped" if commands else "No runtime compose file found; stop skipped",
+        message,
         started_at,
         command_results=results,
-        metadata={"commands": len(commands)},
+        metadata={"commands": len(commands), "dry_run": effective_dry_run},
     )
 
 
@@ -664,20 +715,42 @@ def restore_data(
     )
 
 
-def start_runtime(context: RollbackContext, *, dry_run: bool = False) -> RollbackStepResult:
-    """Start runtime after capsule repoint."""
+def start_runtime(
+    context: RollbackContext,
+    *,
+    dry_run: bool = False,
+    execute_commands: bool = True,
+    command_runner: RollbackCommandRunner | None = None,
+) -> RollbackStepResult:
+    """Start runtime after capsule repoint.
+
+    Set `execute_commands=False` for orchestration/unit-test flows that should
+    verify command construction without touching Docker.
+    """
 
     started_at = utc_now()
     commands = build_start_runtime_commands(context)
-    results = run_commands(commands, dry_run=dry_run) if commands else ()
+    effective_dry_run = dry_run or not execute_commands
+    results = (
+        run_commands(commands, dry_run=effective_dry_run, command_runner=command_runner)
+        if commands
+        else ()
+    )
+
+    if not commands:
+        message = "No runtime compose file found; start skipped"
+    elif effective_dry_run:
+        message = "Runtime start command planned"
+    else:
+        message = "Runtime started"
 
     return _make_step_result(
         RollbackStep.START_RUNTIME,
         RollbackStatus.HEALTHCHECKING,
-        "Runtime started" if commands else "No runtime compose file found; start skipped",
+        message,
         started_at,
         command_results=results,
-        metadata={"commands": len(commands)},
+        metadata={"commands": len(commands), "dry_run": effective_dry_run},
     )
 
 
@@ -766,23 +839,37 @@ def rollback_instance(
     healthcheck_runner: HealthcheckRunner | None = None,
     audit_logger: AuditLogger | None = None,
     dry_run: bool = False,
+    execute_runtime_commands: bool = False,
+    command_runner: RollbackCommandRunner | None = None,
 ) -> RollbackResult:
-    """Execute a full rollback workflow."""
+    """Execute a full rollback workflow.
+
+    By default this function does not execute Docker Compose commands directly.
+    It records the planned stop/start commands, performs pointer/state changes,
+    and runs supplied hooks. Agent endpoints that need to mutate the live runtime
+    should call with `execute_runtime_commands=True` or supply a command runner.
+    This keeps unit tests and API orchestration deterministic while preserving a
+    clear opt-in path for real runtime execution.
+    """
 
     logger = audit_logger or get_audit_logger()
     started_at = utc_now()
     steps: list[RollbackStepResult] = []
 
-    _audit(
-        logger,
-        context=context,
-        outcome=AuditOutcome.STARTED,
-        message="Rollback started",
-        metadata={"dry_run": dry_run},
-    )
-    write_rollback_state(context, RollbackStatus.RUNNING, metadata={"dry_run": dry_run})
-
     try:
+        _audit(
+            logger,
+            context=context,
+            outcome=AuditOutcome.STARTED,
+            message="Rollback started",
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
+        )
+        write_rollback_state(
+            context,
+            RollbackStatus.RUNNING,
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
+        )
+
         audit_instance_state_change(
             instance_id=context.instance_id,
             from_state=InstanceState.RUNNING,
@@ -792,7 +879,14 @@ def rollback_instance(
         )
 
         steps.append(preflight_rollback(context))
-        steps.append(stop_runtime(context, dry_run=dry_run))
+        steps.append(
+            stop_runtime(
+                context,
+                dry_run=dry_run,
+                execute_commands=execute_runtime_commands,
+                command_runner=command_runner,
+            )
+        )
 
         repoint_step = repoint_capsule(context, dry_run=dry_run)
         steps.append(repoint_step)
@@ -807,7 +901,14 @@ def rollback_instance(
         if data_step.status == RollbackStatus.DATA_RESTORED:
             write_rollback_state(context, RollbackStatus.DATA_RESTORED, metadata=data_step.metadata)
 
-        steps.append(start_runtime(context, dry_run=dry_run))
+        steps.append(
+            start_runtime(
+                context,
+                dry_run=dry_run,
+                execute_commands=execute_runtime_commands,
+                command_runner=command_runner,
+            )
+        )
         steps.append(run_migrations(context, migration_runner=migration_runner, dry_run=dry_run))
         steps.append(run_security_gate(context, security_gate_runner=security_gate_runner, dry_run=dry_run))
         steps.append(run_healthchecks(context, healthcheck_runner=healthcheck_runner, dry_run=dry_run))
@@ -821,10 +922,14 @@ def rollback_instance(
             started_at=started_at,
             completed_at=utc_now(),
             steps=tuple(steps),
-            metadata={"dry_run": dry_run},
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
         )
 
-        write_rollback_state(context, RollbackStatus.COMPLETED, metadata={"dry_run": dry_run})
+        write_rollback_state(
+            context,
+            RollbackStatus.COMPLETED,
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
+        )
         audit_instance_state_change(
             instance_id=context.instance_id,
             from_state=InstanceState.ROLLING_BACK,
@@ -837,7 +942,7 @@ def rollback_instance(
             context=context,
             outcome=AuditOutcome.SUCCEEDED,
             message="Rollback completed",
-            metadata={"dry_run": dry_run},
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
         )
         return result
 
@@ -845,7 +950,7 @@ def rollback_instance(
         write_rollback_state(
             context,
             RollbackStatus.FAILED,
-            metadata={"dry_run": dry_run},
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
             error=str(exc),
         )
         _audit(
@@ -854,7 +959,7 @@ def rollback_instance(
             outcome=AuditOutcome.FAILED,
             severity=AuditSeverity.ERROR,
             message="Rollback failed",
-            metadata={"dry_run": dry_run},
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
             error=exc,
         )
 
@@ -868,7 +973,7 @@ def rollback_instance(
             completed_at=utc_now(),
             steps=tuple(steps),
             error=str(exc),
-            metadata={"dry_run": dry_run},
+            metadata={"dry_run": dry_run, "execute_runtime_commands": execute_runtime_commands},
         )
 
 
@@ -903,14 +1008,14 @@ def result_to_dict(result: RollbackResult) -> dict[str, Any]:
 def latest_rollback_state(instance_id: InstanceID | str) -> dict[str, Any] | None:
     """Read the latest rollback state for an instance."""
 
-    path = instance_state_dir(str(instance_id)) / ROLLBACK_STATE_FILENAME
+    path = Path(os.fspath(instance_state_dir(str(instance_id)))) / ROLLBACK_STATE_FILENAME
     return _read_json(path)
 
 
 def rollback_history(instance_id: InstanceID | str) -> list[dict[str, Any]]:
     """Read rollback history entries for an instance."""
 
-    path = instance_state_dir(str(instance_id)) / ROLLBACK_HISTORY_FILENAME
+    path = Path(os.fspath(instance_state_dir(str(instance_id)))) / ROLLBACK_HISTORY_FILENAME
     if not path.exists():
         return []
 
@@ -927,7 +1032,7 @@ def rollback_history(instance_id: InstanceID | str) -> list[dict[str, Any]]:
 def clear_failed_rollback_state(instance_id: InstanceID | str) -> None:
     """Remove failed rollback marker after operator review."""
 
-    state_file = instance_state_dir(str(instance_id)) / ROLLBACK_STATE_FILENAME
+    state_file = Path(os.fspath(instance_state_dir(str(instance_id)))) / ROLLBACK_STATE_FILENAME
     state = _read_json(state_file)
     if not state:
         return
@@ -950,6 +1055,7 @@ __all__ = [
     "RollbackCommand",
     "RollbackCommandError",
     "RollbackCommandResult",
+    "RollbackCommandRunner",
     "RollbackContext",
     "RollbackError",
     "RollbackResult",
@@ -986,4 +1092,8 @@ __all__ = [
     "validate_rollback_context",
     "write_capsule_pointer",
     "write_rollback_state",
+    "KX_BACKUPS_ROOT",
+    "KX_CAPSULES_DIR",
+    "KX_INSTANCES_DIR",
+    "KX_ROOT",
 ]

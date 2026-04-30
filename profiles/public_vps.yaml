@@ -1,9 +1,36 @@
-schema_version: kxprofile/v1
-profile: public_vps
-name: Public VPS
-description: Public VPS deployment profile. Exposes only Traefik on 80/443 and keeps
-  all application internals private.
-default: false
+schema_version: kx-network-profile/v1
+
+profile:
+  name: public_vps
+  label: Public VPS
+  description: Public VPS deployment profile. Exposes only Traefik on 80/443 and keeps all application internals private.
+  default: false
+  app_version: v14
+  param_version: kx-param-2026.04.30
+
+exposure:
+  mode: public
+  public_allowed: true
+  requires_expiration: false
+  host_required: true
+  tls_required: true
+  reverse_proxy: traefik
+
+canonical_env:
+  KX_NETWORK_PROFILE: public_vps
+  KX_EXPOSURE_MODE: public
+  KX_PUBLIC_MODE_ENABLED: "true"
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_REQUIRE_SIGNED_CAPSULE: "true"
+  KX_GENERATE_SECRETS_ON_INSTALL: "true"
+  KX_ALLOW_UNKNOWN_IMAGES: "false"
+  KX_ALLOW_PRIVILEGED_CONTAINERS: "false"
+  KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
+  KX_ALLOW_HOST_NETWORK: "false"
+  KX_BACKUP_ENABLED: "true"
+  KX_BACKUP_ROOT: /opt/konnaxion/backups
+  KX_HOST: <PUBLIC_VPS_HOST>
+
 network:
   network_profile: public_vps
   exposure_mode: public
@@ -12,115 +39,211 @@ network:
   host_required: true
   tls_required: true
   reverse_proxy: traefik
+  bind:
+    host: "0.0.0.0"
+    scope: public
+    allow_wan: true
+    allow_public_internet: true
+  dns:
+    domain_required: true
+    preferred_hostname: <PUBLIC_VPS_HOST>
+    allowed_hosts:
+      - <PUBLIC_VPS_HOST>
+
 entrypoints:
+  traefik:
+    enabled: true
+    public: true
+    lan: true
+    ports:
+      http:
+        port: 80
+        protocol: tcp
+        enabled: true
+        purpose: HTTP redirect to HTTPS
+        service: traefik
+        redirect_to_https: true
+      https:
+        port: 443
+        protocol: tcp
+        enabled: true
+        purpose: HTTPS public entrypoint
+        service: traefik
+
   allowed_public_ports:
-  - port: 80
-    protocol: tcp
-    purpose: HTTP redirect to HTTPS
-    service: traefik
-  - port: 443
-    protocol: tcp
-    purpose: HTTPS public entrypoint
-    service: traefik
+    - port: 80
+      protocol: tcp
+      purpose: HTTP redirect to HTTPS
+      service: traefik
+    - port: 443
+      protocol: tcp
+      purpose: HTTPS public entrypoint
+      service: traefik
+
   restricted_admin_ports:
-  - port: 22
-    protocol: tcp
-    purpose: SSH admin access
-    exposure: restricted
-    required_controls:
-    - key_only_authentication
-    - non_root_login
-    - source_ip_allowlist_recommended
-    - fail2ban_or_equivalent_recommended
+    - port: 22
+      protocol: tcp
+      purpose: SSH admin access
+      exposure: restricted
+      required: false
+      required_controls:
+        - key_only_authentication
+        - non_root_login
+        - source_ip_allowlist_recommended
+        - fail2ban_or_equivalent_recommended
+
 routing:
-  /: frontend-next
-  /api/: django-api
-  /admin/: django-api
-  /media/: media-nginx
+  "/":
+    service: frontend-next
+    internal_port: 3000
+  "/api/":
+    service: django-api
+    internal_port: 5000
+  "/admin/":
+    service: django-api
+    internal_port: 5000
+  "/media/":
+    service: media-nginx
+    internal_port: 80
+
 services:
   public:
-  - traefik
+    - traefik
+  public_entrypoint:
+    - traefik
+  routed_services:
+    - frontend-next
+    - django-api
+    - media-nginx
   internal_only:
-  - frontend-next
-  - django-api
-  - postgres
-  - redis
-  - celeryworker
-  - celerybeat
-  - flower
-  - media-nginx
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+    - kx-agent
+  forbidden_public:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+    - kx-agent
+
 forbidden_public_ports:
-- port: 3000
-  service: frontend-next
-  reason: Next.js direct port must stay internal.
-- port: 5000
-  service: django-api
-  reason: Django/Gunicorn direct port must stay internal.
-- port: 5432
-  service: postgres
-  reason: PostgreSQL must never be public.
-- port: 6379
-  service: redis
-  reason: Redis must never be public.
-- port: 5555
-  service: flower
-  reason: Flower dashboard must stay private.
-- port: 8000
-  service: django-dev-server
-  reason: Django development server must never be public.
+  - port: 3000
+    service: frontend-next
+    reason: Next.js direct port must stay internal.
+  - port: 5000
+    service: django-api
+    reason: Django/Gunicorn direct port must stay internal.
+  - port: 5432
+    service: postgres
+    reason: PostgreSQL must never be public.
+  - port: 6379
+    service: redis
+    reason: Redis must never be public.
+  - port: 5555
+    service: flower
+    reason: Flower dashboard must stay private.
+  - port: 8000
+    service: django-dev-server
+    reason: Django development server must never be public.
+
 firewall:
   required: true
+  mode: deny_by_default
   default_policy: deny_inbound
   allow:
-  - port: 80
-    protocol: tcp
-    source: 0.0.0.0/0
-  - port: 443
-    protocol: tcp
-    source: 0.0.0.0/0
+    - port: 80
+      protocol: tcp
+      source: 0.0.0.0/0
+      purpose: http_redirect_to_https
+    - port: 443
+      protocol: tcp
+      source: 0.0.0.0/0
+      purpose: https_traefik
   allow_restricted:
-  - port: 22
-    protocol: tcp
-    source: <ADMIN_SOURCE_CIDR>
-    required: false
+    - port: 22
+      protocol: tcp
+      source: <ADMIN_SOURCE_CIDR>
+      required: false
+      purpose: restricted_ssh_admin
+      required_controls:
+        - key_only_authentication
+        - non_root_login
+        - source_ip_allowlist_recommended
+        - fail2ban_or_equivalent_recommended
   deny:
-  - 3000
-  - 5000
-  - 5432
-  - 6379
-  - 5555
-  - 8000
+    - 3000
+    - 5000
+    - 5432
+    - 6379
+    - 5555
+    - 8000
+  deny_public_inbound:
+    - port: 3000
+      protocol: tcp
+      purpose: frontend_next_direct_forbidden
+    - port: 5000
+      protocol: tcp
+      purpose: django_api_direct_forbidden
+    - port: 5432
+      protocol: tcp
+      purpose: postgres_forbidden
+    - port: 6379
+      protocol: tcp
+      purpose: redis_forbidden
+    - port: 5555
+      protocol: tcp
+      purpose: flower_forbidden
+    - port: 8000
+      protocol: tcp
+      purpose: django_dev_server_forbidden
+  deny_all_other_inbound: true
+
 security_gate:
   required: true
   blocking_checks:
-  - capsule_signature
-  - image_checksums
-  - manifest_schema
-  - secrets_present
-  - secrets_not_default
-  - dangerous_ports_blocked
-  - postgres_not_public
-  - redis_not_public
-  - docker_socket_not_mounted
-  - no_privileged_containers
-  - no_host_network
-  - allowed_images_only
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
   checks:
-  - capsule_signature
-  - image_checksums
-  - manifest_schema
-  - secrets_present
-  - secrets_not_default
-  - firewall_enabled
-  - dangerous_ports_blocked
-  - postgres_not_public
-  - redis_not_public
-  - docker_socket_not_mounted
-  - no_privileged_containers
-  - no_host_network
-  - allowed_images_only
-  - admin_surface_private
-  - backup_configured
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - firewall_enabled
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
+    - admin_surface_private
+    - backup_configured
+  warn_checks:
+    - firewall_enabled
+    - admin_surface_private
+    - backup_configured
+
 runtime_policy:
   allow_unknown_images: false
   allow_privileged_containers: false
@@ -129,34 +252,57 @@ runtime_policy:
   allow_internal_service_port_publication: false
   require_signed_capsule: true
   generate_secrets_on_install: true
-environment:
-  KX_NETWORK_PROFILE: public_vps
-  KX_EXPOSURE_MODE: public
-  KX_PUBLIC_MODE_ENABLED: 'true'
-  KX_PUBLIC_MODE_EXPIRES_AT: ''
-  KX_REQUIRE_SIGNED_CAPSULE: 'true'
-  KX_GENERATE_SECRETS_ON_INSTALL: 'true'
-  KX_ALLOW_UNKNOWN_IMAGES: 'false'
-  KX_ALLOW_PRIVILEGED_CONTAINERS: 'false'
-  KX_ALLOW_DOCKER_SOCKET_MOUNT: 'false'
-  KX_ALLOW_HOST_NETWORK: 'false'
-  KX_BACKUP_ENABLED: 'true'
-  KX_BACKUP_ROOT: /opt/konnaxion/backups
-  KX_HOST: <PUBLIC_VPS_HOST>
+
+compose_overrides:
+  traefik:
+    publish_ports:
+      - "80:80"
+      - "443:443"
+  frontend-next:
+    expose_only:
+      - 3000
+    publish_ports: []
+  django-api:
+    expose_only:
+      - 5000
+    publish_ports: []
+  postgres:
+    expose_only:
+      - 5432
+    publish_ports: []
+  redis:
+    expose_only:
+      - 6379
+    publish_ports: []
+  flower:
+    expose_only:
+      - 5555
+    publish_ports: []
+  media-nginx:
+    expose_only:
+      - 80
+    publish_ports: []
+
 certificates:
   mode: public_tls
   provider: traefik_acme
   email_required: true
   domain_required: true
+
 backup:
   enabled: true
   root: /opt/konnaxion/backups/<INSTANCE_ID>/
   pre_update_backup_required: true
   pre_restore_backup_required: true
-notes:
-- Use this profile only for a hardened public VPS or equivalent controlled host.
-- Only Traefik may receive public HTTP/HTTPS traffic.
-- PostgreSQL, Redis, Flower, Django direct ports, Next.js direct port, and Docker
-  daemon must never be public.
-- SSH is not an application entrypoint and must be restricted by key authentication
-  and source controls.
+  retention:
+    daily_days: 14
+    weekly_weeks: 8
+    monthly_months: 12
+    pre_update_count: 5
+    pre_restore_count: 5
+
+operator_notes:
+  - Use this profile only for a hardened public VPS or equivalent controlled host.
+  - Only Traefik may receive public HTTP/HTTPS traffic.
+  - PostgreSQL, Redis, Flower, Django direct ports, Next.js direct port, and Docker daemon must never be public.
+  - SSH is not an application entrypoint and must be restricted by key authentication and source controls.

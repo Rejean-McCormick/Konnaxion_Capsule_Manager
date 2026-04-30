@@ -10,9 +10,207 @@ Generated from the Konnaxion canonical documentation.
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
+
+
+# ---------------------------------------------------------------------------
+# POSIX-stable canonical paths
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalPath(os.PathLike[str]):
+    """
+    POSIX-stable path object for canonical appliance paths.
+
+    Why this exists:
+    - Konnaxion canonical runtime paths are Linux/POSIX paths.
+    - On Windows, pathlib.Path("/opt/konnaxion") renders as "\\opt\\konnaxion".
+    - Tests and generated env values must remain "/opt/konnaxion/...".
+
+    This object supports the path operations used by the project while keeping
+    str(path), path.as_posix(), and env rendering stable across platforms.
+    """
+
+    value: str
+
+    def __post_init__(self) -> None:
+        normalized = self._normalize(self.value)
+        object.__setattr__(self, "value", normalized)
+
+    @staticmethod
+    def _normalize(value: str | os.PathLike[str]) -> str:
+        text = os.fspath(value).replace("\\", "/").strip()
+
+        if not text:
+            return "."
+
+        while "//" in text:
+            text = text.replace("//", "/")
+
+        if len(text) > 1:
+            text = text.rstrip("/")
+
+        return text
+
+    def __truediv__(self, other: str | os.PathLike[str]) -> "CanonicalPath":
+        right = self._normalize(other).lstrip("/")
+
+        if self.value == "/":
+            return CanonicalPath(f"/{right}")
+
+        return CanonicalPath(f"{self.value}/{right}")
+
+    def __fspath__(self) -> str:
+        return self.value
+
+    def __str__(self) -> str:
+        return self.value
+
+    def __repr__(self) -> str:
+        return f"CanonicalPath({self.value!r})"
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, CanonicalPath):
+            return self.value == other.value
+
+        if isinstance(other, os.PathLike):
+            other_text = os.fspath(other)
+            other_text = other_text.replace("\\", "/")
+            return self.value == self._normalize(other_text)
+
+        if isinstance(other, str):
+            return self.value == self._normalize(other)
+
+        return False
+
+    @property
+    def parent(self) -> "CanonicalPath":
+        if self.value in {".", "/"}:
+            return self
+
+        parent = self.value.rsplit("/", 1)[0]
+
+        if not parent:
+            parent = "/"
+
+        return CanonicalPath(parent)
+
+    @property
+    def name(self) -> str:
+        if self.value == "/":
+            return ""
+
+        return self.value.rsplit("/", 1)[-1]
+
+    @property
+    def suffix(self) -> str:
+        name = self.name
+
+        if "." not in name:
+            return ""
+
+        return "." + name.rsplit(".", 1)[-1]
+
+    @property
+    def stem(self) -> str:
+        name = self.name
+
+        if "." not in name:
+            return name
+
+        return name.rsplit(".", 1)[0]
+
+    def as_posix(self) -> str:
+        return self.value
+
+    def is_absolute(self) -> bool:
+        return self.value.startswith("/")
+
+    def joinpath(self, *parts: str | os.PathLike[str]) -> "CanonicalPath":
+        current = self
+
+        for part in parts:
+            current = current / part
+
+        return current
+
+    def relative_to(self, other: str | os.PathLike[str]) -> "CanonicalPath":
+        base = self._normalize(other).rstrip("/")
+        value = self.value
+
+        if value == base:
+            return CanonicalPath(".")
+
+        prefix = base + "/"
+
+        if not value.startswith(prefix):
+            raise ValueError(f"{value!r} is not relative to {base!r}")
+
+        return CanonicalPath(value[len(prefix) :])
+
+    def with_name(self, name: str) -> "CanonicalPath":
+        return self.parent / name
+
+    def with_suffix(self, suffix: str) -> "CanonicalPath":
+        if suffix and not suffix.startswith("."):
+            suffix = "." + suffix
+
+        return self.parent / f"{self.stem}{suffix}"
+
+    def to_path(self) -> Path:
+        """Return a platform pathlib.Path for filesystem operations."""
+        return Path(self.value)
+
+    def exists(self) -> bool:
+        return self.to_path().exists()
+
+    def is_file(self) -> bool:
+        return self.to_path().is_file()
+
+    def is_dir(self) -> bool:
+        return self.to_path().is_dir()
+
+    def mkdir(self, *args: Any, **kwargs: Any) -> None:
+        self.to_path().mkdir(*args, **kwargs)
+
+    def open(self, *args: Any, **kwargs: Any) -> Any:
+        return self.to_path().open(*args, **kwargs)
+
+    def read_text(self, *args: Any, **kwargs: Any) -> str:
+        return self.to_path().read_text(*args, **kwargs)
+
+    def write_text(self, *args: Any, **kwargs: Any) -> int:
+        return self.to_path().write_text(*args, **kwargs)
+
+    def read_bytes(self) -> bytes:
+        return self.to_path().read_bytes()
+
+    def write_bytes(self, data: bytes) -> int:
+        return self.to_path().write_bytes(data)
+
+    def resolve(self, *args: Any, **kwargs: Any) -> Path:
+        return self.to_path().resolve(*args, **kwargs)
+
+    def expanduser(self) -> Path:
+        return self.to_path().expanduser()
+
+
+def canonical_path(value: str | os.PathLike[str]) -> CanonicalPath:
+    """Create a POSIX-stable canonical path."""
+    return CanonicalPath(os.fspath(value))
+
+
+def enum_value(value: object) -> str:
+    """Return enum .value when available, otherwise stable string."""
+    return str(getattr(value, "value", value))
 
 
 # ---------------------------------------------------------------------------
@@ -45,88 +243,92 @@ CAPSULE_NAME: Final[str] = "Konnaxion Capsule"
 # Canonical paths
 # ---------------------------------------------------------------------------
 
-KX_ROOT: Final[Path] = Path("/opt/konnaxion")
+KX_ROOT: Final[CanonicalPath] = canonical_path("/opt/konnaxion")
 
-KX_CAPSULES_DIR: Final[Path] = KX_ROOT / "capsules"
-KX_INSTANCES_DIR: Final[Path] = KX_ROOT / "instances"
-KX_SHARED_DIR: Final[Path] = KX_ROOT / "shared"
-KX_RELEASES_DIR: Final[Path] = KX_ROOT / "releases"
-KX_MANAGER_DIR: Final[Path] = KX_ROOT / "manager"
-KX_AGENT_DIR: Final[Path] = KX_ROOT / "agent"
-KX_BACKUPS_ROOT: Final[Path] = KX_ROOT / "backups"
+KX_CAPSULES_DIR: Final[CanonicalPath] = KX_ROOT / "capsules"
+KX_INSTANCES_DIR: Final[CanonicalPath] = KX_ROOT / "instances"
+KX_SHARED_DIR: Final[CanonicalPath] = KX_ROOT / "shared"
+KX_RELEASES_DIR: Final[CanonicalPath] = KX_ROOT / "releases"
+KX_MANAGER_DIR: Final[CanonicalPath] = KX_ROOT / "manager"
+KX_AGENT_DIR: Final[CanonicalPath] = KX_ROOT / "agent"
+KX_BACKUPS_ROOT: Final[CanonicalPath] = KX_ROOT / "backups"
 
-LEGACY_VPS_ROOT: Final[Path] = Path("/home/deploy/apps/Konnaxion")
-LEGACY_VPS_BACKEND: Final[Path] = LEGACY_VPS_ROOT / "backend"
-LEGACY_VPS_FRONTEND: Final[Path] = LEGACY_VPS_ROOT / "frontend"
+LEGACY_VPS_ROOT: Final[CanonicalPath] = canonical_path("/home/deploy/apps/Konnaxion")
+LEGACY_VPS_BACKEND: Final[CanonicalPath] = LEGACY_VPS_ROOT / "backend"
+LEGACY_VPS_FRONTEND: Final[CanonicalPath] = LEGACY_VPS_ROOT / "frontend"
 
-LEGACY_VPS_PATHS: Final[tuple[Path, ...]] = (
+LEGACY_VPS_PATHS: Final[tuple[CanonicalPath, ...]] = (
     LEGACY_VPS_ROOT,
     LEGACY_VPS_BACKEND,
     LEGACY_VPS_FRONTEND,
 )
 
 
-def instance_root(instance_id: str) -> Path:
+def instance_root(instance_id: str) -> CanonicalPath:
     """Return the canonical root directory for an instance."""
     return KX_INSTANCES_DIR / instance_id
 
 
-def instance_env_dir(instance_id: str) -> Path:
+def instance_env_dir(instance_id: str) -> CanonicalPath:
     """Return the canonical env directory for an instance."""
     return instance_root(instance_id) / "env"
 
 
-def instance_postgres_dir(instance_id: str) -> Path:
+def instance_postgres_dir(instance_id: str) -> CanonicalPath:
     """Return the canonical Postgres data directory for an instance."""
     return instance_root(instance_id) / "postgres"
 
 
-def instance_redis_dir(instance_id: str) -> Path:
+def instance_redis_dir(instance_id: str) -> CanonicalPath:
     """Return the canonical Redis data directory for an instance."""
     return instance_root(instance_id) / "redis"
 
 
-def instance_media_dir(instance_id: str) -> Path:
+def instance_media_dir(instance_id: str) -> CanonicalPath:
     """Return the canonical media directory for an instance."""
     return instance_root(instance_id) / "media"
 
 
-def instance_logs_dir(instance_id: str) -> Path:
+def instance_logs_dir(instance_id: str) -> CanonicalPath:
     """Return the canonical logs directory for an instance."""
     return instance_root(instance_id) / "logs"
 
 
-def instance_local_backups_dir(instance_id: str) -> Path:
+def instance_local_backups_dir(instance_id: str) -> CanonicalPath:
     """Return the optional instance-local backup pointer/cache/state directory."""
     return instance_root(instance_id) / "backups"
 
 
-def instance_state_dir(instance_id: str) -> Path:
+def instance_state_dir(instance_id: str) -> CanonicalPath:
     """Return the canonical state directory for an instance."""
     return instance_root(instance_id) / "state"
 
 
-def instance_compose_file(instance_id: str) -> Path:
+def instance_compose_file(instance_id: str) -> CanonicalPath:
     """Return the generated runtime Docker Compose file path for an instance."""
     return instance_state_dir(instance_id) / "docker-compose.runtime.yml"
 
 
-def instance_backup_root(instance_id: str) -> Path:
+def instance_backup_root(instance_id: str) -> CanonicalPath:
     """Return the canonical backup storage root for an instance."""
     return KX_BACKUPS_ROOT / instance_id
 
 
-def instance_backup_dir(instance_id: str, backup_class: str, backup_id: str) -> Path:
+def instance_backup_dir(
+    instance_id: str,
+    backup_class: str,
+    backup_id: str,
+) -> CanonicalPath:
     """Return the canonical backup artifact directory."""
     return instance_backup_root(instance_id) / backup_class / backup_id
 
 
-def release_root(release_id: str) -> Path:
+def release_root(release_id: str) -> CanonicalPath:
     """Return the canonical release directory."""
     return KX_RELEASES_DIR / release_id
 
 
-def capsule_path(capsule_id: str) -> Path:
+def capsule_path(capsule_id: str) -> CanonicalPath:
     """Return the canonical on-host capsule path."""
     return KX_CAPSULES_DIR / f"{capsule_id}{CAPSULE_EXTENSION}"
 
@@ -147,7 +349,6 @@ CAPSULE_ROOT_DIRS: Final[tuple[str, ...]] = (
     "profiles",
     "env-templates",
     "migrations",
-    "seed-data",
     "healthchecks",
     "policies",
     "metadata",
@@ -158,23 +359,68 @@ CAPSULE_REQUIRED_ROOT_ENTRIES: Final[tuple[str, ...]] = (
     *CAPSULE_ROOT_DIRS,
 )
 
-CAPSULE_FORBIDDEN_SECRET_LABELS: Final[tuple[str, ...]] = (
-    "DJANGO_SECRET_KEY",
-    "POSTGRES_PASSWORD",
-    "DATABASE_URL",
-    "SSH private key",
-    "API token",
-    "Git token",
-    "provider token",
-    "unencrypted production DB dump",
-    "complete .env file containing secrets",
-    "private certificate key",
+
+# ---------------------------------------------------------------------------
+# Docker services
+# ---------------------------------------------------------------------------
+
+
+class DockerService(StrEnum):
+    """Canonical Docker Compose service names."""
+
+    TRAEFIK = "traefik"
+    FRONTEND_NEXT = "frontend-next"
+    DJANGO_API = "django-api"
+    POSTGRES = "postgres"
+    REDIS = "redis"
+    CELERYWORKER = "celeryworker"
+    CELERYBEAT = "celerybeat"
+    FLOWER = "flower"
+    MEDIA_NGINX = "media-nginx"
+    KX_AGENT = "kx-agent"
+
+
+CANONICAL_DOCKER_SERVICES: Final[tuple[str, ...]] = tuple(
+    service.value for service in DockerService
 )
+
+FORBIDDEN_SERVICE_ALIASES: Final[frozenset[str]] = frozenset(
+    {
+        "backend",
+        "api",
+        "web",
+        "next",
+        "frontend",
+        "db",
+        "database",
+        "cache",
+        "worker",
+        "scheduler",
+        "media",
+        "agent",
+    }
+)
+
+SERVICE_ALIAS_REPLACEMENTS: Final[dict[str, str]] = {
+    "backend": DockerService.DJANGO_API.value,
+    "api": DockerService.DJANGO_API.value,
+    "web": DockerService.FRONTEND_NEXT.value,
+    "next": DockerService.FRONTEND_NEXT.value,
+    "frontend": DockerService.FRONTEND_NEXT.value,
+    "db": DockerService.POSTGRES.value,
+    "database": DockerService.POSTGRES.value,
+    "cache": DockerService.REDIS.value,
+    "worker": DockerService.CELERYWORKER.value,
+    "scheduler": DockerService.CELERYBEAT.value,
+    "media": DockerService.MEDIA_NGINX.value,
+    "agent": DockerService.KX_AGENT.value,
+}
 
 
 # ---------------------------------------------------------------------------
 # Network profiles and exposure modes
 # ---------------------------------------------------------------------------
+
 
 class NetworkProfile(StrEnum):
     """Canonical Konnaxion network profiles."""
@@ -209,48 +455,104 @@ CANONICAL_EXPOSURE_MODES: Final[tuple[str, ...]] = tuple(
     mode.value for mode in ExposureMode
 )
 
+CANONICAL_PROFILE_FILES: Final[dict[str, str]] = {
+    NetworkProfile.LOCAL_ONLY.value: "local_only.yaml",
+    NetworkProfile.INTRANET_PRIVATE.value: "intranet_private.yaml",
+    NetworkProfile.PRIVATE_TUNNEL.value: "private_tunnel.yaml",
+    NetworkProfile.PUBLIC_TEMPORARY.value: "public_temporary.yaml",
+    NetworkProfile.PUBLIC_VPS.value: "public_vps.yaml",
+    NetworkProfile.OFFLINE.value: "offline.yaml",
+}
 
-# ---------------------------------------------------------------------------
-# Docker services
-# ---------------------------------------------------------------------------
-
-class DockerService(StrEnum):
-    """Canonical Docker Compose service names."""
-
-    TRAEFIK = "traefik"
-    FRONTEND_NEXT = "frontend-next"
-    DJANGO_API = "django-api"
-    POSTGRES = "postgres"
-    REDIS = "redis"
-    CELERYWORKER = "celeryworker"
-    CELERYBEAT = "celerybeat"
-    FLOWER = "flower"
-    MEDIA_NGINX = "media-nginx"
-    KX_AGENT = "kx-agent"
-
-
-CANONICAL_DOCKER_SERVICES: Final[tuple[str, ...]] = tuple(
-    service.value for service in DockerService
-)
-
-FORBIDDEN_SERVICE_ALIASES: Final[dict[str, str]] = {
-    "backend": DockerService.DJANGO_API.value,
-    "api": DockerService.DJANGO_API.value,
-    "web": DockerService.FRONTEND_NEXT.value,
-    "next": DockerService.FRONTEND_NEXT.value,
-    "frontend": DockerService.FRONTEND_NEXT.value,
-    "db": DockerService.POSTGRES.value,
-    "database": DockerService.POSTGRES.value,
-    "cache": DockerService.REDIS.value,
-    "worker": DockerService.CELERYWORKER.value,
-    "scheduler": DockerService.CELERYBEAT.value,
-    "media": DockerService.MEDIA_NGINX.value,
-    "agent": DockerService.KX_AGENT.value,
+ALLOWED_PROFILE_EXPOSURE: Final[dict[str, frozenset[str]]] = {
+    NetworkProfile.LOCAL_ONLY.value: frozenset({ExposureMode.PRIVATE.value}),
+    NetworkProfile.INTRANET_PRIVATE.value: frozenset(
+        {
+            ExposureMode.PRIVATE.value,
+            ExposureMode.LAN.value,
+        }
+    ),
+    NetworkProfile.PRIVATE_TUNNEL.value: frozenset(
+        {
+            ExposureMode.PRIVATE.value,
+            ExposureMode.VPN.value,
+        }
+    ),
+    NetworkProfile.PUBLIC_TEMPORARY.value: frozenset(
+        {
+            ExposureMode.TEMPORARY_TUNNEL.value,
+        }
+    ),
+    NetworkProfile.PUBLIC_VPS.value: frozenset(
+        {
+            ExposureMode.PUBLIC.value,
+        }
+    ),
+    NetworkProfile.OFFLINE.value: frozenset({ExposureMode.PRIVATE.value}),
 }
 
 
+def is_canonical_network_profile(value: object) -> bool:
+    """Return True when value is a canonical Konnaxion network profile."""
+    return enum_value(value) in CANONICAL_NETWORK_PROFILES
+
+
+def is_canonical_exposure_mode(value: object) -> bool:
+    """Return True when value is a canonical Konnaxion exposure mode."""
+    return enum_value(value) in CANONICAL_EXPOSURE_MODES
+
+
+def is_canonical_service(value: object) -> bool:
+    """Return True when value is a canonical Docker service name."""
+    return enum_value(value) in CANONICAL_DOCKER_SERVICES
+
+
+def is_public_mode(
+    network_profile: object = DEFAULT_NETWORK_PROFILE,
+    exposure_mode: object = DEFAULT_EXPOSURE_MODE,
+    public_mode_enabled: bool = DEFAULT_PUBLIC_MODE_ENABLED,
+) -> bool:
+    """Return True when profile/mode represents public exposure."""
+    profile = enum_value(network_profile)
+    mode = enum_value(exposure_mode)
+
+    return (
+        bool(public_mode_enabled)
+        or profile in {
+            NetworkProfile.PUBLIC_TEMPORARY.value,
+            NetworkProfile.PUBLIC_VPS.value,
+        }
+        or mode in {
+            ExposureMode.TEMPORARY_TUNNEL.value,
+            ExposureMode.PUBLIC.value,
+        }
+    )
+
+
+def require_public_expiration(
+    *,
+    network_profile: object = DEFAULT_NETWORK_PROFILE,
+    exposure_mode: object = DEFAULT_EXPOSURE_MODE,
+    public_mode_enabled: bool = DEFAULT_PUBLIC_MODE_ENABLED,
+    public_mode_expires_at: str | None = None,
+    expires_at: str | None = None,
+) -> None:
+    """Require an expiration timestamp for temporary public exposure."""
+    profile = enum_value(network_profile)
+    mode = enum_value(exposure_mode)
+    expiration = public_mode_expires_at or expires_at
+
+    temporary_public = (
+        profile == NetworkProfile.PUBLIC_TEMPORARY.value
+        or mode == ExposureMode.TEMPORARY_TUNNEL.value
+    )
+
+    if temporary_public and bool(public_mode_enabled) and not expiration:
+        raise ValueError("Temporary public exposure requires an expiration timestamp.")
+
+
 # ---------------------------------------------------------------------------
-# Ports and public surfaces
+# Ports and routes
 # ---------------------------------------------------------------------------
 
 ALLOWED_ENTRY_PORTS: Final[dict[str, int]] = {
@@ -259,31 +561,16 @@ ALLOWED_ENTRY_PORTS: Final[dict[str, int]] = {
     "ssh_admin_restricted": 22,
 }
 
-INTERNAL_ONLY_PORTS: Final[dict[str, int]] = {
-    DockerService.FRONTEND_NEXT.value: 3000,
-    DockerService.DJANGO_API.value: 5000,
-    DockerService.POSTGRES.value: 5432,
-    DockerService.REDIS.value: 6379,
-    DockerService.FLOWER.value: 5555,
+INTERNAL_ONLY_PORTS: Final[dict[DockerService | str, int]] = {
+    DockerService.FRONTEND_NEXT: 3000,
+    DockerService.DJANGO_API: 5000,
+    DockerService.POSTGRES: 5432,
+    DockerService.REDIS: 6379,
+    DockerService.FLOWER: 5555,
     "django_dev_server": 8000,
 }
 
 FORBIDDEN_PUBLIC_PORTS: Final[frozenset[int]] = frozenset(INTERNAL_ONLY_PORTS.values())
-
-FORBIDDEN_PUBLIC_SURFACES: Final[tuple[str, ...]] = (
-    "Next.js direct port",
-    "Django direct port",
-    "PostgreSQL",
-    "Redis",
-    "Flower/dashboard",
-    "Docker daemon TCP socket",
-    "Docker socket mount into app containers",
-)
-
-
-# ---------------------------------------------------------------------------
-# Routing
-# ---------------------------------------------------------------------------
 
 ROUTES: Final[dict[str, str]] = {
     "/": DockerService.FRONTEND_NEXT.value,
@@ -294,7 +581,7 @@ ROUTES: Final[dict[str, str]] = {
 
 
 # ---------------------------------------------------------------------------
-# Runtime environment variables
+# Runtime environment defaults
 # ---------------------------------------------------------------------------
 
 DJANGO_ENV_DEFAULTS: Final[dict[str, str]] = {
@@ -338,7 +625,6 @@ KX_ENV_DEFAULTS: Final[dict[str, str]] = {
     "KX_NETWORK_PROFILE": DEFAULT_NETWORK_PROFILE.value,
     "KX_EXPOSURE_MODE": DEFAULT_EXPOSURE_MODE.value,
     "KX_PUBLIC_MODE_ENABLED": "false",
-    "KX_PUBLIC_MODE_DURATION_HOURS": "",
     "KX_PUBLIC_MODE_EXPIRES_AT": "",
     "KX_REQUIRE_SIGNED_CAPSULE": "true",
     "KX_GENERATE_SECRETS_ON_INSTALL": "true",
@@ -347,18 +633,14 @@ KX_ENV_DEFAULTS: Final[dict[str, str]] = {
     "KX_ALLOW_DOCKER_SOCKET_MOUNT": "false",
     "KX_ALLOW_HOST_NETWORK": "false",
     "KX_BACKUP_ENABLED": "true",
-    "KX_BACKUP_ROOT": str(KX_BACKUPS_ROOT),
+    "KX_BACKUP_ROOT": "/opt/konnaxion/backups",
     "KX_BACKUP_RETENTION_DAYS": "14",
     "KX_DAILY_BACKUP_RETENTION_DAYS": "14",
     "KX_WEEKLY_BACKUP_RETENTION_WEEKS": "8",
     "KX_MONTHLY_BACKUP_RETENTION_MONTHS": "12",
     "KX_PRE_UPDATE_BACKUP_RETENTION_COUNT": "5",
     "KX_PRE_RESTORE_BACKUP_RETENTION_COUNT": "5",
-    "KX_COMPOSE_FILE": str(instance_compose_file("<KX_INSTANCE_ID>")),
-    "KX_BACKUP_DIR": str(
-        KX_BACKUPS_ROOT / "<KX_INSTANCE_ID>" / "<BACKUP_CLASS>" / "<BACKUP_ID>"
-    ),
-    "KX_HOST": "<GENERATED_FROM_PROFILE>",
+    "KX_HOST": "",
 }
 
 ALL_ENV_DEFAULTS: Final[dict[str, str]] = {
@@ -373,6 +655,7 @@ ALL_ENV_DEFAULTS: Final[dict[str, str]] = {
 # ---------------------------------------------------------------------------
 # Security Gate
 # ---------------------------------------------------------------------------
+
 
 class SecurityGateStatus(StrEnum):
     """Canonical Security Gate result statuses."""
@@ -434,8 +717,9 @@ BLOCKING_SECURITY_CHECKS: Final[frozenset[SecurityGateCheck]] = frozenset(
 # Lifecycle states
 # ---------------------------------------------------------------------------
 
+
 class InstanceState(StrEnum):
-    """Canonical Konnaxion Instance states."""
+    """Canonical Konnaxion Instance lifecycle states."""
 
     CREATED = "created"
     IMPORTING = "importing"
@@ -450,6 +734,16 @@ class InstanceState(StrEnum):
     DEGRADED = "degraded"
     FAILED = "failed"
     SECURITY_BLOCKED = "security_blocked"
+
+
+CANONICAL_INSTANCE_STATES: Final[tuple[str, ...]] = tuple(
+    state.value for state in InstanceState
+)
+
+
+# ---------------------------------------------------------------------------
+# Backup / restore / rollback statuses
+# ---------------------------------------------------------------------------
 
 
 class BackupStatus(StrEnum):
@@ -494,10 +788,6 @@ class RollbackStatus(StrEnum):
     FAILED = "failed"
 
 
-CANONICAL_INSTANCE_STATES: Final[tuple[str, ...]] = tuple(
-    state.value for state in InstanceState
-)
-
 CANONICAL_BACKUP_STATUSES: Final[tuple[str, ...]] = tuple(
     status.value for status in BackupStatus
 )
@@ -509,6 +799,9 @@ CANONICAL_RESTORE_STATUSES: Final[tuple[str, ...]] = tuple(
 CANONICAL_ROLLBACK_STATUSES: Final[tuple[str, ...]] = tuple(
     status.value for status in RollbackStatus
 )
+
+# Backward-compatible alias used by kx_shared.__init__ and older modules.
+BACKUP_STATUS: Final[type[BackupStatus]] = BackupStatus
 
 
 # ---------------------------------------------------------------------------
@@ -539,93 +832,36 @@ PUBLIC_CLI_COMMANDS: Final[tuple[str, ...]] = (
     "kx network set-profile",
 )
 
-INTERNAL_AGENT_COMMANDS: Final[tuple[str, ...]] = (
-    "kx backup preflight",
-    "kx backup postflight",
-    "kx instance stop-services",
-    "kx instance fix-permissions",
-)
-
-
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
-
-def is_canonical_network_profile(value: str) -> bool:
-    """Return True if value is a canonical network profile."""
-    return value in CANONICAL_NETWORK_PROFILES
-
-
-def is_canonical_exposure_mode(value: str) -> bool:
-    """Return True if value is a canonical exposure mode."""
-    return value in CANONICAL_EXPOSURE_MODES
-
-
-def is_canonical_service(value: str) -> bool:
-    """Return True if value is a canonical Docker service name."""
-    return value in CANONICAL_DOCKER_SERVICES
-
-
-def is_forbidden_public_port(port: int) -> bool:
-    """Return True if port must never be publicly exposed."""
-    return port in FORBIDDEN_PUBLIC_PORTS
-
-
-def is_public_mode(profile: NetworkProfile | str, exposure: ExposureMode | str) -> bool:
-    """Return True if the profile or exposure implies public access."""
-    profile_value = profile.value if isinstance(profile, NetworkProfile) else profile
-    exposure_value = exposure.value if isinstance(exposure, ExposureMode) else exposure
-    return (
-        profile_value in {NetworkProfile.PUBLIC_TEMPORARY.value, NetworkProfile.PUBLIC_VPS.value}
-        or exposure_value in {ExposureMode.TEMPORARY_TUNNEL.value, ExposureMode.PUBLIC.value}
-    )
-
-
-def normalize_service_name(value: str) -> str:
-    """
-    Normalize legacy/inconsistent service aliases to canonical service names.
-
-    Unknown values are returned unchanged so callers can decide whether to reject them.
-    """
-    return FORBIDDEN_SERVICE_ALIASES.get(value, value)
-
-
-def require_public_expiration(public_mode_enabled: bool, expires_at: str | None) -> None:
-    """
-    Validate that public mode has an expiration.
-
-    Raises:
-        ValueError: if public mode is enabled and expires_at is empty.
-    """
-    if public_mode_enabled and not expires_at:
-        raise ValueError("KX_PUBLIC_MODE_EXPIRES_AT is mandatory when public mode is enabled.")
-
 
 __all__ = [
     "AGENT_NAME",
-    "ALL_ENV_DEFAULTS",
     "ALLOWED_ENTRY_PORTS",
+    "ALLOWED_PROFILE_EXPOSURE",
+    "ALL_ENV_DEFAULTS",
     "APP_VERSION",
+    "BACKUP_STATUS",
     "BLOCKING_SECURITY_CHECKS",
     "BOX_NAME",
     "BUILDER_NAME",
+    "BackupStatus",
     "CANONICAL_BACKUP_STATUSES",
     "CANONICAL_DOCKER_SERVICES",
     "CANONICAL_EXPOSURE_MODES",
     "CANONICAL_INSTANCE_STATES",
     "CANONICAL_NETWORK_PROFILES",
+    "CANONICAL_PROFILE_FILES",
     "CANONICAL_RESTORE_STATUSES",
     "CANONICAL_ROLLBACK_STATUSES",
     "CANONICAL_SECURITY_GATE_CHECKS",
     "CANONICAL_SECURITY_GATE_STATUSES",
     "CAPSULE_EXTENSION",
     "CAPSULE_FILENAME_PATTERN",
-    "CAPSULE_FORBIDDEN_SECRET_LABELS",
     "CAPSULE_NAME",
     "CAPSULE_REQUIRED_ROOT_ENTRIES",
     "CAPSULE_ROOT_DIRS",
     "CAPSULE_ROOT_FILES",
     "CLI_NAME",
+    "CanonicalPath",
     "DATABASE_ENV_DEFAULTS",
     "DEFAULT_CAPSULE_ID",
     "DEFAULT_CAPSULE_VERSION",
@@ -639,13 +875,11 @@ __all__ = [
     "DockerService",
     "ExposureMode",
     "FORBIDDEN_PUBLIC_PORTS",
-    "FORBIDDEN_PUBLIC_SURFACES",
     "FORBIDDEN_SERVICE_ALIASES",
     "FRONTEND_ENV_DEFAULTS",
     "HOST_NAME",
-    "INTERNAL_AGENT_COMMANDS",
-    "INTERNAL_ONLY_PORTS",
     "INSTANCE_NAME",
+    "INTERNAL_ONLY_PORTS",
     "InstanceState",
     "KX_AGENT_DIR",
     "KX_BACKUPS_ROOT",
@@ -667,12 +901,14 @@ __all__ = [
     "PUBLIC_CLI_COMMANDS",
     "REDIS_ENV_DEFAULTS",
     "ROUTES",
-    "RollbackStatus",
     "RestoreStatus",
+    "RollbackStatus",
+    "SERVICE_ALIAS_REPLACEMENTS",
     "SecurityGateCheck",
     "SecurityGateStatus",
-    "BackupStatus",
+    "canonical_path",
     "capsule_path",
+    "enum_value",
     "instance_backup_dir",
     "instance_backup_root",
     "instance_compose_file",
@@ -687,9 +923,7 @@ __all__ = [
     "is_canonical_exposure_mode",
     "is_canonical_network_profile",
     "is_canonical_service",
-    "is_forbidden_public_port",
     "is_public_mode",
-    "normalize_service_name",
     "release_root",
     "require_public_expiration",
 ]

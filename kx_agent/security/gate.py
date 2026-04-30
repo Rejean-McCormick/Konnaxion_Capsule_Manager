@@ -8,7 +8,7 @@ and backup readiness.
 
 This module is intentionally deterministic and side-effect-light. It consumes a
 SecurityGateContext prepared by higher-level Agent components and returns a
-SecurityGateSummary that the lifecycle layer can use to allow or block startup.
+SecurityGateResult that the lifecycle layer can use to allow or block startup.
 """
 
 from __future__ import annotations
@@ -28,12 +28,6 @@ from kx_shared.konnaxion_constants import (
     DockerService,
     SecurityGateCheck,
     SecurityGateStatus,
-    is_canonical_service,
-)
-
-from kx_agent.instances.model import (
-    SecurityGateCheckResult,
-    SecurityGateSummary,
 )
 
 
@@ -71,24 +65,27 @@ SECRET_PLACEHOLDER_VALUES = frozenset(
         "secret",
         "default",
         "<generated_on_install>",
+        "<generated-on-install>",
         "<generated-from-profile>",
-        "<generated_from_profile>",
         "<postgres_password>",
-        "<public_or_private_host>",
+        "<django_secret_key>",
+        "example",
+        "test",
+        "admin",
+        "none",
+        "null",
     }
 )
 
 SECRET_PLACEHOLDER_SUBSTRINGS = frozenset(
     {
-        "<generated",
-        "<postgres_password>",
-        "<public_or_private_host>",
         "changeme",
         "change-me",
-        "example",
         "placeholder",
+        "generated",
+        "example",
         "dummy",
-        "default-secret",
+        "default",
     }
 )
 
@@ -96,13 +93,7 @@ FORBIDDEN_MOUNT_PATHS = frozenset(
     {
         "/var/run/docker.sock",
         "/run/docker.sock",
-        "docker.sock",
-    }
-)
-
-FORBIDDEN_HOST_NETWORK_VALUES = frozenset(
-    {
-        "host",
+        "\\\\.\\pipe\\docker_engine",
     }
 )
 
@@ -111,212 +102,90 @@ FORBIDDEN_PRIVILEGED_VALUES = frozenset(
         True,
         "true",
         "True",
-        "yes",
-        "1",
+        "TRUE",
         1,
+        "1",
+        "yes",
+        "YES",
+        "on",
+        "ON",
+    }
+)
+
+FORBIDDEN_HOST_NETWORK_VALUES = frozenset(
+    {
+        "host",
+        "HOST",
     }
 )
 
 DEFAULT_ALLOWED_IMAGES = frozenset(
     {
-        DockerService.TRAEFIK.value,
-        DockerService.FRONTEND_NEXT.value,
-        DockerService.DJANGO_API.value,
-        DockerService.POSTGRES.value,
-        DockerService.REDIS.value,
-        DockerService.CELERYWORKER.value,
-        DockerService.CELERYBEAT.value,
-        DockerService.FLOWER.value,
-        DockerService.MEDIA_NGINX.value,
-        DockerService.KX_AGENT.value,
+        "traefik",
+        "frontend-next",
+        "django-api",
+        "postgres",
+        "redis",
+        "celeryworker",
+        "celerybeat",
+        "flower",
+        "media-nginx",
+        "kx-agent",
+        "nginx",
     }
 )
 
 
 # ---------------------------------------------------------------------------
-# Input models
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class PublishedPort:
-    """A host-published port discovered in runtime configuration."""
-
-    service: str
-    host_port: int
-    container_port: int | None = None
-    protocol: str = "tcp"
-    host_ip: str | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "service", str(self.service))
-        object.__setattr__(self, "host_port", int(self.host_port))
-        if self.container_port is not None:
-            object.__setattr__(self, "container_port", int(self.container_port))
-
-
-@dataclass(frozen=True)
-class RuntimeServicePolicy:
-    """Security-relevant runtime settings for one service."""
-
-    name: str
-    image: str | None = None
-    privileged: bool = False
-    network_mode: str | None = None
-    mounts: tuple[str, ...] = field(default_factory=tuple)
-    published_ports: tuple[PublishedPort, ...] = field(default_factory=tuple)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", str(self.name))
-        object.__setattr__(self, "mounts", tuple(str(mount) for mount in self.mounts))
-        object.__setattr__(
-            self,
-            "published_ports",
-            tuple(self.published_ports),
-        )
-
-
-@dataclass(frozen=True)
-class SecurityGatePolicy:
-    """Toggles used by the Security Gate."""
-
-    require_signed_capsule: bool = True
-    require_image_checksums: bool = True
-    require_firewall_enabled: bool = True
-    require_backup_configured: bool = True
-    allow_unknown_images: bool = False
-    allow_privileged_containers: bool = False
-    allow_docker_socket_mount: bool = False
-    allow_host_network: bool = False
-    allowed_images: frozenset[str] = DEFAULT_ALLOWED_IMAGES
-
-    @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "SecurityGatePolicy":
-        """Build policy from KX_* environment values."""
-        return cls(
-            require_signed_capsule=_env_bool(env, "KX_REQUIRE_SIGNED_CAPSULE", True),
-            require_image_checksums=True,
-            require_firewall_enabled=True,
-            require_backup_configured=_env_bool(env, "KX_BACKUP_ENABLED", True),
-            allow_unknown_images=_env_bool(env, "KX_ALLOW_UNKNOWN_IMAGES", False),
-            allow_privileged_containers=_env_bool(env, "KX_ALLOW_PRIVILEGED_CONTAINERS", False),
-            allow_docker_socket_mount=_env_bool(env, "KX_ALLOW_DOCKER_SOCKET_MOUNT", False),
-            allow_host_network=_env_bool(env, "KX_ALLOW_HOST_NETWORK", False),
-        )
-
-
-@dataclass(frozen=True)
-class SecurityGateContext:
-    """
-    Complete input to run the Security Gate.
-
-    Higher-level Agent code should prepare this from the verified capsule,
-    generated instance env, resolved compose model, network profile, firewall
-    status, and backup configuration.
-    """
-
-    instance_id: str
-    capsule_path: Path | None = None
-    manifest: Mapping[str, Any] = field(default_factory=dict)
-    env: Mapping[str, str] = field(default_factory=dict)
-    services: tuple[RuntimeServicePolicy, ...] = field(default_factory=tuple)
-    published_ports: tuple[PublishedPort, ...] = field(default_factory=tuple)
-    allowed_images: frozenset[str] = DEFAULT_ALLOWED_IMAGES
-    capsule_signature_verified: bool = False
-    image_checksums_verified: bool = False
-    firewall_enabled: bool = False
-    backup_configured: bool = False
-    backup_root: Path = KX_BACKUPS_ROOT
-    admin_surface_private: bool = True
-    postgres_public: bool = False
-    redis_public: bool = False
-    policy: SecurityGatePolicy = field(default_factory=SecurityGatePolicy)
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "instance_id", str(self.instance_id).strip())
-        object.__setattr__(self, "services", tuple(self.services))
-        object.__setattr__(self, "published_ports", tuple(self.published_ports))
-        object.__setattr__(self, "allowed_images", frozenset(self.allowed_images))
-
-        if not self.instance_id:
-            raise ValueError("instance_id is required.")
-
-
-# ---------------------------------------------------------------------------
-# Result helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _enum_value(value: object) -> str:
+    return str(getattr(value, "value", value))
+
+
+def normalize_security_check(value: SecurityGateCheck | str) -> SecurityGateCheck:
+    if isinstance(value, SecurityGateCheck):
+        return value
+
+    raw = str(value).strip()
+
+    try:
+        return SecurityGateCheck(raw)
+    except ValueError as exc:
+        valid = ", ".join(check.value for check in SecurityGateCheck)
+        raise ValueError(f"Unknown Security Gate check: {raw!r}. Valid: {valid}") from exc
+
+
+def normalize_security_status(value: SecurityGateStatus | str) -> SecurityGateStatus:
+    if isinstance(value, SecurityGateStatus):
+        return value
+
+    raw = str(value).strip()
+
+    try:
+        return SecurityGateStatus(raw)
+    except ValueError as exc:
+        valid = ", ".join(status.value for status in SecurityGateStatus)
+        raise ValueError(f"Unknown Security Gate status: {raw!r}. Valid: {valid}") from exc
+
+
+def _is_blocking_check(check: SecurityGateCheck | str) -> bool:
+    normalized = normalize_security_check(check)
+    return normalized in BLOCKING_SECURITY_CHECKS
+
+
 def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
     value = env.get(key)
+
     if value is None:
         return default
+
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _result(
-    check: SecurityGateCheck,
-    status: SecurityGateStatus,
-    message: str,
-    *,
-    details: Mapping[str, Any] | None = None,
-) -> SecurityGateCheckResult:
-    return SecurityGateCheckResult(
-        check=check,
-        status=status,
-        message=message,
-        blocking=check in BLOCKING_SECURITY_CHECKS,
-        details=dict(details or {}),
-        checked_at=_utc_now(),
-    )
-
-
-def _pass(check: SecurityGateCheck, message: str, *, details: Mapping[str, Any] | None = None) -> SecurityGateCheckResult:
-    return _result(check, SecurityGateStatus.PASS, message, details=details)
-
-
-def _warn(check: SecurityGateCheck, message: str, *, details: Mapping[str, Any] | None = None) -> SecurityGateCheckResult:
-    return _result(check, SecurityGateStatus.WARN, message, details=details)
-
-
-def _fail(check: SecurityGateCheck, message: str, *, details: Mapping[str, Any] | None = None) -> SecurityGateCheckResult:
-    return _result(check, SecurityGateStatus.FAIL_BLOCKING, message, details=details)
-
-
-def _skipped(check: SecurityGateCheck, message: str, *, details: Mapping[str, Any] | None = None) -> SecurityGateCheckResult:
-    return _result(check, SecurityGateStatus.SKIPPED, message, details=details)
-
-
-def _unknown(check: SecurityGateCheck, message: str, *, details: Mapping[str, Any] | None = None) -> SecurityGateCheckResult:
-    return _result(check, SecurityGateStatus.UNKNOWN, message, details=details)
-
-
-def _public_ports(context: SecurityGateContext) -> tuple[PublishedPort, ...]:
-    return tuple((*context.published_ports, *(port for service in context.services for port in service.published_ports)))
-
-
-def _has_forbidden_mount(mounts: Iterable[str]) -> bool:
-    for mount in mounts:
-        normalized = str(mount).lower()
-        if any(forbidden in normalized for forbidden in FORBIDDEN_MOUNT_PATHS):
-            return True
-    return False
-
-
-def _image_base_name(image: str | None) -> str | None:
-    if not image:
-        return None
-
-    raw = image.strip()
-    if not raw:
-        return None
-
-    # registry/path/name:tag -> name
-    name_with_tag = raw.rsplit("/", 1)[-1]
-    return name_with_tag.split(":", 1)[0]
 
 
 def _secret_is_placeholder(value: str | None) -> bool:
@@ -337,6 +206,7 @@ def _database_url_has_placeholder(value: str | None) -> bool:
         return True
 
     lowered = value.lower()
+
     return (
         "<postgres_password>" in lowered
         or "changeme" in lowered
@@ -346,12 +216,481 @@ def _database_url_has_placeholder(value: str | None) -> bool:
     )
 
 
+def _image_base_name(image: str | None) -> str | None:
+    if not image:
+        return None
+
+    raw = image.strip()
+
+    if not raw:
+        return None
+
+    name_with_tag = raw.rsplit("/", 1)[-1]
+    return name_with_tag.split(":", 1)[0]
+
+
+def _has_forbidden_mount(mounts: Iterable[str]) -> bool:
+    for mount in mounts:
+        normalized = str(mount).lower()
+        if any(forbidden.lower() in normalized for forbidden in FORBIDDEN_MOUNT_PATHS):
+            return True
+
+    return False
+
+
+def _as_status_value(value: object) -> str:
+    return _enum_value(value)
+
+
+def _as_check_value(value: object) -> str:
+    return _enum_value(value)
+
+
+# ---------------------------------------------------------------------------
+# Result models expected by tests and lifecycle code
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SecurityCheckResult:
+    """Result of one Security Gate check."""
+
+    check: SecurityGateCheck | str
+    status: SecurityGateStatus | str
+    message: str | None = ""
+    blocking: bool | None = None
+    details: Mapping[str, Any] = field(default_factory=dict)
+    checked_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        normalized_check = normalize_security_check(self.check)
+        normalized_status = normalize_security_status(self.status)
+
+        object.__setattr__(self, "check", normalized_check)
+        object.__setattr__(self, "status", normalized_status)
+
+        if self.blocking is None:
+            object.__setattr__(self, "blocking", normalized_check in BLOCKING_SECURITY_CHECKS)
+        else:
+            object.__setattr__(self, "blocking", bool(self.blocking))
+
+        object.__setattr__(self, "details", dict(self.details or {}))
+
+    @property
+    def failed_blocking(self) -> bool:
+        return bool(self.blocking) and self.status == SecurityGateStatus.FAIL_BLOCKING
+
+    @property
+    def unknown_blocking(self) -> bool:
+        return bool(self.blocking) and self.status == SecurityGateStatus.UNKNOWN
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "check": self.check.value,
+            "status": self.status.value,
+            "message": self.message or "",
+            "blocking": bool(self.blocking),
+            "details": dict(self.details),
+            "checked_at": self.checked_at.isoformat() if self.checked_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SecurityCheckResult":
+        checked_at = data.get("checked_at")
+
+        if isinstance(checked_at, str) and checked_at:
+            parsed_checked_at = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+        else:
+            parsed_checked_at = None
+
+        return cls(
+            check=data["check"],
+            status=data["status"],
+            message=str(data.get("message") or ""),
+            blocking=bool(data.get("blocking", False)),
+            details=dict(data.get("details") or {}),
+            checked_at=parsed_checked_at,
+        )
+
+
+class SecurityGateResult:
+    """
+    Aggregated Security Gate result.
+
+    Supports both constructor shapes used across the repo/tests:
+
+        SecurityGateResult(results=[...])
+        SecurityGateResult(checks=[...])
+    """
+
+    def __init__(
+        self,
+        *,
+        results: Sequence[Any] | None = None,
+        checks: Sequence[Any] | None = None,
+        status: SecurityGateStatus | str = SecurityGateStatus.UNKNOWN,
+        checked_at: datetime | None = None,
+        instance_id: str = "",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        raw_results = results if results is not None else checks
+        normalized_results = tuple(_coerce_check_result(result) for result in (raw_results or ()))
+
+        self.instance_id = str(instance_id or "")
+        self.results = normalized_results
+        self.checks = normalized_results
+        self.status = _derive_status(normalized_results, fallback=status)
+        self.checked_at = checked_at or _utc_now()
+        self.metadata = dict(metadata or {})
+
+    @property
+    def passed(self) -> bool:
+        return is_security_gate_passing(self)
+
+    @property
+    def blocking_failures(self) -> tuple[SecurityCheckResult, ...]:
+        return tuple(
+            result
+            for result in self.results
+            if result.failed_blocking or result.unknown_blocking
+        )
+
+    @property
+    def warnings(self) -> tuple[SecurityCheckResult, ...]:
+        return tuple(result for result in self.results if result.status == SecurityGateStatus.WARN)
+
+    def with_derived_status(self) -> "SecurityGateResult":
+        return SecurityGateResult(
+            results=self.results,
+            status=_derive_status(self.results, fallback=self.status),
+            checked_at=self.checked_at,
+            instance_id=self.instance_id,
+            metadata=self.metadata,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "instance_id": self.instance_id,
+            "status": self.status.value,
+            "passed": self.passed,
+            "checked_at": self.checked_at.isoformat(),
+            "blocking_failures": [result.to_dict() for result in self.blocking_failures],
+            "warnings": [result.to_dict() for result in self.warnings],
+            "results": [result.to_dict() for result in self.results],
+            "checks": [result.to_dict() for result in self.checks],
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SecurityGateResult":
+        raw_results = data.get("results") or data.get("checks") or ()
+
+        checked_at = data.get("checked_at")
+        if isinstance(checked_at, str) and checked_at:
+            parsed_checked_at = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+        else:
+            parsed_checked_at = None
+
+        return cls(
+            results=[_coerce_check_result(result) for result in raw_results],
+            status=data.get("status", SecurityGateStatus.UNKNOWN.value),
+            checked_at=parsed_checked_at,
+            instance_id=str(data.get("instance_id") or ""),
+            metadata=dict(data.get("metadata") or {}),
+        )
+
+
+SecurityGateCheckResult = SecurityCheckResult
+SecurityGateSummary = SecurityGateResult
+
+
+class SecurityGateBlocked(RuntimeError):
+    """Raised when the Security Gate blocks instance startup."""
+
+    def __init__(self, result: SecurityGateResult) -> None:
+        self.result = result
+        self.summary = result
+        failures = ", ".join(check.check.value for check in result.blocking_failures)
+        message = failures or result.status.value
+        super().__init__(f"Konnaxion Security Gate blocked startup: {message}")
+
+
+def _coerce_check_result(value: Any) -> SecurityCheckResult:
+    if isinstance(value, SecurityCheckResult):
+        return value
+
+    if isinstance(value, Mapping):
+        return SecurityCheckResult(
+            check=value.get("check"),
+            status=value.get("status"),
+            message=str(value.get("message") or ""),
+            blocking=value.get("blocking"),
+            details=dict(value.get("details") or {}),
+        )
+
+    check = getattr(value, "check", None)
+    status = getattr(value, "status", None)
+    message = getattr(value, "message", "")
+    blocking = getattr(value, "blocking", None)
+    details = getattr(value, "details", {})
+
+    return SecurityCheckResult(
+        check=check,
+        status=status,
+        message=str(message or ""),
+        blocking=blocking,
+        details=dict(details or {}),
+    )
+
+
+def _extract_results(result: Any) -> tuple[SecurityCheckResult, ...]:
+    if isinstance(result, SecurityGateResult):
+        return result.results
+
+    if isinstance(result, Mapping):
+        raw_results = result.get("results") or result.get("checks") or ()
+        return tuple(_coerce_check_result(item) for item in raw_results)
+
+    raw_results = getattr(result, "results", None)
+    if raw_results is None:
+        raw_results = getattr(result, "checks", None)
+
+    return tuple(_coerce_check_result(item) for item in (raw_results or ()))
+
+
+def _derive_status(
+    results: Sequence[SecurityCheckResult],
+    *,
+    fallback: SecurityGateStatus | str = SecurityGateStatus.UNKNOWN,
+) -> SecurityGateStatus:
+    if any(result.failed_blocking for result in results):
+        return SecurityGateStatus.FAIL_BLOCKING
+
+    if any(result.unknown_blocking for result in results):
+        return SecurityGateStatus.UNKNOWN
+
+    if any(result.status == SecurityGateStatus.WARN for result in results):
+        return SecurityGateStatus.WARN
+
+    if results and all(
+        result.status in {SecurityGateStatus.PASS, SecurityGateStatus.SKIPPED}
+        for result in results
+    ):
+        return SecurityGateStatus.PASS
+
+    return normalize_security_status(fallback)
+
+
+def is_security_gate_passing(result: Any) -> bool:
+    """
+    Return True when a Security Gate result allows startup.
+
+    Rules:
+    - FAIL_BLOCKING on a blocking check fails.
+    - UNKNOWN on a blocking check fails.
+    - WARN on a non-blocking check is allowed.
+    - SKIPPED is allowed.
+    """
+
+    results = _extract_results(result)
+
+    if any(item.failed_blocking for item in results):
+        return False
+
+    if any(item.unknown_blocking for item in results):
+        return False
+
+    aggregate_status = getattr(result, "status", None)
+
+    if aggregate_status is not None:
+        status = normalize_security_status(aggregate_status)
+        if status == SecurityGateStatus.FAIL_BLOCKING:
+            return False
+
+        if status == SecurityGateStatus.UNKNOWN and any(item.blocking for item in results):
+            return False
+
+    return True
+
+
+def assert_security_gate_passing(result: Any) -> Any:
+    """Raise SecurityGateBlocked if the Security Gate result blocks startup."""
+
+    normalized = result if isinstance(result, SecurityGateResult) else SecurityGateResult(results=_extract_results(result))
+
+    if not is_security_gate_passing(normalized):
+        raise SecurityGateBlocked(normalized)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Security Gate context
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PublishedPort:
+    """Public or host-published port discovered from Docker Compose."""
+
+    service: str
+    host_ip: str | None
+    host_port: int | None
+    container_port: int | None
+    protocol: str | None = None
+    raw: Any = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "service": self.service,
+            "host_ip": self.host_ip,
+            "host_port": self.host_port,
+            "container_port": self.container_port,
+            "protocol": self.protocol,
+            "raw": self.raw,
+        }
+
+
+@dataclass(frozen=True)
+class RuntimeServicePolicy:
+    """Runtime service security-relevant policy extracted from Compose."""
+
+    name: str
+    image: str | None = None
+    privileged: bool = False
+    network_mode: str | None = None
+    mounts: tuple[str, ...] = field(default_factory=tuple)
+    published_ports: tuple[PublishedPort, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(self, "mounts", tuple(str(item) for item in self.mounts))
+        object.__setattr__(self, "published_ports", tuple(self.published_ports))
+
+
+@dataclass(frozen=True)
+class SecurityGatePolicy:
+    """Runtime policy switches used by Security Gate checks."""
+
+    require_signed_capsule: bool = True
+    allow_unknown_images: bool = False
+    allow_privileged_containers: bool = False
+    allow_docker_socket_mount: bool = False
+    allow_host_network: bool = False
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str]) -> "SecurityGatePolicy":
+        return cls(
+            require_signed_capsule=_env_bool(env, "KX_REQUIRE_SIGNED_CAPSULE", True),
+            allow_unknown_images=_env_bool(env, "KX_ALLOW_UNKNOWN_IMAGES", False),
+            allow_privileged_containers=_env_bool(
+                env,
+                "KX_ALLOW_PRIVILEGED_CONTAINERS",
+                False,
+            ),
+            allow_docker_socket_mount=_env_bool(
+                env,
+                "KX_ALLOW_DOCKER_SOCKET_MOUNT",
+                False,
+            ),
+            allow_host_network=_env_bool(env, "KX_ALLOW_HOST_NETWORK", False),
+        )
+
+
+@dataclass(frozen=True)
+class SecurityGateContext:
+    """Input context consumed by the Konnaxion Agent Security Gate."""
+
+    instance_id: str
+    manifest: Mapping[str, Any] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict)
+    services: tuple[RuntimeServicePolicy, ...] = field(default_factory=tuple)
+    published_ports: tuple[PublishedPort, ...] = field(default_factory=tuple)
+    allowed_images: frozenset[str] = DEFAULT_ALLOWED_IMAGES
+    capsule_signature_verified: bool = False
+    image_checksums_verified: bool = False
+    firewall_enabled: bool = False
+    backup_configured: bool = False
+    backup_root: Path = KX_BACKUPS_ROOT
+    admin_surface_private: bool = True
+    postgres_public: bool = False
+    redis_public: bool = False
+    policy: SecurityGatePolicy = field(default_factory=SecurityGatePolicy)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        instance_id = str(self.instance_id).strip()
+
+        if not instance_id:
+            raise ValueError("instance_id is required.")
+
+        object.__setattr__(self, "instance_id", instance_id)
+        object.__setattr__(self, "services", tuple(self.services))
+        object.__setattr__(self, "published_ports", tuple(self.published_ports))
+        object.__setattr__(self, "allowed_images", frozenset(self.allowed_images))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+
+
+# ---------------------------------------------------------------------------
+# Result helpers
+# ---------------------------------------------------------------------------
+
+def _result(
+    check: SecurityGateCheck,
+    status: SecurityGateStatus,
+    message: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> SecurityCheckResult:
+    return SecurityCheckResult(
+        check=check,
+        status=status,
+        message=message,
+        blocking=check in BLOCKING_SECURITY_CHECKS,
+        details=dict(details or {}),
+        checked_at=_utc_now(),
+    )
+
+
+def _pass(
+    check: SecurityGateCheck,
+    message: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> SecurityCheckResult:
+    return _result(check, SecurityGateStatus.PASS, message, details=details)
+
+
+def _warn(
+    check: SecurityGateCheck,
+    message: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> SecurityCheckResult:
+    return _result(check, SecurityGateStatus.WARN, message, details=details)
+
+
+def _fail(
+    check: SecurityGateCheck,
+    message: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> SecurityCheckResult:
+    return _result(check, SecurityGateStatus.FAIL_BLOCKING, message, details=details)
+
+
+def _unknown(
+    check: SecurityGateCheck,
+    message: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> SecurityCheckResult:
+    return _result(check, SecurityGateStatus.UNKNOWN, message, details=details)
+
+
 # ---------------------------------------------------------------------------
 # Individual checks
 # ---------------------------------------------------------------------------
 
-def check_capsule_signature(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate capsule signature status."""
+def check_capsule_signature(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.CAPSULE_SIGNATURE
 
     if not context.policy.require_signed_capsule:
@@ -363,414 +702,391 @@ def check_capsule_signature(context: SecurityGateContext) -> SecurityGateCheckRe
     return _fail(check, "Capsule signature is missing or invalid.")
 
 
-def check_image_checksums(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate OCI image checksum verification status."""
+def check_image_checksums(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.IMAGE_CHECKSUMS
 
-    if not context.policy.require_image_checksums:
-        return _warn(check, "Image checksum enforcement is disabled by policy.")
-
     if context.image_checksums_verified:
-        return _pass(check, "Image checksums verified.")
+        return _pass(check, "Capsule image checksums verified.")
 
-    return _fail(check, "Image checksums are missing or invalid.")
+    return _fail(check, "Capsule image checksums are missing or invalid.")
 
 
-def check_manifest_schema(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate the manifest contains required root fields."""
+def check_manifest_schema(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.MANIFEST_SCHEMA
+    missing = sorted(field for field in REQUIRED_MANIFEST_FIELDS if not context.manifest.get(field))
 
-    if not context.manifest:
-        return _fail(check, "Manifest is missing.")
-
-    missing = sorted(REQUIRED_MANIFEST_FIELDS.difference(context.manifest.keys()))
-    if missing:
-        return _fail(
+    if not missing:
+        return _pass(
             check,
-            "Manifest is missing required fields.",
-            details={"missing_fields": missing},
+            "Capsule manifest contains required fields.",
+            details={"required_fields": sorted(REQUIRED_MANIFEST_FIELDS)},
         )
 
-    services = context.manifest.get("services")
-    if services is not None:
-        invalid_services = sorted(
-            service for service in _extract_service_names(services) if not is_canonical_service(service)
-        )
-        if invalid_services:
-            return _fail(
-                check,
-                "Manifest references non-canonical service names.",
-                details={"invalid_services": invalid_services},
-            )
-
-    return _pass(
+    return _fail(
         check,
-        "Manifest schema has required canonical fields.",
-        details={"required_fields": sorted(REQUIRED_MANIFEST_FIELDS)},
+        "Capsule manifest is missing required fields.",
+        details={"missing_fields": missing},
     )
 
 
-def check_secrets_present(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate required generated secrets are present."""
+def check_secrets_present(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.SECRETS_PRESENT
-    missing = sorted(key for key in REQUIRED_SECRET_KEYS if not str(context.env.get(key, "")).strip())
+    missing = sorted(key for key in REQUIRED_SECRET_KEYS if not context.env.get(key))
 
-    if missing:
-        return _fail(
+    if not missing:
+        return _pass(
             check,
-            "Required generated secrets are missing.",
-            details={"missing_secret_keys": missing},
+            "Required instance secrets are present.",
+            details={"required_keys": sorted(REQUIRED_SECRET_KEYS)},
         )
 
-    return _pass(check, "Required generated secrets are present.")
+    return _fail(
+        check,
+        "Required instance secrets are missing.",
+        details={"missing": missing},
+    )
 
 
-def check_secrets_not_default(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate required secrets are not placeholders or default values."""
+def check_secrets_not_default(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.SECRETS_NOT_DEFAULT
-    default_like: list[str] = []
+    bad: list[str] = []
 
     for key in REQUIRED_SECRET_KEYS:
         value = context.env.get(key)
 
         if key == "DATABASE_URL":
             if _database_url_has_placeholder(value):
-                default_like.append(key)
-            continue
+                bad.append(key)
+        elif _secret_is_placeholder(value):
+            bad.append(key)
 
-        if _secret_is_placeholder(value):
-            default_like.append(key)
-
-    if default_like:
-        return _fail(
+    if not bad:
+        return _pass(
             check,
-            "Required secrets still look like defaults or placeholders.",
-            details={"default_like_secret_keys": sorted(default_like)},
+            "Required instance secrets are non-default.",
+            details={"checked_keys": sorted(REQUIRED_SECRET_KEYS)},
         )
 
-    return _pass(check, "Required secrets are generated values.")
-
-
-def check_firewall_enabled(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate firewall status."""
-    check = SecurityGateCheck.FIREWALL_ENABLED
-
-    if not context.policy.require_firewall_enabled:
-        return _warn(check, "Firewall enforcement is disabled by policy.")
-
-    if context.firewall_enabled:
-        return _pass(check, "Firewall is enabled.")
-
-    return _warn(check, "Firewall is not confirmed enabled.")
-
-
-def check_dangerous_ports_blocked(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate internal-only ports are not published publicly."""
-    check = SecurityGateCheck.DANGEROUS_PORTS_BLOCKED
-    ports = _public_ports(context)
-
-    dangerous = sorted(
-        {
-            port.host_port
-            for port in ports
-            if port.host_port in FORBIDDEN_PUBLIC_PORTS
-        }
+    return _fail(
+        check,
+        "Required instance secrets are default, empty, or placeholders.",
+        details={"invalid_keys": bad},
     )
 
-    if dangerous:
-        return _fail(
+
+def check_firewall_enabled(context: SecurityGateContext) -> SecurityCheckResult:
+    check = SecurityGateCheck.FIREWALL_ENABLED
+
+    if context.firewall_enabled:
+        return _pass(check, "Host firewall is enabled.")
+
+    return _warn(check, "Host firewall is disabled or unconfirmed.")
+
+
+def check_dangerous_ports_blocked(context: SecurityGateContext) -> SecurityCheckResult:
+    check = SecurityGateCheck.DANGEROUS_PORTS_BLOCKED
+    exposed = [
+        port.to_dict()
+        for port in _public_ports(context)
+        if (port.host_port in FORBIDDEN_PUBLIC_PORTS or port.container_port in FORBIDDEN_PUBLIC_PORTS)
+    ]
+
+    if not exposed:
+        return _pass(
             check,
-            "Internal-only ports are published.",
-            details={
-                "forbidden_public_ports": dangerous,
-                "internal_only_ports": dict(INTERNAL_ONLY_PORTS),
-            },
+            "Forbidden internal service ports are not publicly exposed.",
+            details={"forbidden_ports": sorted(FORBIDDEN_PUBLIC_PORTS)},
         )
 
-    return _pass(check, "No internal-only ports are published.")
+    return _fail(
+        check,
+        "Forbidden internal service ports are publicly exposed.",
+        details={
+            "exposed": exposed,
+            "forbidden_ports": sorted(FORBIDDEN_PUBLIC_PORTS),
+        },
+    )
 
 
-def check_postgres_not_public(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate PostgreSQL is not public."""
+def check_postgres_not_public(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.POSTGRES_NOT_PUBLIC
 
-    postgres_ports = [
-        port.host_port
+    if context.postgres_public:
+        return _fail(check, "PostgreSQL is marked public.")
+
+    offenders = [
+        port.to_dict()
         for port in _public_ports(context)
-        if port.service == DockerService.POSTGRES.value or port.host_port == INTERNAL_ONLY_PORTS[DockerService.POSTGRES.value]
+        if port.service == DockerService.POSTGRES.value
+        or port.host_port == 5432
+        or port.container_port == 5432
     ]
-
-    if context.postgres_public or postgres_ports:
-        return _fail(
-            check,
-            "PostgreSQL is publicly exposed or published.",
-            details={"published_ports": sorted(set(postgres_ports))},
-        )
-
-    return _pass(check, "PostgreSQL is not public.")
-
-
-def check_redis_not_public(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate Redis is not public."""
-    check = SecurityGateCheck.REDIS_NOT_PUBLIC
-
-    redis_ports = [
-        port.host_port
-        for port in _public_ports(context)
-        if port.service == DockerService.REDIS.value or port.host_port == INTERNAL_ONLY_PORTS[DockerService.REDIS.value]
-    ]
-
-    if context.redis_public or redis_ports:
-        return _fail(
-            check,
-            "Redis is publicly exposed or published.",
-            details={"published_ports": sorted(set(redis_ports))},
-        )
-
-    return _pass(check, "Redis is not public.")
-
-
-def check_docker_socket_not_mounted(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate Docker socket is not mounted into app containers."""
-    check = SecurityGateCheck.DOCKER_SOCKET_NOT_MOUNTED
-
-    if context.policy.allow_docker_socket_mount:
-        return _warn(check, "Docker socket mount is allowed by policy.")
-
-    offenders = sorted(service.name for service in context.services if _has_forbidden_mount(service.mounts))
 
     if offenders:
         return _fail(
             check,
-            "Docker socket mount detected.",
-            details={"services": offenders},
+            "PostgreSQL is publicly exposed.",
+            details={"ports": offenders},
         )
 
-    return _pass(check, "Docker socket is not mounted into app containers.")
+    return _pass(check, "PostgreSQL is not publicly exposed.")
 
 
-def check_no_privileged_containers(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate no runtime service uses privileged containers."""
+def check_redis_not_public(context: SecurityGateContext) -> SecurityCheckResult:
+    check = SecurityGateCheck.REDIS_NOT_PUBLIC
+
+    if context.redis_public:
+        return _fail(check, "Redis is marked public.")
+
+    offenders = [
+        port.to_dict()
+        for port in _public_ports(context)
+        if port.service == DockerService.REDIS.value
+        or port.host_port == 6379
+        or port.container_port == 6379
+    ]
+
+    if offenders:
+        return _fail(
+            check,
+            "Redis is publicly exposed.",
+            details={"ports": offenders},
+        )
+
+    return _pass(check, "Redis is not publicly exposed.")
+
+
+def check_docker_socket_not_mounted(context: SecurityGateContext) -> SecurityCheckResult:
+    check = SecurityGateCheck.DOCKER_SOCKET_NOT_MOUNTED
+
+    if context.policy.allow_docker_socket_mount:
+        return _warn(check, "Docker socket mounts are allowed by policy.")
+
+    offenders = [
+        service.name
+        for service in context.services
+        if _has_forbidden_mount(service.mounts)
+    ]
+
+    if not offenders:
+        return _pass(check, "Docker socket is not mounted into app containers.")
+
+    return _fail(
+        check,
+        "Docker socket is mounted into one or more containers.",
+        details={"offenders": offenders},
+    )
+
+
+def check_no_privileged_containers(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.NO_PRIVILEGED_CONTAINERS
 
     if context.policy.allow_privileged_containers:
         return _warn(check, "Privileged containers are allowed by policy.")
 
-    offenders = sorted(
-        service.name
-        for service in context.services
-        if service.privileged in FORBIDDEN_PRIVILEGED_VALUES
+    offenders = [service.name for service in context.services if service.privileged]
+
+    if not offenders:
+        return _pass(check, "No privileged app containers are configured.")
+
+    return _fail(
+        check,
+        "One or more containers are configured as privileged.",
+        details={"offenders": offenders},
     )
 
-    if offenders:
-        return _fail(
-            check,
-            "Privileged containers detected.",
-            details={"services": offenders},
-        )
 
-    return _pass(check, "No privileged containers detected.")
-
-
-def check_no_host_network(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate no service uses host networking."""
+def check_no_host_network(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.NO_HOST_NETWORK
 
     if context.policy.allow_host_network:
-        return _warn(check, "Host networking is allowed by policy.")
+        return _warn(check, "Host network mode is allowed by policy.")
 
-    offenders = sorted(
+    offenders = [
         service.name
         for service in context.services
-        if str(service.network_mode or "").strip().lower() in FORBIDDEN_HOST_NETWORK_VALUES
+        if str(service.network_mode or "").strip().lower() == "host"
+    ]
+
+    if not offenders:
+        return _pass(check, "No app containers use host networking.")
+
+    return _fail(
+        check,
+        "One or more containers use host networking.",
+        details={"offenders": offenders},
     )
 
-    if offenders:
-        return _fail(
-            check,
-            "Host network mode detected.",
-            details={"services": offenders},
-        )
 
-    return _pass(check, "No host network mode detected.")
-
-
-def check_allowed_images_only(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate service images are allowlisted or canonical."""
+def check_allowed_images_only(context: SecurityGateContext) -> SecurityCheckResult:
     check = SecurityGateCheck.ALLOWED_IMAGES_ONLY
 
     if context.policy.allow_unknown_images:
         return _warn(check, "Unknown images are allowed by policy.")
 
-    allowed = set(context.allowed_images or context.policy.allowed_images or DEFAULT_ALLOWED_IMAGES)
-    unknown: list[dict[str, str]] = []
+    allowed = set(context.allowed_images or ())
+    unknown: dict[str, str] = {}
 
     for service in context.services:
-        base = _image_base_name(service.image)
+        base_name = _image_base_name(service.image)
         service_name = service.name
 
-        if not base:
-            unknown.append({"service": service_name, "image": ""})
+        if not base_name:
             continue
 
-        if base not in allowed and service_name not in allowed and base not in CANONICAL_DOCKER_SERVICES:
-            unknown.append({"service": service_name, "image": service.image or ""})
+        if service.image in allowed or base_name in allowed or service_name in allowed:
+            continue
 
-    if unknown:
-        return _fail(
-            check,
-            "Runtime references unknown or non-allowlisted images.",
-            details={"unknown_images": unknown, "allowed_images": sorted(allowed)},
-        )
+        unknown[service_name] = service.image or ""
 
-    return _pass(check, "Runtime images are allowlisted.")
-
-
-def check_admin_surface_private(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate admin surface is not directly public."""
-    check = SecurityGateCheck.ADMIN_SURFACE_PRIVATE
-
-    if context.admin_surface_private:
-        return _pass(check, "Admin surface is private or routed through approved entrypoint.")
-
-    return _warn(check, "Admin surface privacy is not confirmed.")
-
-
-def check_backup_configured(context: SecurityGateContext) -> SecurityGateCheckResult:
-    """Validate backup configuration is present."""
-    check = SecurityGateCheck.BACKUP_CONFIGURED
-
-    if not context.policy.require_backup_configured:
-        return _skipped(check, "Backup requirement disabled by policy.")
-
-    if context.backup_configured:
+    if not unknown:
         return _pass(
             check,
-            "Backup is configured.",
-            details={"backup_root": str(context.backup_root)},
+            "All configured service images are allowlisted.",
+            details={"allowed_images": sorted(allowed)},
         )
 
-    return _warn(
+    return _fail(
         check,
-        "Backup is not confirmed configured.",
-        details={"backup_root": str(context.backup_root)},
+        "One or more configured service images are not allowlisted.",
+        details={"unknown_images": unknown, "allowed_images": sorted(allowed)},
     )
 
 
-# ---------------------------------------------------------------------------
-# Compose/runtime extraction helpers
-# ---------------------------------------------------------------------------
+def check_admin_surface_private(context: SecurityGateContext) -> SecurityCheckResult:
+    check = SecurityGateCheck.ADMIN_SURFACE_PRIVATE
 
-def _extract_service_names(services: Any) -> tuple[str, ...]:
-    """Extract service names from a list or mapping."""
-    if isinstance(services, Mapping):
-        return tuple(str(name) for name in services.keys())
+    if context.admin_surface_private:
+        return _pass(check, "Admin surface is private.")
 
-    if isinstance(services, Sequence) and not isinstance(services, (str, bytes)):
-        names: list[str] = []
-        for item in services:
-            if isinstance(item, Mapping):
-                name = item.get("name") or item.get("service")
-                if name:
-                    names.append(str(name))
-            else:
-                names.append(str(item))
-        return tuple(names)
-
-    return tuple()
+    return _warn(check, "Admin surface is public or unconfirmed.")
 
 
-def parse_port_mapping(service_name: str, raw_port: Any) -> PublishedPort | None:
-    """
-    Parse a Docker Compose-style port entry into PublishedPort.
+def check_backup_configured(context: SecurityGateContext) -> SecurityCheckResult:
+    check = SecurityGateCheck.BACKUP_CONFIGURED
 
-    Supported examples:
-        "80:80"
-        "127.0.0.1:8000:8000"
-        {"published": 443, "target": 443, "protocol": "tcp"}
-    """
-    if isinstance(raw_port, Mapping):
-        published = raw_port.get("published") or raw_port.get("host_port")
-        target = raw_port.get("target") or raw_port.get("container_port")
-        protocol = str(raw_port.get("protocol", "tcp"))
-        host_ip = raw_port.get("host_ip")
-
-        if published is None:
-            return None
-
-        return PublishedPort(
-            service=service_name,
-            host_port=int(published),
-            container_port=int(target) if target is not None else None,
-            protocol=protocol,
-            host_ip=str(host_ip) if host_ip else None,
+    if context.backup_configured and str(context.backup_root).strip():
+        return _pass(
+            check,
+            "Backups are enabled and backup root is configured.",
+            details={"backup_root": str(context.backup_root)},
         )
 
-    if isinstance(raw_port, int):
-        return PublishedPort(service=service_name, host_port=raw_port)
+    return _warn(check, "Backup configuration is missing or unconfirmed.")
 
-    if isinstance(raw_port, str):
-        port_part = raw_port.split("/", 1)[0]
-        parts = port_part.split(":")
 
-        try:
-            if len(parts) == 1:
-                return PublishedPort(service=service_name, host_port=int(parts[0]))
-            if len(parts) == 2:
-                return PublishedPort(
-                    service=service_name,
-                    host_port=int(parts[0]),
-                    container_port=int(parts[1]),
-                )
-            if len(parts) == 3:
-                return PublishedPort(
-                    service=service_name,
-                    host_ip=parts[0],
-                    host_port=int(parts[1]),
-                    container_port=int(parts[2]),
-                )
-        except ValueError:
-            return None
+# ---------------------------------------------------------------------------
+# Compose parsing helpers
+# ---------------------------------------------------------------------------
 
-    return None
+def parse_port_mapping(service: str, value: Any) -> PublishedPort:
+    """Parse one Docker Compose port mapping into a PublishedPort."""
+
+    if isinstance(value, int):
+        return PublishedPort(
+            service=service,
+            host_ip=None,
+            host_port=value,
+            container_port=value,
+            protocol="tcp",
+            raw=value,
+        )
+
+    if isinstance(value, Mapping):
+        published = value.get("published") or value.get("host_port")
+        target = value.get("target") or value.get("container_port")
+        protocol = value.get("protocol") or "tcp"
+
+        return PublishedPort(
+            service=service,
+            host_ip=value.get("host_ip"),
+            host_port=int(published) if published is not None else None,
+            container_port=int(target) if target is not None else None,
+            protocol=str(protocol),
+            raw=dict(value),
+        )
+
+    raw = str(value)
+    protocol = "tcp"
+    without_protocol = raw
+
+    if "/" in raw:
+        without_protocol, protocol = raw.rsplit("/", 1)
+
+    parts = without_protocol.split(":")
+    host_ip: str | None = None
+    host_port: int | None = None
+    container_port: int | None = None
+
+    try:
+        if len(parts) == 1:
+            container_port = int(parts[0])
+            host_port = container_port
+        elif len(parts) == 2:
+            host_port = int(parts[0])
+            container_port = int(parts[1])
+        elif len(parts) >= 3:
+            host_ip = parts[0]
+            host_port = int(parts[-2])
+            container_port = int(parts[-1])
+    except ValueError:
+        host_port = None
+        container_port = None
+
+    return PublishedPort(
+        service=service,
+        host_ip=host_ip,
+        host_port=host_port,
+        container_port=container_port,
+        protocol=protocol,
+        raw=value,
+    )
 
 
 def services_from_compose(compose: Mapping[str, Any]) -> tuple[RuntimeServicePolicy, ...]:
-    """Build RuntimeServicePolicy records from a Compose-like mapping."""
+    """Extract service policy data from a Docker Compose-like mapping."""
+
     raw_services = compose.get("services", {})
     if not isinstance(raw_services, Mapping):
-        return tuple()
+        return ()
 
     services: list[RuntimeServicePolicy] = []
 
-    for service_name, spec in raw_services.items():
-        if not isinstance(spec, Mapping):
-            spec = {}
+    for service_name, raw_spec in raw_services.items():
+        spec = raw_spec if isinstance(raw_spec, Mapping) else {}
+
+        mounts: list[str] = []
+        for key in ("volumes", "mounts"):
+            value = spec.get(key, ())
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                mounts.extend(str(item) for item in value)
 
         ports = tuple(
-            parsed
-            for raw_port in spec.get("ports", ()) or ()
-            if (parsed := parse_port_mapping(str(service_name), raw_port)) is not None
-        )
-
-        mounts = tuple(
-            str(mount)
-            for key in ("volumes", "mounts")
-            for mount in (spec.get(key, ()) or ())
+            parse_port_mapping(str(service_name), item)
+            for item in spec.get("ports", ()) or ()
         )
 
         services.append(
             RuntimeServicePolicy(
                 name=str(service_name),
-                image=spec.get("image"),
+                image=str(spec.get("image")) if spec.get("image") is not None else None,
                 privileged=bool(spec.get("privileged", False)),
-                network_mode=spec.get("network_mode"),
-                mounts=mounts,
+                network_mode=str(spec.get("network_mode")) if spec.get("network_mode") else None,
+                mounts=tuple(mounts),
                 published_ports=ports,
             )
         )
 
     return tuple(services)
+
+
+def _public_ports(context: SecurityGateContext) -> tuple[PublishedPort, ...]:
+    service_ports = tuple(
+        port
+        for service in context.services
+        for port in service.published_ports
+    )
+    return tuple((*context.published_ports, *service_ports))
 
 
 def context_from_compose(
@@ -789,6 +1105,7 @@ def context_from_compose(
     policy: SecurityGatePolicy | None = None,
 ) -> SecurityGateContext:
     """Build SecurityGateContext from a Compose-like mapping."""
+
     services = services_from_compose(compose)
     published_ports = tuple(port for service in services for port in service.published_ports)
 
@@ -834,42 +1151,36 @@ class SecurityGate:
         check_backup_configured,
     )
 
-    def run(self, context: SecurityGateContext) -> SecurityGateSummary:
-        """Run all canonical checks and return an aggregate summary."""
+    def run(self, context: SecurityGateContext) -> SecurityGateResult:
         results = tuple(check(context) for check in self.CHECKS)
-        summary = SecurityGateSummary(
-            status=SecurityGateStatus.UNKNOWN,
-            checks=results,
-            checked_at=_utc_now(),
+        return SecurityGateResult(
+            results=results,
+            instance_id=context.instance_id,
+            metadata={
+                "routes": dict(ROUTES),
+                "canonical_services": tuple(CANONICAL_DOCKER_SERVICES),
+                "internal_only_ports": {
+                    _enum_value(service): port
+                    for service, port in INTERNAL_ONLY_PORTS.items()
+                },
+            },
         )
-        return summary.with_derived_status()
 
-    def assert_start_allowed(self, context: SecurityGateContext) -> SecurityGateSummary:
-        """
-        Run the Security Gate and raise SecurityGateBlocked if startup is blocked.
-        """
-        summary = self.run(context)
-        if summary.status == SecurityGateStatus.FAIL_BLOCKING:
-            raise SecurityGateBlocked(summary)
-        return summary
+    def assert_start_allowed(self, context: SecurityGateContext) -> SecurityGateResult:
+        result = self.run(context)
+        assert_security_gate_passing(result)
+        return result
 
 
-class SecurityGateBlocked(RuntimeError):
-    """Raised when the Security Gate blocks instance startup."""
+def run_security_gate(context: SecurityGateContext) -> SecurityGateResult:
+    """Run the canonical Security Gate."""
 
-    def __init__(self, summary: SecurityGateSummary) -> None:
-        self.summary = summary
-        failures = ", ".join(check.check.value for check in summary.blocking_failures)
-        super().__init__(f"Konnaxion Security Gate blocked startup: {failures}")
-
-
-def run_security_gate(context: SecurityGateContext) -> SecurityGateSummary:
-    """Convenience wrapper for running the canonical Security Gate."""
     return SecurityGate().run(context)
 
 
-def assert_security_gate_allows_start(context: SecurityGateContext) -> SecurityGateSummary:
-    """Convenience wrapper that raises when startup must be blocked."""
+def assert_security_gate_allows_start(context: SecurityGateContext) -> SecurityGateResult:
+    """Run the Security Gate and raise if startup must be blocked."""
+
     return SecurityGate().assert_start_allowed(context)
 
 
@@ -884,11 +1195,16 @@ __all__ = [
     "SECRET_PLACEHOLDER_VALUES",
     "PublishedPort",
     "RuntimeServicePolicy",
+    "SecurityCheckResult",
     "SecurityGate",
     "SecurityGateBlocked",
+    "SecurityGateCheckResult",
     "SecurityGateContext",
     "SecurityGatePolicy",
+    "SecurityGateResult",
+    "SecurityGateSummary",
     "assert_security_gate_allows_start",
+    "assert_security_gate_passing",
     "check_admin_surface_private",
     "check_allowed_images_only",
     "check_backup_configured",
@@ -905,6 +1221,9 @@ __all__ = [
     "check_secrets_not_default",
     "check_secrets_present",
     "context_from_compose",
+    "is_security_gate_passing",
+    "normalize_security_check",
+    "normalize_security_status",
     "parse_port_mapping",
     "run_security_gate",
     "services_from_compose",

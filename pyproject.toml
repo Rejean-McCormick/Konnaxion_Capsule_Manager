@@ -24,7 +24,8 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12"
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13"
 ]
 
 dependencies = [
@@ -35,6 +36,7 @@ dependencies = [
   "pydantic>=2.7",
   "pydantic-settings>=2.3",
   "python-dotenv>=1.0",
+  "python-multipart>=0.0.20",
   "pyyaml>=6.0",
   "rich>=13.7",
   "typer>=0.12",
@@ -54,8 +56,8 @@ dev = [
 [project.scripts]
 kx = "kx_cli.main:app"
 kx-agent = "kx_agent.main:main"
-kx-manager = "kx_manager.main:app"
-kx-builder = "kx_builder.main:app"
+kx-manager = "kx_manager.main:main"
+kx-builder = "kx_builder.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = [

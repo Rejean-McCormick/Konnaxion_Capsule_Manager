@@ -11,7 +11,7 @@
 #   - PostgreSQL, Redis, Flower, Django direct, Next.js direct, and Docker daemon
 #     must remain private.
 
-schema_version: kx-profile/v1
+schema_version: kx-network-profile/v1
 
 profile:
   name: intranet_private
@@ -20,6 +20,15 @@ profile:
   default: true
   app_version: v14
   param_version: kx-param-2026.04.30
+
+exposure:
+  mode: private
+  public_allowed: false
+  requires_expiration: false
+  temporary: false
+  allowed_modes:
+    - private
+    - lan
 
 network:
   network_profile: intranet_private
@@ -178,6 +187,20 @@ security_gate:
     - admin_surface_private
     - backup_configured
 
+canonical_env:
+  KX_NETWORK_PROFILE: intranet_private
+  KX_EXPOSURE_MODE: private
+  KX_PUBLIC_MODE_ENABLED: "false"
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_REQUIRE_SIGNED_CAPSULE: "true"
+  KX_GENERATE_SECRETS_ON_INSTALL: "true"
+  KX_ALLOW_UNKNOWN_IMAGES: "false"
+  KX_ALLOW_PRIVILEGED_CONTAINERS: "false"
+  KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
+  KX_ALLOW_HOST_NETWORK: "false"
+  KX_BACKUP_ENABLED: "true"
+  KX_HOST: ""
+
 environment:
   KX_NETWORK_PROFILE: intranet_private
   KX_EXPOSURE_MODE: private
@@ -190,7 +213,7 @@ environment:
   KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
   KX_ALLOW_HOST_NETWORK: "false"
   KX_BACKUP_ENABLED: "true"
-  KX_HOST: konnaxion.local
+  KX_HOST: ""
 
 backup:
   enabled: true

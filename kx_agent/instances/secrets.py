@@ -371,7 +371,7 @@ def is_placeholder_secret(value: str | None) -> bool:
         return True
 
     normalized = value.strip().lower()
-    normalized = normalized.strip("'"")
+    normalized = normalized.strip("'\"")
 
     return normalized in PLACEHOLDER_VALUES
 
@@ -385,12 +385,16 @@ def has_sensitive_key(key: str) -> bool:
 # ---------------------------------------------------------------------
 
 
-def build_env_files(bundle: GeneratedSecrets, policy: SecretGenerationPolicy) -> dict[str, dict[str, str]]:
+def build_env_files(
+    bundle: GeneratedSecrets,
+    policy: SecretGenerationPolicy,
+) -> dict[str, dict[str, str]]:
     """Build canonical env-file contents from generated secrets."""
 
     kx_env = {
         "KX_INSTANCE_ID": policy.instance_id,
-        "KX_CAPSULE_ID": policy.capsule_id or str(KX_ENV_DEFAULTS.get("KX_CAPSULE_ID", "")),
+        "KX_CAPSULE_ID": policy.capsule_id
+        or str(KX_ENV_DEFAULTS.get("KX_CAPSULE_ID", "")),
         "KX_CAPSULE_VERSION": policy.capsule_version
         or str(KX_ENV_DEFAULTS.get("KX_CAPSULE_VERSION", "")),
         "KX_NETWORK_PROFILE": policy.network_profile
@@ -514,7 +518,10 @@ def read_env_file(path: Path) -> dict[str, str]:
         )
 
     result: dict[str, str] = {}
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
         line = raw_line.strip()
 
         if not line or line.startswith("#"):
@@ -535,7 +542,7 @@ def read_env_file(path: Path) -> dict[str, str]:
 def unquote_env_value(value: str) -> str:
     if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
         inner = value[1:-1]
-        return inner.replace('\"', '"').replace("\\\\", "\\")
+        return inner.replace('\\"', '"').replace("\\\\", "\\")
     return value
 
 

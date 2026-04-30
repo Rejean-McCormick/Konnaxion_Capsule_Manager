@@ -428,25 +428,56 @@ def to_safe_relative_path(root: Path, file_path: Path) -> str:
 
 
 def normalize_relative_path(path: str) -> str:
-    """Normalize and validate a capsule-relative POSIX path."""
+    """
+    Normalize and validate a capsule-relative POSIX path.
+
+    This function intentionally rejects:
+    - empty paths
+    - absolute paths
+    - path traversal with `..`
+    - current-directory segments such as `.`
+    - raw non-canonical paths such as `metadata/./build.json`
+
+    Rejecting raw `.` segments keeps checksum manifests deterministic and avoids
+    ambiguous equivalents for the same capsule file.
+    """
 
     raw = str(path).replace("\\", "/").strip()
 
     if not raw:
         raise UnsafeChecksumPathError("Checksum path cannot be empty.")
 
+    if raw == ".":
+        raise UnsafeChecksumPathError("Checksum path cannot be current directory.")
+
+    if raw.startswith("./"):
+        raise UnsafeChecksumPathError(f"Current-directory segments are not allowed: {path!r}")
+
+    if raw.endswith("/."):
+        raise UnsafeChecksumPathError(f"Current-directory segments are not allowed: {path!r}")
+
+    if "/./" in raw:
+        raise UnsafeChecksumPathError(f"Current-directory segments are not allowed: {path!r}")
+
+    raw_parts = raw.split("/")
+
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        raise UnsafeChecksumPathError(f"Unsafe relative path: {path!r}")
+
     pure = PurePosixPath(raw)
 
     if pure.is_absolute():
         raise UnsafeChecksumPathError(f"Absolute paths are not allowed: {path!r}")
 
-    if any(part in {"", ".", ".."} for part in pure.parts):
-        raise UnsafeChecksumPathError(f"Unsafe relative path: {path!r}")
-
     normalized = pure.as_posix()
 
     if normalized.startswith("../") or normalized == "..":
         raise UnsafeChecksumPathError(f"Path traversal is not allowed: {path!r}")
+
+    if normalized != raw:
+        raise UnsafeChecksumPathError(
+            f"Checksum path must already be normalized POSIX relative path: {path!r}"
+        )
 
     return normalized
 
