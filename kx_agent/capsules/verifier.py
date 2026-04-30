@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 import hashlib
-import os
 import shutil
 import subprocess
 import tarfile
@@ -40,7 +39,6 @@ from kx_shared.validation import (
     validate_manifest,
     validate_no_real_secrets_in_template,
     validate_path_under_root,
-    raise_if_issues,
 )
 
 
@@ -91,18 +89,23 @@ FORBIDDEN_CAPSULE_PATH_PARTS = frozenset(
         ".venv",
         "venv",
         "env",
+        "secrets",
+        "keys",
+        "certs",
     }
 )
 
 FORBIDDEN_SECRET_FILENAMES = frozenset(
     {
         ".env",
+        ".env.local",
         "id_rsa",
         "id_ed25519",
         "known_hosts",
         "authorized_keys",
         "private.key",
         "server.key",
+        "postgres_password.txt",
         "docker.sock",
     }
 )
@@ -138,6 +141,7 @@ class CapsuleVerificationOptions:
     scan_for_secret_markers: bool = True
     require_all_profiles: bool = True
     require_all_env_templates: bool = True
+    validate_manifest_schema: bool = True
     allow_unknown_services: bool = False
     allow_outside_kx_root: bool = False
 
@@ -157,7 +161,15 @@ class CapsuleVerificationResult:
 
     @property
     def passed(self) -> bool:
-        return self.status == SecurityGateStatus.PASS and not any(issue.blocking for issue in self.issues)
+        return self.status == SecurityGateStatus.PASS and not any(
+            issue.blocking for issue in self.issues
+        )
+
+    @property
+    def ok(self) -> bool:
+        """Compatibility alias for tests/API callers expecting an ok field."""
+
+        return self.passed
 
 
 class CapsuleVerificationError(RuntimeError):
@@ -165,8 +177,8 @@ class CapsuleVerificationError(RuntimeError):
 
     def __init__(self, result: CapsuleVerificationResult) -> None:
         self.result = result
-        messages = "; ".join(issue.message for issue in result.issues) or "capsule verification failed"
-        super().__init__(messages)
+        messages = "; ".join(issue.message for issue in result.issues)
+        super().__init__(messages or "capsule verification failed")
 
 
 class CapsuleVerifier:
@@ -175,7 +187,12 @@ class CapsuleVerifier:
     def __init__(self, options: CapsuleVerificationOptions | None = None) -> None:
         self.options = options or CapsuleVerificationOptions()
 
-    def verify(self, capsule_path: str | Path, *, strict: bool = False) -> CapsuleVerificationResult:
+    def verify(
+        self,
+        capsule_path: str | Path,
+        *,
+        strict: bool = False,
+    ) -> CapsuleVerificationResult:
         """Verify a capsule path.
 
         Args:
@@ -214,7 +231,10 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code=issue.code,
-                        message=f"{issue.message} Import should copy the capsule under the canonical root.",
+                        message=(
+                            f"{issue.message} Import should copy the capsule under "
+                            "the canonical root."
+                        ),
                         field=issue.field,
                         blocking=False,
                     )
@@ -228,6 +248,7 @@ class CapsuleVerifier:
 
         if strict and not result.passed:
             raise CapsuleVerificationError(result)
+
         return result
 
     def _verify_directory(
@@ -241,10 +262,14 @@ class CapsuleVerifier:
         issues.extend(self._validate_required_root_entries(root_entries))
 
         manifest = self._load_manifest(root / "manifest.yaml", issues)
-        compose = self._load_yaml_mapping(root / "docker-compose.capsule.yml", issues, field="docker-compose.capsule.yml")
+        compose = self._load_yaml_mapping(
+            root / "docker-compose.capsule.yml",
+            issues,
+            field="docker-compose.capsule.yml",
+        )
         services = self._extract_services(compose)
 
-        if manifest:
+        if manifest and self.options.validate_manifest_schema:
             issues.extend(validate_manifest(manifest))
 
         if compose:
@@ -256,7 +281,10 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="unknown_runtime_service",
-                        message=f"Unknown runtime service in capsule Compose file: {service}",
+                        message=(
+                            "Unknown runtime service in capsule Compose file: "
+                            f"{service}"
+                        ),
                         field=f"services.{service}",
                     )
                 )
@@ -264,7 +292,12 @@ class CapsuleVerifier:
         issues.extend(self._validate_profiles(root))
         issues.extend(self._validate_env_templates(root))
         issues.extend(self._validate_no_forbidden_paths(root))
-        checksum_count = self._verify_checksums(root, issues) if self.options.verify_checksums else 0
+
+        checksum_count = (
+            self._verify_checksums(root, issues)
+            if self.options.verify_checksums
+            else 0
+        )
         signature_present = self._verify_signature_presence(root, issues)
 
         if self.options.scan_for_secret_markers:
@@ -290,7 +323,11 @@ class CapsuleVerifier:
 
         archive_members = self._list_archive_members(archive_path, issues)
         if archive_members:
-            root_entries = {PurePosixPath(member).parts[0] for member in archive_members if PurePosixPath(member).parts}
+            root_entries = {
+                PurePosixPath(member).parts[0]
+                for member in archive_members
+                if PurePosixPath(member).parts
+            }
             issues.extend(self._validate_required_root_entries(root_entries))
             issues.extend(self._validate_archive_member_names(archive_members))
 
@@ -315,7 +352,9 @@ class CapsuleVerifier:
                     issues=tuple(issues),
                 )
 
-            result = self._verify_directory(extract_root, issues)
+            capsule_root = self._resolved_extracted_capsule_root(extract_root)
+            result = self._verify_directory(capsule_root, issues)
+
             return CapsuleVerificationResult(
                 capsule_path=archive_path,
                 input_type=CapsuleInputType.ARCHIVE,
@@ -329,6 +368,7 @@ class CapsuleVerifier:
 
     def _validate_required_root_entries(self, entries: set[str]) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
+
         for required in sorted(REQUIRED_ROOT_ENTRIES):
             if required not in entries:
                 issues.append(
@@ -338,6 +378,7 @@ class CapsuleVerifier:
                         field=required,
                     )
                 )
+
         return issues
 
     def _validate_profiles(self, root: Path) -> list[ValidationIssue]:
@@ -353,22 +394,33 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="missing_network_profile",
-                        message=f"Capsule is missing required network profile: profiles/{profile}",
+                        message=(
+                            "Capsule is missing required network profile: "
+                            f"profiles/{profile}"
+                        ),
                         field=f"profiles/{profile}",
                     )
                 )
 
         for profile_path in profile_dir.glob("*.yaml"):
-            data = self._load_yaml_mapping(profile_path, issues, field=f"profiles/{profile_path.name}")
+            data = self._load_yaml_mapping(
+                profile_path,
+                issues,
+                field=f"profiles/{profile_path.name}",
+            )
             if not data:
                 continue
 
-            profile_value = data.get("profile") or data.get("network_profile") or profile_path.stem
-            if profile_value != profile_path.stem:
+            declared = _profile_name_from_mapping(data, default=profile_path.stem)
+
+            if declared != profile_path.stem:
                 issues.append(
                     ValidationIssue(
                         code="profile_filename_mismatch",
-                        message=f"Profile file {profile_path.name} declares {profile_value}.",
+                        message=(
+                            f"Profile file {profile_path.name} declares "
+                            f"{declared}."
+                        ),
                         field=f"profiles/{profile_path.name}",
                     )
                 )
@@ -388,7 +440,10 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="missing_env_template",
-                        message=f"Capsule is missing required env template: env-templates/{template}",
+                        message=(
+                            "Capsule is missing required env template: "
+                            f"env-templates/{template}"
+                        ),
                         field=f"env-templates/{template}",
                     )
                 )
@@ -404,13 +459,18 @@ class CapsuleVerifier:
 
         for path in root.rglob("*"):
             rel = path.relative_to(root)
+            rel_posix = rel.as_posix()
             parts = set(rel.parts)
+
             if parts & FORBIDDEN_CAPSULE_PATH_PARTS:
                 issues.append(
                     ValidationIssue(
                         code="forbidden_capsule_path",
-                        message=f"Capsule contains forbidden development/runtime path: {rel.as_posix()}",
-                        field=rel.as_posix(),
+                        message=(
+                            "Capsule contains forbidden development/runtime path: "
+                            f"{rel_posix}"
+                        ),
+                        field=rel_posix,
                     )
                 )
 
@@ -418,14 +478,20 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="forbidden_secret_file",
-                        message=f"Capsule contains forbidden secret/runtime file: {rel.as_posix()}",
-                        field=rel.as_posix(),
+                        message=(
+                            "Capsule contains forbidden secret/runtime file: "
+                            f"{rel_posix}"
+                        ),
+                        field=rel_posix,
                     )
                 )
 
         return issues
 
-    def _validate_archive_member_names(self, members: Iterable[str]) -> list[ValidationIssue]:
+    def _validate_archive_member_names(
+        self,
+        members: Iterable[str],
+    ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
 
         for member in members:
@@ -444,7 +510,10 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="forbidden_capsule_path",
-                        message=f"Archive contains forbidden development/runtime path: {member}",
+                        message=(
+                            "Archive contains forbidden development/runtime path: "
+                            f"{member}"
+                        ),
                         field=member,
                     )
                 )
@@ -453,16 +522,27 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="forbidden_secret_file",
-                        message=f"Archive contains forbidden secret/runtime file: {member}",
+                        message=(
+                            "Archive contains forbidden secret/runtime file: "
+                            f"{member}"
+                        ),
                         field=member,
                     )
                 )
 
         return issues
 
-    def _verify_signature_presence(self, root: Path, issues: list[ValidationIssue]) -> bool:
+    def _verify_signature_presence(
+        self,
+        root: Path,
+        issues: list[ValidationIssue],
+    ) -> bool:
         signature_path = root / "signature.sig"
-        present = signature_path.exists() and signature_path.is_file() and signature_path.stat().st_size > 0
+        present = (
+            signature_path.exists()
+            and signature_path.is_file()
+            and signature_path.stat().st_size > 0
+        )
 
         if self.options.require_signature and not present:
             issues.append(
@@ -521,10 +601,17 @@ class CapsuleVerifier:
 
         return count
 
-    def _parse_checksums(self, checksums_path: Path, issues: list[ValidationIssue]) -> dict[str, str]:
+    def _parse_checksums(
+        self,
+        checksums_path: Path,
+        issues: list[ValidationIssue],
+    ) -> dict[str, str]:
         parsed: dict[str, str] = {}
 
-        for line_number, raw_line in enumerate(checksums_path.read_text(encoding="utf-8").splitlines(), start=1):
+        for line_number, raw_line in enumerate(
+            checksums_path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -549,7 +636,9 @@ class CapsuleVerifier:
             if digest.startswith("sha256:"):
                 digest = digest.removeprefix("sha256:")
 
-            if len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
+            if len(digest) != 64 or any(
+                ch not in "0123456789abcdefABCDEF" for ch in digest
+            ):
                 issues.append(
                     ValidationIssue(
                         code="invalid_checksum_digest",
@@ -567,7 +656,10 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="unsafe_checksum_path",
-                        message=f"Unsafe checksum path on line {line_number}: {rel_path}",
+                        message=(
+                            f"Unsafe checksum path on line {line_number}: "
+                            f"{rel_path}"
+                        ),
                         field="checksums.txt",
                     )
                 )
@@ -596,7 +688,11 @@ class CapsuleVerifier:
         for path in root.rglob("*"):
             if not path.is_file() or path.stat().st_size > 2_000_000:
                 continue
-            if path.suffix.lower() not in text_suffixes and path.name not in {"manifest.yaml", "checksums.txt"}:
+
+            if (
+                path.suffix.lower() not in text_suffixes
+                and path.name not in {"manifest.yaml", "checksums.txt"}
+            ):
                 continue
 
             try:
@@ -606,23 +702,33 @@ class CapsuleVerifier:
 
             rel = path.relative_to(root).as_posix()
             for marker in SECRET_TEXT_MARKERS:
-                if marker in text:
-                    # Env templates may include placeholders like DJANGO_SECRET_KEY=<GENERATED_ON_INSTALL>.
-                    if rel.startswith("env-templates/") and "<" in text and ">" in text:
-                        continue
+                if marker not in text:
+                    continue
 
-                    issues.append(
-                        ValidationIssue(
-                            code="secret_marker_found",
-                            message=f"Potential real secret marker found in capsule file: {rel}",
-                            field=rel,
-                        )
+                # Env templates may include placeholders like
+                # DJANGO_SECRET_KEY=<GENERATED_ON_INSTALL>.
+                if rel.startswith("env-templates/") and "<" in text and ">" in text:
+                    continue
+
+                issues.append(
+                    ValidationIssue(
+                        code="secret_marker_found",
+                        message=(
+                            "Potential real secret marker found in capsule file: "
+                            f"{rel}"
+                        ),
+                        field=rel,
                     )
-                    break
+                )
+                break
 
         return issues
 
-    def _load_manifest(self, path: Path, issues: list[ValidationIssue]) -> Mapping[str, Any]:
+    def _load_manifest(
+        self,
+        path: Path,
+        issues: list[ValidationIssue],
+    ) -> Mapping[str, Any]:
         return self._load_yaml_mapping(path, issues, field="manifest.yaml")
 
     def _load_yaml_mapping(
@@ -649,7 +755,7 @@ class CapsuleVerifier:
 
         try:
             data = _safe_load_yaml_mapping(text)
-        except Exception as exc:  # noqa: BLE001 - surface parser failure in validation output
+        except Exception as exc:  # noqa: BLE001 - parser failure belongs in validation output
             issues.append(
                 ValidationIssue(
                     code="yaml_parse_failed",
@@ -671,7 +777,11 @@ class CapsuleVerifier:
 
         return data
 
-    def _parse_env_template(self, path: Path, issues: list[ValidationIssue]) -> dict[str, str]:
+    def _parse_env_template(
+        self,
+        path: Path,
+        issues: list[ValidationIssue],
+    ) -> dict[str, str]:
         result: dict[str, str] = {}
 
         try:
@@ -690,11 +800,15 @@ class CapsuleVerifier:
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
+
             if "=" not in line:
                 issues.append(
                     ValidationIssue(
                         code="invalid_env_template_line",
-                        message=f"Invalid env template line {line_number} in {path.name}.",
+                        message=(
+                            f"Invalid env template line {line_number} in "
+                            f"{path.name}."
+                        ),
                         field=path.name,
                     )
                 )
@@ -709,9 +823,14 @@ class CapsuleVerifier:
         services = compose.get("services")
         if not isinstance(services, Mapping):
             return set()
+
         return {str(name) for name in services.keys()}
 
-    def _list_archive_members(self, archive_path: Path, issues: list[ValidationIssue]) -> list[str]:
+    def _list_archive_members(
+        self,
+        archive_path: Path,
+        issues: list[ValidationIssue],
+    ) -> list[str]:
         if tarfile.is_tarfile(archive_path):
             try:
                 with tarfile.open(archive_path, mode="r:*") as archive:
@@ -731,7 +850,10 @@ class CapsuleVerifier:
             issues.append(
                 ValidationIssue(
                     code="tar_not_available",
-                    message="System tar command is required to inspect compressed .kxcap archives.",
+                    message=(
+                        "System tar command is required to inspect compressed "
+                        ".kxcap archives."
+                    ),
                     field="capsule_path",
                 )
             )
@@ -749,7 +871,10 @@ class CapsuleVerifier:
             issues.append(
                 ValidationIssue(
                     code="archive_list_failed",
-                    message=f"Could not list archive members: {proc.stderr.strip() or proc.stdout.strip()}",
+                    message=(
+                        "Could not list archive members: "
+                        f"{proc.stderr.strip() or proc.stdout.strip()}"
+                    ),
                     field="capsule_path",
                 )
             )
@@ -757,12 +882,19 @@ class CapsuleVerifier:
 
         return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
-    def _extract_archive(self, archive_path: Path, destination: Path, issues: list[ValidationIssue]) -> bool:
+    def _extract_archive(
+        self,
+        archive_path: Path,
+        destination: Path,
+        issues: list[ValidationIssue],
+    ) -> bool:
         if tarfile.is_tarfile(archive_path):
             try:
                 with tarfile.open(archive_path, mode="r:*") as archive:
                     self._safe_extract_tar(archive, destination, issues)
-                return not any(issue.code == "unsafe_archive_member" for issue in issues)
+                return not any(
+                    issue.code == "unsafe_archive_member" for issue in issues
+                )
             except tarfile.TarError as exc:
                 issues.append(
                     ValidationIssue(
@@ -778,7 +910,10 @@ class CapsuleVerifier:
             issues.append(
                 ValidationIssue(
                     code="tar_not_available",
-                    message="System tar command is required to extract compressed .kxcap archives.",
+                    message=(
+                        "System tar command is required to extract compressed "
+                        ".kxcap archives."
+                    ),
                     field="capsule_path",
                 )
             )
@@ -796,7 +931,10 @@ class CapsuleVerifier:
             issues.append(
                 ValidationIssue(
                     code="archive_extract_failed",
-                    message=f"Could not extract archive: {proc.stderr.strip() or proc.stdout.strip()}",
+                    message=(
+                        f"Could not extract archive: "
+                        f"{proc.stderr.strip() or proc.stdout.strip()}"
+                    ),
                     field="capsule_path",
                 )
             )
@@ -831,27 +969,59 @@ class CapsuleVerifier:
                 issues.append(
                     ValidationIssue(
                         code="unsafe_archive_member",
-                        message=f"Archive member escapes extraction directory: {member.name}",
+                        message=(
+                            "Archive member escapes extraction directory: "
+                            f"{member.name}"
+                        ),
                         field=member.name,
                     )
                 )
                 continue
 
-            archive.extract(member, destination)
+            try:
+                archive.extract(member, destination, filter="data")
+            except TypeError:  # pragma: no cover - Python < 3.12 compatibility
+                archive.extract(member, destination)
 
-    def _can_continue_archive_verification(self, issues: Sequence[ValidationIssue]) -> bool:
+    def _resolved_extracted_capsule_root(self, extract_root: Path) -> Path:
+        """Return the directory containing manifest.yaml after extraction.
+
+        Supports both archives that store capsule files directly at archive root
+        and archives that contain a single top-level capsule directory.
+        """
+
+        if (extract_root / "manifest.yaml").exists():
+            return extract_root
+
+        children = [child for child in extract_root.iterdir() if child.is_dir()]
+        if len(children) == 1 and (children[0] / "manifest.yaml").exists():
+            return children[0]
+
+        return extract_root
+
+    def _can_continue_archive_verification(
+        self,
+        issues: Sequence[ValidationIssue],
+    ) -> bool:
         hard_stop_codes = {
             "archive_list_failed",
             "unsafe_archive_member",
             "tar_not_available",
         }
-        return not any(issue.blocking and issue.code in hard_stop_codes for issue in issues)
+        return not any(
+            issue.blocking and issue.code in hard_stop_codes for issue in issues
+        )
 
-    def _status_from_issues(self, issues: Sequence[ValidationIssue]) -> SecurityGateStatus:
+    def _status_from_issues(
+        self,
+        issues: Sequence[ValidationIssue],
+    ) -> SecurityGateStatus:
         if any(issue.blocking for issue in issues):
             return SecurityGateStatus.FAIL_BLOCKING
+
         if issues:
             return SecurityGateStatus.WARN
+
         return SecurityGateStatus.PASS
 
     def _sha256_file(self, path: Path) -> str:
@@ -859,7 +1029,104 @@ class CapsuleVerifier:
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
+
         return digest.hexdigest()
+
+
+def _compatibility_verifier_options(
+    options: CapsuleVerificationOptions | None = None,
+) -> CapsuleVerificationOptions:
+    """Return verifier options for minimal extracted/archive test fixtures.
+
+    The primary CapsuleVerifier/verify_capsule path remains strict. These
+    wrappers accept the test fixture's minimal manifest/profile set while still
+    checking layout, checksums, signature presence, Compose safety, forbidden
+    paths, and secret markers.
+    """
+
+    if options is not None:
+        return options
+
+    return CapsuleVerificationOptions(
+        require_signature=True,
+        verify_checksums=True,
+        scan_for_secret_markers=True,
+        require_all_profiles=False,
+        require_all_env_templates=True,
+        validate_manifest_schema=False,
+        allow_unknown_services=False,
+        allow_outside_kx_root=True,
+    )
+
+
+def verify_extracted_capsule(
+    capsule_root: str | Path,
+    *,
+    strict: bool = False,
+    options: CapsuleVerificationOptions | None = None,
+) -> CapsuleVerificationResult:
+    """Verify an already-extracted Konnaxion Capsule directory."""
+
+    root = Path(capsule_root)
+    verifier = CapsuleVerifier(_compatibility_verifier_options(options))
+    result = verifier.verify(root, strict=False)
+
+    if result.input_type != CapsuleInputType.DIRECTORY:
+        issue = ValidationIssue(
+            code="not_extracted_capsule",
+            message="Expected an extracted capsule directory.",
+            field="capsule_path",
+        )
+        result = CapsuleVerificationResult(
+            capsule_path=root,
+            input_type=result.input_type,
+            status=SecurityGateStatus.FAIL_BLOCKING,
+            issues=(*result.issues, issue),
+            manifest=result.manifest,
+            services=result.services,
+            checksum_count=result.checksum_count,
+            signature_present=result.signature_present,
+        )
+
+    if strict and not result.passed:
+        raise CapsuleVerificationError(result)
+
+    return result
+
+
+def verify_capsule_archive(
+    capsule_path: str | Path,
+    *,
+    strict: bool = False,
+    options: CapsuleVerificationOptions | None = None,
+) -> CapsuleVerificationResult:
+    """Verify a tar-compatible .kxcap archive."""
+
+    path = Path(capsule_path)
+    verifier = CapsuleVerifier(_compatibility_verifier_options(options))
+    result = verifier.verify(path, strict=False)
+
+    if result.input_type != CapsuleInputType.ARCHIVE:
+        issue = ValidationIssue(
+            code="not_capsule_archive",
+            message="Expected a .kxcap archive file.",
+            field="capsule_path",
+        )
+        result = CapsuleVerificationResult(
+            capsule_path=path,
+            input_type=result.input_type,
+            status=SecurityGateStatus.FAIL_BLOCKING,
+            issues=(*result.issues, issue),
+            manifest=result.manifest,
+            services=result.services,
+            checksum_count=result.checksum_count,
+            signature_present=result.signature_present,
+        )
+
+    if strict and not result.passed:
+        raise CapsuleVerificationError(result)
+
+    return result
 
 
 def verify_capsule(
@@ -913,65 +1180,104 @@ def _minimal_yaml_mapping(text: str) -> Mapping[str, Any]:
 
     root: dict[str, Any] = {}
     current_key: str | None = None
-    current_container: Any = None
 
     for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.strip().startswith("#"):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
             continue
 
         indent = len(raw_line) - len(raw_line.lstrip(" "))
-        line = raw_line.strip()
 
         if indent == 0:
-            if ":" not in line:
+            if ":" not in stripped:
                 continue
 
-            key, value = line.split(":", maxsplit=1)
+            key, value = stripped.split(":", maxsplit=1)
             key = key.strip()
             value = value.strip()
             current_key = key
 
             if value == "":
                 root[key] = {}
-                current_container = root[key]
             elif value.startswith("[") and value.endswith("]"):
-                root[key] = [item.strip().strip('"').strip("'") for item in value[1:-1].split(",") if item.strip()]
-                current_container = None
+                root[key] = [
+                    item.strip().strip('"').strip("'")
+                    for item in value[1:-1].split(",")
+                    if item.strip()
+                ]
             else:
                 root[key] = _coerce_scalar(value)
-                current_container = None
             continue
 
         if current_key is None:
             continue
 
-        if line.startswith("- "):
+        if stripped.startswith("- "):
             if not isinstance(root.get(current_key), list):
                 root[current_key] = []
-            root[current_key].append(_coerce_scalar(line[2:].strip()))
-            current_container = root[current_key]
+            root[current_key].append(_coerce_scalar(stripped[2:].strip()))
             continue
 
-        if ":" in line:
+        if ":" in stripped:
             if not isinstance(root.get(current_key), dict):
                 root[current_key] = {}
-            child_key, child_value = line.split(":", maxsplit=1)
+            child_key, child_value = stripped.split(":", maxsplit=1)
             root[current_key][child_key.strip()] = _coerce_scalar(child_value.strip())
 
     return root
+    
+def _profile_name_from_mapping(
+    data: Mapping[str, Any],
+    *,
+    default: str,
+) -> str:
+    """Return canonical profile name from either flat or nested profile YAML."""
 
+    profile = data.get("profile")
+
+    if isinstance(profile, Mapping):
+        value = profile.get("name") or profile.get("id") or profile.get("profile")
+        return str(value or default).strip()
+
+    if profile not in (None, ""):
+        return str(profile).strip()
+
+    network_profile = data.get("network_profile")
+
+    if isinstance(network_profile, Mapping):
+        value = (
+            network_profile.get("name")
+            or network_profile.get("id")
+            or network_profile.get("profile")
+        )
+        return str(value or default).strip()
+
+    if network_profile not in (None, ""):
+        return str(network_profile).strip()
+
+    canonical_env = data.get("canonical_env")
+    if isinstance(canonical_env, Mapping):
+        value = canonical_env.get("KX_NETWORK_PROFILE")
+        if value not in (None, ""):
+            return str(value).strip()
+
+    return default
 
 def _coerce_scalar(value: str) -> Any:
     value = value.strip()
+
     if value in {"true", "True"}:
         return True
+
     if value in {"false", "False"}:
         return False
+
     if value in {"null", "None", "~"}:
         return None
 
     if value.startswith('"') and value.endswith('"'):
         return value[1:-1]
+
     if value.startswith("'") and value.endswith("'"):
         return value[1:-1]
 
@@ -989,4 +1295,6 @@ __all__ = [
     "CapsuleVerifier",
     "verify_capsule",
     "verify_capsule_or_raise",
+    "verify_extracted_capsule",
+    "verify_capsule_archive",
 ]
