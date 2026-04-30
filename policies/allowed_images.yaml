@@ -1,0 +1,141 @@
+# Konnaxion allowed runtime images policy
+#
+# Purpose:
+#   Allowlist container images that a Konnaxion Capsule may use at runtime.
+#
+# Security rule:
+#   KX_ALLOW_UNKNOWN_IMAGES=false means every runtime image must match this file.
+#
+# Canonical services:
+#   traefik
+#   frontend-next
+#   django-api
+#   postgres
+#   redis
+#   celeryworker
+#   celerybeat
+#   flower
+#   media-nginx
+#
+# Notes:
+#   - Use immutable digests in production capsules when available.
+#   - Tags are acceptable for local MVP/demo capsules only.
+#   - Do not add arbitrary third-party images without security review.
+
+schema_version: kx-policy/allowed-images/v1
+policy_name: konnaxion-allowed-images
+app_name: Konnaxion
+app_version: v14
+param_version: kx-param-2026.04.30
+default_action: deny
+
+rules:
+  require_known_images: true
+  require_canonical_service_names: true
+  allow_latest_tag: false
+  prefer_digest_pins: true
+  allow_privileged_containers: false
+  allow_host_network: false
+  allow_docker_socket_mount: false
+
+services:
+  traefik:
+    role: reverse_proxy_entrypoint
+    required: true
+    allowed_images:
+      - traefik:v3.2
+      - traefik:v3.2.*
+      - traefik@sha256:*
+
+  frontend-next:
+    role: nextjs_frontend
+    required: true
+    allowed_images:
+      - konnaxion/frontend-next:v14
+      - konnaxion/frontend-next:v14-*
+      - konnaxion/frontend-next@sha256:*
+
+  django-api:
+    role: django_api
+    required: true
+    allowed_images:
+      - konnaxion/django-api:v14
+      - konnaxion/django-api:v14-*
+      - konnaxion/django-api@sha256:*
+
+  postgres:
+    role: database
+    required: true
+    allowed_images:
+      - postgres:16-alpine
+      - postgres:16.*-alpine
+      - postgres@sha256:*
+
+  redis:
+    role: broker_result_backend
+    required: true
+    allowed_images:
+      - redis:7-alpine
+      - redis:7.*-alpine
+      - redis@sha256:*
+
+  celeryworker:
+    role: background_worker
+    required: true
+    allowed_images:
+      - konnaxion/django-api:v14
+      - konnaxion/django-api:v14-*
+      - konnaxion/django-api@sha256:*
+
+  celerybeat:
+    role: celery_scheduler
+    required: true
+    allowed_images:
+      - konnaxion/django-api:v14
+      - konnaxion/django-api:v14-*
+      - konnaxion/django-api@sha256:*
+
+  flower:
+    role: private_celery_monitoring
+    required: false
+    private_only: true
+    allowed_images:
+      - konnaxion/django-api:v14
+      - konnaxion/django-api:v14-*
+      - konnaxion/django-api@sha256:*
+
+  media-nginx:
+    role: media_static_service
+    required: true
+    allowed_images:
+      - nginx:1.27-alpine
+      - nginx:1.27.*-alpine
+      - nginx@sha256:*
+
+forbidden_services:
+  - backend
+  - api
+  - web
+  - next
+  - frontend
+  - db
+  - database
+  - cache
+  - worker
+  - scheduler
+  - media
+  - agent
+
+forbidden_images:
+  - "*:latest"
+  - "docker:*"
+  - "docker.io/library/docker:*"
+
+forbidden_runtime_features:
+  privileged: true
+  network_mode: host
+  pid: host
+  ipc: host
+  mounts:
+    - /var/run/docker.sock
+    - /run/docker.sock

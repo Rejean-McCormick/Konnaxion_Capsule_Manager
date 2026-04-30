@@ -1,0 +1,128 @@
+# Konnaxion network profile: public_temporary
+#
+# Purpose:
+#   Short-lived public demo exposure.
+#
+# Safety rules:
+#   - Not default.
+#   - Requires explicit user action.
+#   - Requires expiration.
+#   - Public traffic enters only through Traefik.
+#   - Internal services are never exposed directly.
+
+schema_version: kx-network-profile/v1
+profile: public_temporary
+display_name: Public temporary
+description: Short-lived public tunnel exposure for controlled demos.
+
+default: false
+enabled_by_default: false
+
+network:
+  profile: public_temporary
+  exposure_mode: temporary_tunnel
+  public_mode_enabled: true
+  require_public_mode_expiration: true
+  public_mode_duration_hours_default: 2
+  public_mode_duration_hours_max: 24
+  public_mode_expires_at: null
+
+host:
+  bind_address: 0.0.0.0
+  generated_host_required: true
+  allowed_host_source: generated_from_profile
+
+entrypoints:
+  traefik:
+    service: traefik
+    public: true
+    ports:
+      - 80
+      - 443
+
+routing:
+  - path: /
+    service: frontend-next
+  - path: /api/
+    service: django-api
+  - path: /admin/
+    service: django-api
+  - path: /media/
+    service: media-nginx
+
+allowed_public_ports:
+  - 80
+  - 443
+
+restricted_admin_ports:
+  - 22
+
+forbidden_public_ports:
+  - 3000
+  - 5000
+  - 5432
+  - 6379
+  - 5555
+  - 8000
+
+forbidden_public_services:
+  - frontend-next
+  - django-api
+  - postgres
+  - redis
+  - celeryworker
+  - celerybeat
+  - flower
+  - media-nginx
+  - kx-agent
+
+service_exposure:
+  traefik: public
+  frontend-next: internal
+  django-api: internal
+  postgres: internal
+  redis: internal
+  celeryworker: internal
+  celerybeat: internal
+  flower: private
+  media-nginx: internal
+  kx-agent: local_only
+
+security_gate:
+  required: true
+  blocking: true
+  checks:
+    capsule_signature: required
+    image_checksums: required
+    manifest_schema: required
+    secrets_present: required
+    secrets_not_default: required
+    firewall_enabled: required
+    dangerous_ports_blocked: required
+    postgres_not_public: required
+    redis_not_public: required
+    docker_socket_not_mounted: required
+    no_privileged_containers: required
+    no_host_network: required
+    allowed_images_only: required
+    admin_surface_private: required
+    backup_configured: required
+
+runtime_policy:
+  require_signed_capsule: true
+  generate_secrets_on_install: true
+  allow_unknown_images: false
+  allow_privileged_containers: false
+  allow_docker_socket_mount: false
+  allow_host_network: false
+  require_firewall: true
+  require_https: true
+  require_tunnel_expiration: true
+  auto_disable_public_mode_on_expiry: true
+
+environment:
+  KX_NETWORK_PROFILE: public_temporary
+  KX_EXPOSURE_MODE: temporary_tunnel
+  KX_PUBLIC_MODE_ENABLED: "true"
+  KX_PUBLIC_MODE_EXPIRES_AT: "<REQUIRED_ON_ENABLE>"
+  KX_HOST: "<GENERATED_FROM_PROFILE>"

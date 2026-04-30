@@ -1,0 +1,279 @@
+schema_version: kx-security-gate/v1
+project: Konnaxion
+app_version: v14
+param_version: kx-param-2026.04.30
+policy_id: konnaxion-security-gate-default
+default_status_on_error: FAIL_BLOCKING
+private_by_default: true
+deny_by_default: true
+signed_capsules_only: true
+network_defaults:
+  network_profile: intranet_private
+  exposure_mode: private
+  public_mode_enabled: false
+  public_mode_requires_expiration: true
+allowed_status_values:
+- PASS
+- WARN
+- FAIL_BLOCKING
+- SKIPPED
+- UNKNOWN
+blocking_checks:
+- capsule_signature
+- image_checksums
+- manifest_schema
+- secrets_present
+- secrets_not_default
+- dangerous_ports_blocked
+- postgres_not_public
+- redis_not_public
+- docker_socket_not_mounted
+- no_privileged_containers
+- no_host_network
+- allowed_images_only
+checks:
+- id: capsule_signature
+  required: true
+  blocking: true
+  description: Capsule signature must be present and valid before import or startup.
+  failure_status: FAIL_BLOCKING
+  evidence:
+  - signature.sig
+  - manifest.yaml
+  - checksums.txt
+- id: image_checksums
+  required: true
+  blocking: true
+  description: All capsule image archives must match checksums.txt and manifest references.
+  failure_status: FAIL_BLOCKING
+  evidence:
+  - checksums.txt
+  - images/*.oci.tar
+- id: manifest_schema
+  required: true
+  blocking: true
+  description: manifest.yaml must match the supported Konnaxion capsule schema.
+  failure_status: FAIL_BLOCKING
+  evidence:
+  - manifest.yaml
+- id: secrets_present
+  required: true
+  blocking: true
+  description: Runtime secrets must exist in generated instance env files.
+  failure_status: FAIL_BLOCKING
+  required_env:
+  - DJANGO_SECRET_KEY
+  - POSTGRES_PASSWORD
+  - DATABASE_URL
+- id: secrets_not_default
+  required: true
+  blocking: true
+  description: Runtime secrets must not be default values, placeholders, or capsule
+    template values.
+  failure_status: FAIL_BLOCKING
+  forbidden_values:
+  - ''
+  - changeme
+  - change-me
+  - password
+  - secret
+  - admin
+  - konnaxion
+  - <GENERATED_ON_INSTALL>
+  - <POSTGRES_PASSWORD>
+  - <DJANGO_SECRET_KEY>
+- id: firewall_enabled
+  required: true
+  blocking: false
+  description: Host firewall should be enabled and managed by the Konnaxion Agent.
+  failure_status: WARN
+  accepted_backends:
+  - ufw
+  - nftables
+  - iptables
+- id: dangerous_ports_blocked
+  required: true
+  blocking: true
+  description: Internal app, database, broker, dashboard, dev, and Docker ports must
+    not be public.
+  failure_status: FAIL_BLOCKING
+  forbidden_public_ports:
+  - 3000
+  - 5000
+  - 5432
+  - 6379
+  - 5555
+  - 8000
+  forbidden_public_surfaces:
+  - frontend-next direct port
+  - django-api direct port
+  - postgres
+  - redis
+  - flower
+  - django development server
+  - Docker daemon TCP socket
+- id: postgres_not_public
+  required: true
+  blocking: true
+  description: PostgreSQL must be reachable only on internal Docker networks.
+  failure_status: FAIL_BLOCKING
+  service: postgres
+  port: 5432
+  must_not_publish: true
+- id: redis_not_public
+  required: true
+  blocking: true
+  description: Redis must be reachable only on internal Docker networks.
+  failure_status: FAIL_BLOCKING
+  service: redis
+  port: 6379
+  must_not_publish: true
+- id: docker_socket_not_mounted
+  required: true
+  blocking: true
+  description: Application containers must not mount the host Docker socket.
+  failure_status: FAIL_BLOCKING
+  forbidden_mounts:
+  - /var/run/docker.sock
+  - /run/docker.sock
+- id: no_privileged_containers
+  required: true
+  blocking: true
+  description: Application containers must not run in privileged mode.
+  failure_status: FAIL_BLOCKING
+  forbidden_compose_keys:
+  - 'privileged: true'
+- id: no_host_network
+  required: true
+  blocking: true
+  description: Application containers must not use host network mode.
+  failure_status: FAIL_BLOCKING
+  forbidden_compose_values:
+  - 'network_mode: host'
+- id: allowed_images_only
+  required: true
+  blocking: true
+  description: Runtime services may use only images declared in the signed manifest.
+  failure_status: FAIL_BLOCKING
+  allowed_source: manifest.yaml
+- id: admin_surface_private
+  required: true
+  blocking: false
+  description: Admin routes and dashboards should remain private or access-controlled.
+  failure_status: WARN
+  protected_routes:
+  - /admin/
+  - /api/
+  private_only_services:
+  - flower
+- id: backup_configured
+  required: true
+  blocking: false
+  description: Backups should be enabled and stored under the canonical backup root.
+  failure_status: WARN
+  required_env:
+  - KX_BACKUP_ENABLED
+  - KX_BACKUP_ROOT
+  canonical_backup_root: /opt/konnaxion/backups
+canonical_services:
+- traefik
+- frontend-next
+- django-api
+- postgres
+- redis
+- celeryworker
+- celerybeat
+- flower
+- media-nginx
+- kx-agent
+allowed_entry_ports:
+  https: 443
+  http_redirect: 80
+  ssh_admin_restricted: 22
+always_internal_ports:
+  frontend-next: 3000
+  django-api: 5000
+  postgres: 5432
+  redis: 6379
+  flower: 5555
+  django_dev_server: 8000
+routing:
+  /: frontend-next
+  /api/: django-api
+  /admin/: django-api
+  /media/: media-nginx
+profile_rules:
+  local_only:
+    allowed_external_ports: []
+    public_allowed: false
+    expected_exposure_mode: private
+  intranet_private:
+    allowed_external_ports:
+    - 80
+    - 443
+    public_allowed: false
+    expected_exposure_mode: private
+    restrict_to_private_networks: true
+  private_tunnel:
+    allowed_external_ports:
+    - 443
+    public_allowed: false
+    expected_exposure_mode: vpn
+  public_temporary:
+    allowed_external_ports:
+    - 80
+    - 443
+    public_allowed: true
+    expected_exposure_mode: temporary_tunnel
+    requires_expiration: true
+  public_vps:
+    allowed_external_ports:
+    - 80
+    - 443
+    public_allowed: true
+    expected_exposure_mode: public
+    requires_hardened_host: true
+  offline:
+    allowed_external_ports: []
+    public_allowed: false
+    expected_exposure_mode: private
+    external_network_allowed: false
+env_requirements:
+  required_kx_vars:
+  - KX_INSTANCE_ID
+  - KX_CAPSULE_ID
+  - KX_CAPSULE_VERSION
+  - KX_APP_VERSION
+  - KX_PARAM_VERSION
+  - KX_NETWORK_PROFILE
+  - KX_EXPOSURE_MODE
+  - KX_PUBLIC_MODE_ENABLED
+  - KX_BACKUP_ENABLED
+  - KX_BACKUP_ROOT
+  - KX_COMPOSE_FILE
+  - KX_BACKUP_DIR
+  - KX_HOST
+  generated_secret_vars:
+  - DJANGO_SECRET_KEY
+  - POSTGRES_PASSWORD
+  - DATABASE_URL
+remediation:
+  capsule_signature: Rebuild and sign the capsule, then import the signed .kxcap artifact.
+  image_checksums: Rebuild capsule checksums and reject any modified image archive.
+  manifest_schema: Regenerate manifest.yaml using the supported Konnaxion manifest
+    schema.
+  secrets_present: Regenerate instance env files through the Konnaxion Agent.
+  secrets_not_default: Rotate generated runtime secrets and rewrite instance env files.
+  firewall_enabled: Enable the host firewall through the Konnaxion Agent.
+  dangerous_ports_blocked: Remove public port mappings for internal services.
+  postgres_not_public: Remove PostgreSQL published ports and keep postgres on internal
+    networks only.
+  redis_not_public: Remove Redis published ports and keep redis on internal networks
+    only.
+  docker_socket_not_mounted: Remove Docker socket mounts from application containers.
+  no_privileged_containers: Remove privileged mode from application containers.
+  no_host_network: Use isolated Docker Compose networks instead of host networking.
+  allowed_images_only: Use only images declared in the signed capsule manifest.
+  admin_surface_private: Restrict admin routes and dashboards to private profiles
+    or authenticated access.
+  backup_configured: Enable backups and use /opt/konnaxion/backups as the backup root.

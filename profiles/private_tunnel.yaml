@@ -1,0 +1,152 @@
+# Konnaxion network profile: private_tunnel
+#
+# Purpose:
+#   Controlled remote access through a private tunnel/VPN.
+#
+# Rules:
+#   - No public app ports are exposed directly.
+#   - Traefik remains the only HTTP(S) entrypoint.
+#   - PostgreSQL, Redis, Flower, Django direct, Next.js direct, and Docker daemon
+#     must never be public.
+#   - Tunnel activation must be handled by Konnaxion Agent allowlisted actions.
+
+schema_version: kx-network-profile/v1
+
+profile:
+  name: private_tunnel
+  display_name: Private tunnel
+  description: Controlled remote demo or access through a private tunnel/VPN.
+  default: false
+
+network:
+  profile: private_tunnel
+  exposure_mode: vpn
+  public_mode_enabled: false
+  public_mode_duration_hours: null
+  public_mode_expires_at: null
+
+host:
+  bind_address: "0.0.0.0"
+  allowed_entry_ports:
+    - 443
+  optional_entry_ports:
+    - 80
+  forbidden_public_ports:
+    - 3000
+    - 5000
+    - 5432
+    - 6379
+    - 5555
+    - 8000
+
+routing:
+  entrypoint: traefik
+  routes:
+    "/": frontend-next
+    "/api/": django-api
+    "/admin/": django-api
+    "/media/": media-nginx
+
+tunnel:
+  required: true
+  public: false
+  allowed_providers:
+    - tailscale
+    - wireguard
+    - ssh-reverse
+  default_provider: tailscale
+  require_authentication: true
+  require_expiration: false
+  allow_public_quick_tunnel: false
+
+firewall:
+  deny_by_default: true
+  allow_inbound:
+    - port: 443
+      protocol: tcp
+      source: vpn
+      service: traefik
+    - port: 80
+      protocol: tcp
+      source: vpn
+      service: traefik
+      optional: true
+  deny_inbound:
+    - port: 3000
+      protocol: tcp
+      reason: Next.js direct access is forbidden.
+    - port: 5000
+      protocol: tcp
+      reason: Django/Gunicorn direct access is forbidden.
+    - port: 5432
+      protocol: tcp
+      reason: PostgreSQL must remain internal.
+    - port: 6379
+      protocol: tcp
+      reason: Redis must remain internal.
+    - port: 5555
+      protocol: tcp
+      reason: Flower must remain private.
+    - port: 8000
+      protocol: tcp
+      reason: Django development server must never be public.
+    - port: 2375
+      protocol: tcp
+      reason: Docker daemon TCP socket is forbidden.
+    - port: 2376
+      protocol: tcp
+      reason: Docker daemon TCP socket is forbidden.
+
+docker:
+  exposed_services:
+    - traefik
+  internal_services:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+  forbidden:
+    privileged_containers: true
+    host_network: true
+    docker_socket_mount: true
+    unknown_images: true
+
+environment:
+  KX_NETWORK_PROFILE: private_tunnel
+  KX_EXPOSURE_MODE: vpn
+  KX_PUBLIC_MODE_ENABLED: "false"
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_ALLOW_UNKNOWN_IMAGES: "false"
+  KX_ALLOW_PRIVILEGED_CONTAINERS: "false"
+  KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
+  KX_ALLOW_HOST_NETWORK: "false"
+
+security_gate:
+  required: true
+  blocking_checks:
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
+  warning_checks:
+    - firewall_enabled
+    - admin_surface_private
+    - backup_configured
+
+operator_notes:
+  - Use this profile for authenticated VPN/private tunnel access only.
+  - Do not use this profile for public demos; use public_temporary instead.
+  - Do not expose internal service ports through router, firewall, or tunnel rules.
+  - Konnaxion Agent must activate tunnels through allowlisted provider actions only.

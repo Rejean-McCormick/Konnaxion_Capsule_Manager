@@ -1,0 +1,167 @@
+# Konnaxion Network Profile: offline
+#
+# Purpose:
+#   No external network exposure.
+#
+# Rules:
+#   - Public mode is disabled.
+#   - No host ports are published.
+#   - Traefik entrypoints are disabled by the Agent-rendered runtime.
+#   - Internal service ports remain internal only.
+#   - No tunnel is allowed.
+#   - No automatic certificate or public DNS workflow is allowed.
+#
+# Canonical values:
+#   KX_NETWORK_PROFILE=offline
+#   KX_EXPOSURE_MODE=private
+#   KX_PUBLIC_MODE_ENABLED=false
+
+schema_version: kx-network-profile/v1
+
+profile:
+  name: offline
+  display_name: Offline
+  description: "No external network exposure. Runtime services are isolated and not reachable from LAN or Internet."
+  default: false
+
+canonical_env:
+  KX_NETWORK_PROFILE: offline
+  KX_EXPOSURE_MODE: private
+  KX_PUBLIC_MODE_ENABLED: "false"
+  KX_PUBLIC_MODE_DURATION_HOURS: ""
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_HOST: ""
+
+exposure:
+  mode: private
+  public_allowed: false
+  lan_allowed: false
+  tunnel_allowed: false
+  temporary_public_allowed: false
+  requires_expiration: false
+
+routing:
+  traefik_enabled: false
+  public_entrypoint_enabled: false
+  allowed_external_paths: []
+  hostnames: []
+  tls:
+    enabled: false
+    certificate_source: none
+
+ports:
+  publish:
+    http_80: false
+    https_443: false
+    ssh_22: false
+  allowed_entry_ports: []
+  forbidden_public_ports:
+    - 3000
+    - 5000
+    - 5432
+    - 6379
+    - 5555
+    - 8000
+
+firewall:
+  policy: deny_all_inbound
+  allow_inbound: []
+  deny_inbound:
+    - port: 80
+      protocol: tcp
+      reason: "Offline profile does not publish HTTP."
+    - port: 443
+      protocol: tcp
+      reason: "Offline profile does not publish HTTPS."
+    - port: 3000
+      protocol: tcp
+      reason: "Next.js direct port must never be public."
+    - port: 5000
+      protocol: tcp
+      reason: "Django/Gunicorn direct port must never be public."
+    - port: 5432
+      protocol: tcp
+      reason: "PostgreSQL must never be public."
+    - port: 6379
+      protocol: tcp
+      reason: "Redis must never be public."
+    - port: 5555
+      protocol: tcp
+      reason: "Flower dashboard must never be public."
+    - port: 8000
+      protocol: tcp
+      reason: "Django development server must never be public."
+
+compose_overrides:
+  traefik:
+    enabled: false
+    publish_ports: []
+  networks:
+    kx-public:
+      enabled: false
+    kx-internal:
+      enabled: true
+      internal: true
+  services:
+    frontend-next:
+      expose:
+        - 3000
+      publish_ports: []
+    django-api:
+      expose:
+        - 5000
+      publish_ports: []
+    postgres:
+      expose:
+        - 5432
+      publish_ports: []
+    redis:
+      expose:
+        - 6379
+      publish_ports: []
+    flower:
+      expose:
+        - 5555
+      publish_ports: []
+      enabled: false
+    media-nginx:
+      expose:
+        - 8080
+      publish_ports: []
+
+security_gate:
+  required: true
+  blocking_checks:
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
+  expected_results:
+    capsule_signature: PASS
+    image_checksums: PASS
+    manifest_schema: PASS
+    secrets_present: PASS
+    secrets_not_default: PASS
+    firewall_enabled: WARN
+    dangerous_ports_blocked: PASS
+    postgres_not_public: PASS
+    redis_not_public: PASS
+    docker_socket_not_mounted: PASS
+    no_privileged_containers: PASS
+    no_host_network: PASS
+    allowed_images_only: PASS
+    admin_surface_private: PASS
+    backup_configured: PASS
+
+operator_notes:
+  - "Use this profile for disconnected demos, maintenance, or isolated restore validation."
+  - "The instance may run internally, but the Manager must not expose a user-facing URL."
+  - "Switch to intranet_private or local_only when operator access is required."

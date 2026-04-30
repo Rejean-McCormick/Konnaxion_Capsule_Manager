@@ -1,0 +1,209 @@
+# Konnaxion Network Profile
+# Canonical default profile: intranet_private
+#
+# Purpose:
+#   Private LAN / intranet access only.
+#
+# Rules:
+#   - Public exposure is disabled by default.
+#   - All user-facing HTTP(S) access must go through Traefik.
+#   - Internal service ports must never be exposed directly.
+#   - PostgreSQL, Redis, Flower, Django direct, Next.js direct, and Docker daemon
+#     must remain private.
+
+schema_version: kx-profile/v1
+
+profile:
+  name: intranet_private
+  label: Intranet Private
+  description: Private LAN/intranet access through Traefik only.
+  default: true
+  app_version: v14
+  param_version: kx-param-2026.04.30
+
+network:
+  network_profile: intranet_private
+  exposure_mode: private
+  public_mode_enabled: false
+  public_mode_duration_hours: null
+  public_mode_expires_at: null
+
+  bind:
+    host: "0.0.0.0"
+    scope: lan
+    allow_wan: false
+    allow_public_internet: false
+
+  dns:
+    preferred_hostname: konnaxion.local
+    allowed_hosts:
+      - konnaxion.local
+      - localhost
+      - 127.0.0.1
+
+entrypoints:
+  traefik:
+    enabled: true
+    public: false
+    lan: true
+    ports:
+      http:
+        port: 80
+        enabled: true
+        redirect_to_https: true
+      https:
+        port: 443
+        enabled: true
+
+routing:
+  "/":
+    service: frontend-next
+    internal_port: 3000
+  "/api/":
+    service: django-api
+    internal_port: 5000
+  "/admin/":
+    service: django-api
+    internal_port: 5000
+  "/media/":
+    service: media-nginx
+    internal_port: 80
+
+firewall:
+  mode: deny_by_default
+  allow_inbound:
+    - port: 80
+      protocol: tcp
+      source: lan
+      purpose: http_redirect_to_https
+    - port: 443
+      protocol: tcp
+      source: lan
+      purpose: https_traefik
+  deny_public_inbound:
+    - port: 22
+      protocol: tcp
+      purpose: ssh_not_public_for_intranet_profile
+    - port: 3000
+      protocol: tcp
+      purpose: frontend_next_direct_forbidden
+    - port: 5000
+      protocol: tcp
+      purpose: django_api_direct_forbidden
+    - port: 5432
+      protocol: tcp
+      purpose: postgres_forbidden
+    - port: 6379
+      protocol: tcp
+      purpose: redis_forbidden
+    - port: 5555
+      protocol: tcp
+      purpose: flower_forbidden
+    - port: 8000
+      protocol: tcp
+      purpose: django_dev_server_forbidden
+  deny_all_other_inbound: true
+
+services:
+  public_entrypoint:
+    - traefik
+  routed_services:
+    - frontend-next
+    - django-api
+    - media-nginx
+  internal_only:
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+  forbidden_public:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+    - kx-agent
+
+compose_overrides:
+  traefik:
+    publish_ports:
+      - "80:80"
+      - "443:443"
+  frontend-next:
+    expose_only:
+      - 3000
+    publish_ports: []
+  django-api:
+    expose_only:
+      - 5000
+    publish_ports: []
+  postgres:
+    expose_only:
+      - 5432
+    publish_ports: []
+  redis:
+    expose_only:
+      - 6379
+    publish_ports: []
+  flower:
+    expose_only:
+      - 5555
+    publish_ports: []
+  media-nginx:
+    expose_only:
+      - 80
+    publish_ports: []
+
+security_gate:
+  required: true
+  blocking_checks:
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
+  warn_checks:
+    - firewall_enabled
+    - admin_surface_private
+    - backup_configured
+
+environment:
+  KX_NETWORK_PROFILE: intranet_private
+  KX_EXPOSURE_MODE: private
+  KX_PUBLIC_MODE_ENABLED: "false"
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_REQUIRE_SIGNED_CAPSULE: "true"
+  KX_GENERATE_SECRETS_ON_INSTALL: "true"
+  KX_ALLOW_UNKNOWN_IMAGES: "false"
+  KX_ALLOW_PRIVILEGED_CONTAINERS: "false"
+  KX_ALLOW_DOCKER_SOCKET_MOUNT: "false"
+  KX_ALLOW_HOST_NETWORK: "false"
+  KX_BACKUP_ENABLED: "true"
+  KX_HOST: konnaxion.local
+
+backup:
+  enabled: true
+  root: /opt/konnaxion/backups
+  retention:
+    daily_days: 14
+    weekly_weeks: 8
+    monthly_months: 12
+    pre_update_count: 5
+    pre_restore_count: 5
+
+operator_notes:
+  - This profile is the default Konnaxion private LAN profile.
+  - Do not expose internal service ports directly.
+  - Public Internet access requires a different approved profile.
+  - Temporary public demos must use public_temporary with expiration.

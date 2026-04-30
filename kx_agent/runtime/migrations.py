@@ -1,0 +1,415 @@
+"""Controlled runtime migration operations for Konnaxion instances.
+
+The Agent runs database migrations as an allowlisted lifecycle step. This module
+never executes arbitrary shell supplied by the Manager or UI. It only builds
+known Docker Compose commands against the canonical Django service.
+
+Production capsules must contain migration files already. The Agent runs:
+
+    python manage.py migrate --noinput
+
+It must not run ``makemigrations`` during normal capsule startup/update.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import StrEnum
+from pathlib import Path
+import subprocess
+from typing import Mapping, Sequence
+
+from kx_shared.konnaxion_constants import DockerService, instance_compose_file
+
+
+DEFAULT_TIMEOUT_SECONDS = 900
+DEFAULT_PROJECT_PREFIX = "konnaxion"
+
+
+class MigrationStatus(StrEnum):
+    """Lifecycle status for a migration operation."""
+
+    PLANNED = "planned"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+
+
+class MigrationError(RuntimeError):
+    """Raised when a controlled migration command fails."""
+
+
+@dataclass(frozen=True)
+class MigrationCommand:
+    """A safe, prebuilt migration command."""
+
+    argv: tuple[str, ...]
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+
+    def as_list(self) -> list[str]:
+        return list(self.argv)
+
+
+@dataclass(frozen=True)
+class MigrationResult:
+    """Result of a migration command execution."""
+
+    status: MigrationStatus
+    command: tuple[str, ...]
+    returncode: int | None
+    stdout: str
+    stderr: str
+    started_at: datetime
+    finished_at: datetime
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.status == MigrationStatus.SUCCEEDED and self.returncode == 0
+
+    def raise_for_failure(self) -> None:
+        if not self.ok:
+            raise MigrationError(
+                "Migration command failed "
+                f"(status={self.status}, returncode={self.returncode}). "
+                f"stderr={self.stderr.strip()!r}"
+            )
+
+
+@dataclass(frozen=True)
+class MigrationPlan:
+    """A migration plan for one Konnaxion instance."""
+
+    instance_id: str
+    compose_file: Path
+    project_name: str
+    service_name: str = DockerService.DJANGO_API.value
+    environment: Mapping[str, str] = field(default_factory=dict)
+
+    def migrate_command(self) -> MigrationCommand:
+        return MigrationCommand(
+            argv=(
+                "docker",
+                "compose",
+                "-p",
+                self.project_name,
+                "-f",
+                str(self.compose_file),
+                "run",
+                "--rm",
+                self.service_name,
+                "python",
+                "manage.py",
+                "migrate",
+                "--noinput",
+            )
+        )
+
+    def show_plan_command(self) -> MigrationCommand:
+        return MigrationCommand(
+            argv=(
+                "docker",
+                "compose",
+                "-p",
+                self.project_name,
+                "-f",
+                str(self.compose_file),
+                "run",
+                "--rm",
+                self.service_name,
+                "python",
+                "manage.py",
+                "showmigrations",
+                "--plan",
+            ),
+            timeout_seconds=300,
+        )
+
+    def check_command(self) -> MigrationCommand:
+        return MigrationCommand(
+            argv=(
+                "docker",
+                "compose",
+                "-p",
+                self.project_name,
+                "-f",
+                str(self.compose_file),
+                "run",
+                "--rm",
+                self.service_name,
+                "python",
+                "manage.py",
+                "migrate",
+                "--check",
+            ),
+            timeout_seconds=300,
+        )
+
+
+def build_migration_plan(
+    instance_id: str,
+    *,
+    compose_file: str | Path | None = None,
+    project_name: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> MigrationPlan:
+    """Build a canonical migration plan for an instance."""
+
+    if not instance_id:
+        raise MigrationError("instance_id is required to build a migration plan")
+
+    resolved_compose_file = Path(compose_file) if compose_file else instance_compose_file(instance_id)
+    resolved_project_name = project_name or project_name_for_instance(instance_id)
+
+    return MigrationPlan(
+        instance_id=instance_id,
+        compose_file=resolved_compose_file,
+        project_name=resolved_project_name,
+        environment=dict(environment or {}),
+    )
+
+
+def project_name_for_instance(instance_id: str) -> str:
+    """Return a stable Docker Compose project name for an instance."""
+
+    safe_instance_id = "".join(
+        char.lower() if char.isalnum() else "_" for char in instance_id.strip()
+    ).strip("_")
+
+    if not safe_instance_id:
+        raise MigrationError("instance_id must contain at least one alphanumeric character")
+
+    return f"{DEFAULT_PROJECT_PREFIX}_{safe_instance_id}"
+
+
+def show_migration_plan(
+    instance_id: str,
+    *,
+    compose_file: str | Path | None = None,
+    project_name: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> MigrationResult:
+    """Return Django's migration plan for the instance."""
+
+    plan = build_migration_plan(
+        instance_id,
+        compose_file=compose_file,
+        project_name=project_name,
+        environment=environment,
+    )
+    return run_migration_command(plan.show_plan_command(), environment=plan.environment)
+
+
+def check_migrations_applied(
+    instance_id: str,
+    *,
+    compose_file: str | Path | None = None,
+    project_name: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> MigrationResult:
+    """Run ``python manage.py migrate --check`` for the instance."""
+
+    plan = build_migration_plan(
+        instance_id,
+        compose_file=compose_file,
+        project_name=project_name,
+        environment=environment,
+    )
+    return run_migration_command(plan.check_command(), environment=plan.environment)
+
+
+def run_django_migrations(
+    instance_id: str,
+    *,
+    compose_file: str | Path | None = None,
+    project_name: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    raise_on_failure: bool = True,
+) -> MigrationResult:
+    """Run canonical Django migrations for a Konnaxion instance.
+
+    This is the public Agent entrypoint for migrations. It performs a controlled
+    Docker Compose ``run --rm django-api python manage.py migrate --noinput``.
+    """
+
+    plan = build_migration_plan(
+        instance_id,
+        compose_file=compose_file,
+        project_name=project_name,
+        environment=environment,
+    )
+    validate_migration_plan(plan)
+
+    result = run_migration_command(plan.migrate_command(), environment=plan.environment)
+
+    if raise_on_failure:
+        result.raise_for_failure()
+
+    return result
+
+
+def validate_migration_plan(plan: MigrationPlan) -> None:
+    """Validate a migration plan before command execution."""
+
+    if plan.service_name != DockerService.DJANGO_API.value:
+        raise MigrationError(
+            f"Migration service must be {DockerService.DJANGO_API.value!r}; "
+            f"got {plan.service_name!r}"
+        )
+
+    if not plan.compose_file:
+        raise MigrationError("compose_file is required")
+
+    if plan.compose_file.name not in {"docker-compose.runtime.yml", "docker-compose.capsule.yml"}:
+        raise MigrationError(
+            "compose_file must be a Konnaxion runtime/capsule compose file, "
+            f"got {plan.compose_file.name!r}"
+        )
+
+
+def run_migration_command(
+    command: MigrationCommand,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> MigrationResult:
+    """Run a prebuilt allowlisted migration command."""
+
+    validate_command_allowlist(command.argv)
+
+    started_at = _utcnow()
+
+    try:
+        completed = subprocess.run(
+            command.as_list(),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=command.timeout_seconds,
+            env=_merged_environment(environment),
+        )
+    except subprocess.TimeoutExpired as exc:
+        finished_at = _utcnow()
+        return MigrationResult(
+            status=MigrationStatus.TIMED_OUT,
+            command=command.argv,
+            returncode=None,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+            started_at=started_at,
+            finished_at=finished_at,
+            timed_out=True,
+        )
+
+    finished_at = _utcnow()
+    status = (
+        MigrationStatus.SUCCEEDED
+        if completed.returncode == 0
+        else MigrationStatus.FAILED
+    )
+
+    return MigrationResult(
+        status=status,
+        command=command.argv,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+
+
+def validate_command_allowlist(argv: Sequence[str]) -> None:
+    """Reject anything outside the migration command allowlist."""
+
+    if not argv:
+        raise MigrationError("empty command is not allowed")
+
+    forbidden_tokens = {";", "&&", "||", "|", "`", "$(", "makemigrations"}
+    for token in argv:
+        if token in forbidden_tokens or any(marker in token for marker in (";", "`", "$(")):
+            raise MigrationError(f"forbidden command token: {token!r}")
+
+    required_prefix = ("docker", "compose")
+    if tuple(argv[:2]) != required_prefix:
+        raise MigrationError("migration commands must start with: docker compose")
+
+    if "run" not in argv:
+        raise MigrationError("migration command must use docker compose run")
+
+    if "--rm" not in argv:
+        raise MigrationError("migration command must use --rm")
+
+    if DockerService.DJANGO_API.value not in argv:
+        raise MigrationError(
+            f"migration command must target {DockerService.DJANGO_API.value!r}"
+        )
+
+    expected_manage = ("python", "manage.py")
+    if not _contains_subsequence(tuple(argv), expected_manage):
+        raise MigrationError("migration command must run python manage.py")
+
+    if "migrate" not in argv and "showmigrations" not in argv:
+        raise MigrationError("only migrate/showmigrations commands are allowed")
+
+    if "migrate" in argv and "makemigrations" in argv:
+        raise MigrationError("makemigrations is not allowed at runtime")
+
+
+def redact_command(argv: Sequence[str]) -> str:
+    """Return a printable command string without exposing secrets."""
+
+    redacted: list[str] = []
+    secret_markers = ("PASSWORD", "SECRET", "TOKEN", "KEY", "DATABASE_URL")
+
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            redacted.append("<redacted>")
+            skip_next = False
+            continue
+
+        upper = token.upper()
+        if any(marker in upper for marker in secret_markers):
+            if "=" in token:
+                name, _value = token.split("=", 1)
+                redacted.append(f"{name}=<redacted>")
+            else:
+                redacted.append("<redacted>")
+            continue
+
+        if token in {"-e", "--env"}:
+            redacted.append(token)
+            skip_next = True
+            continue
+
+        redacted.append(token)
+
+    return " ".join(redacted)
+
+
+def _contains_subsequence(values: tuple[str, ...], expected: tuple[str, ...]) -> bool:
+    if not expected:
+        return True
+
+    window_size = len(expected)
+    for index in range(0, len(values) - window_size + 1):
+        if values[index : index + window_size] == expected:
+            return True
+    return False
+
+
+def _merged_environment(environment: Mapping[str, str] | None) -> dict[str, str] | None:
+    if environment is None:
+        return None
+
+    import os
+
+    merged = dict(os.environ)
+    merged.update({str(key): str(value) for key, value in environment.items()})
+    return merged
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)

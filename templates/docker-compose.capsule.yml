@@ -1,0 +1,310 @@
+# Konnaxion Capsule Docker Compose Template
+#
+# Canonical runtime target:
+#   Traefik + Next.js + Django + PostgreSQL + Redis + Celery + Nginx/media
+#
+# Security rules:
+#   - Traefik is the only HTTP(S) entrypoint.
+#   - Only 80/443 may be published by this stack.
+#   - 3000, 5000, 5432, 6379, 5555, and 8000 remain internal.
+#   - No privileged containers.
+#   - No host network mode.
+#   - No Docker socket mounts.
+#   - Secrets are generated on install, not stored in the capsule.
+#
+# Rendered by Konnaxion Agent into:
+#   /opt/konnaxion/instances/<KX_INSTANCE_ID>/state/docker-compose.runtime.yml
+
+name: "konnaxion-${KX_INSTANCE_ID:?KX_INSTANCE_ID is required}"
+
+services:
+  traefik:
+    image: "${KX_IMAGE_TRAEFIK:?KX_IMAGE_TRAEFIK is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-traefik"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - "--api.dashboard=false"
+      - "--api.insecure=false"
+      - "--providers.docker=false"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+      - "--accesslog=true"
+    ports:
+      - "${KX_HTTP_BIND:-0.0.0.0}:80:80"
+      - "${KX_HTTPS_BIND:-0.0.0.0}:443:443"
+    volumes:
+      - type: bind
+        source: "${KX_INSTANCE_STATE_DIR:?KX_INSTANCE_STATE_DIR is required}/traefik/dynamic"
+        target: /etc/traefik/dynamic
+        read_only: true
+      - type: bind
+        source: "${KX_INSTANCE_STATE_DIR:?KX_INSTANCE_STATE_DIR is required}/traefik/certs"
+        target: /etc/traefik/certs
+        read_only: true
+      - type: bind
+        source: "${KX_INSTANCE_LOGS_DIR:?KX_INSTANCE_LOGS_DIR is required}/traefik"
+        target: /var/log/traefik
+    depends_on:
+      frontend-next:
+        condition: service_started
+      django-api:
+        condition: service_healthy
+      media-nginx:
+        condition: service_started
+    networks:
+      - kx-public
+      - kx-internal
+    labels:
+      konnaxion.service: "traefik"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      konnaxion.exposure: "${KX_EXPOSURE_MODE:-private}"
+
+  frontend-next:
+    image: "${KX_IMAGE_FRONTEND_NEXT:?KX_IMAGE_FRONTEND_NEXT is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-frontend-next"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/frontend.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/kx.env"
+    expose:
+      - "3000"
+    depends_on:
+      django-api:
+        condition: service_healthy
+    networks:
+      - kx-internal
+    labels:
+      konnaxion.service: "frontend-next"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      traefik.enable: "false"
+
+  django-api:
+    image: "${KX_IMAGE_DJANGO_API:?KX_IMAGE_DJANGO_API is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-django-api"
+    restart: unless-stopped
+    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:5000"]
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/django.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/postgres.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/redis.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/kx.env"
+    expose:
+      - "5000"
+    volumes:
+      - type: bind
+        source: "${KX_INSTANCE_MEDIA_DIR:?KX_INSTANCE_MEDIA_DIR is required}"
+        target: /app/media
+      - type: bind
+        source: "${KX_INSTANCE_LOGS_DIR:?KX_INSTANCE_LOGS_DIR is required}/django-api"
+        target: /app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python manage.py check --deploy >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - kx-internal
+    labels:
+      konnaxion.service: "django-api"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      traefik.enable: "false"
+
+  postgres:
+    image: "${KX_IMAGE_POSTGRES:?KX_IMAGE_POSTGRES is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-postgres"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/postgres.env"
+    expose:
+      - "5432"
+    volumes:
+      - type: bind
+        source: "${KX_INSTANCE_POSTGRES_DIR:?KX_INSTANCE_POSTGRES_DIR is required}"
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: "${KX_INSTANCE_LOGS_DIR:?KX_INSTANCE_LOGS_DIR is required}/postgres"
+        target: /var/log/postgresql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER:-konnaxion} -d $${POSTGRES_DB:-konnaxion} -h 127.0.0.1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - kx-internal
+    labels:
+      konnaxion.service: "postgres"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      traefik.enable: "false"
+
+  redis:
+    image: "${KX_IMAGE_REDIS:?KX_IMAGE_REDIS is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-redis"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    command: ["redis-server", "--appendonly", "yes", "--protected-mode", "yes"]
+    expose:
+      - "6379"
+    volumes:
+      - type: bind
+        source: "${KX_INSTANCE_REDIS_DIR:?KX_INSTANCE_REDIS_DIR is required}"
+        target: /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    networks:
+      - kx-internal
+    labels:
+      konnaxion.service: "redis"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      traefik.enable: "false"
+
+  celeryworker:
+    image: "${KX_IMAGE_DJANGO_API:?KX_IMAGE_DJANGO_API is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-celeryworker"
+    restart: unless-stopped
+    command: ["celery", "-A", "config.celery_app", "worker", "--loglevel=INFO"]
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/django.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/postgres.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/redis.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/kx.env"
+    volumes:
+      - type: bind
+        source: "${KX_INSTANCE_MEDIA_DIR:?KX_INSTANCE_MEDIA_DIR is required}"
+        target: /app/media
+      - type: bind
+        source: "${KX_INSTANCE_LOGS_DIR:?KX_INSTANCE_LOGS_DIR is required}/celeryworker"
+        target: /app/logs
+    depends_on:
+      django-api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - kx-internal
+    labels:
+      konnaxion.service: "celeryworker"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      traefik.enable: "false"
+
+  celerybeat:
+    image: "${KX_IMAGE_DJANGO_API:?KX_IMAGE_DJANGO_API is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-celerybeat"
+    restart: unless-stopped
+    command: ["celery", "-A", "config.celery_app", "beat", "--loglevel=INFO"]
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/django.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/postgres.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/redis.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/kx.env"
+    volumes:
+      - type: bind
+        source: "${KX_INSTANCE_LOGS_DIR:?KX_INSTANCE_LOGS_DIR is required}/celerybeat"
+        target: /app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - kx-internal
+    labels:
+      konnaxion.service: "celerybeat"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      traefik.enable: "false"
+
+  flower:
+    image: "${KX_IMAGE_DJANGO_API:?KX_IMAGE_DJANGO_API is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-flower"
+    restart: unless-stopped
+    command: ["celery", "-A", "config.celery_app", "flower", "--port=5555"]
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/django.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/redis.env"
+      - "${KX_INSTANCE_ENV_DIR:?KX_INSTANCE_ENV_DIR is required}/kx.env"
+    expose:
+      - "5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - kx-internal
+    profiles:
+      - diagnostics
+    labels:
+      konnaxion.service: "flower"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      konnaxion.private_only: "true"
+      traefik.enable: "false"
+
+  media-nginx:
+    image: "${KX_IMAGE_MEDIA_NGINX:?KX_IMAGE_MEDIA_NGINX is required}"
+    container_name: "kx-${KX_INSTANCE_ID}-media-nginx"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8080"
+    volumes:
+      - type: bind
+        source: "${KX_INSTANCE_MEDIA_DIR:?KX_INSTANCE_MEDIA_DIR is required}"
+        target: /usr/share/nginx/html/media
+        read_only: true
+      - type: bind
+        source: "${KX_INSTANCE_LOGS_DIR:?KX_INSTANCE_LOGS_DIR is required}/media-nginx"
+        target: /var/log/nginx
+    networks:
+      - kx-internal
+    labels:
+      konnaxion.service: "media-nginx"
+      konnaxion.instance: "${KX_INSTANCE_ID}"
+      traefik.enable: "false"
+
+networks:
+  kx-public:
+    name: "kx-${KX_INSTANCE_ID}-public"
+    driver: bridge
+  kx-internal:
+    name: "kx-${KX_INSTANCE_ID}-internal"
+    driver: bridge
+    internal: true

@@ -1,0 +1,79 @@
+# Konnaxion network profile: local_only
+#
+# Purpose:
+#   Demo or maintenance use on the same machine only.
+#
+# Safety rule:
+#   No LAN, VPN, tunnel, or public exposure. No internal Konnaxion service ports
+#   are exposed directly. Runtime access must stay bound to loopback.
+
+schema_version: kx-profile/v1
+profile: local_only
+name: Local only
+description: Accessible only from the local machine.
+default: false
+
+network:
+  exposure_mode: private
+  public_mode_enabled: false
+  public_mode_expires_at: null
+  binding: loopback
+  bind_hosts:
+    - 127.0.0.1
+    - ::1
+
+entrypoints:
+  traefik:
+    enabled: true
+    public: false
+    ports: []
+
+routing:
+  enabled: true
+  host: konnaxion.localhost
+  routes:
+    /: frontend-next
+    /api/: django-api
+    /admin/: django-api
+    /media/: media-nginx
+
+services:
+  public_entrypoint: traefik
+  direct_public_access_allowed: false
+  internal_only:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+
+ports:
+  allowed_entry_ports: []
+  forbidden_public_ports:
+    - 3000
+    - 5000
+    - 5432
+    - 6379
+    - 5555
+    - 8000
+  docker_daemon_tcp_public: false
+  docker_socket_mount_allowed: false
+
+security:
+  require_signed_capsule: true
+  require_security_gate: true
+  allow_unknown_images: false
+  allow_privileged_containers: false
+  allow_host_network: false
+  require_firewall_check: true
+  require_admin_surface_private: true
+
+kx_env:
+  KX_NETWORK_PROFILE: local_only
+  KX_EXPOSURE_MODE: private
+  KX_PUBLIC_MODE_ENABLED: "false"
+  KX_PUBLIC_MODE_EXPIRES_AT: ""
+  KX_HOST: konnaxion.localhost

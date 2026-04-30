@@ -1,0 +1,260 @@
+# Konnaxion Runtime Policy
+# Canonical policy for Docker Compose runtime validation.
+#
+# Purpose:
+# - keep Konnaxion private-by-default
+# - allow only canonical services
+# - expose only Traefik entry ports
+# - block dangerous Docker features
+# - prevent public exposure of internal service ports
+#
+# This file is consumed by Konnaxion Builder, Konnaxion Agent, and Security Gate.
+
+schema_version: kx-policy/runtime/v1
+project: Konnaxion
+app_version: v14
+param_version: kx-param-2026.04.30
+policy_id: konnaxion-runtime-policy-2026.04.30
+default_network_profile: intranet_private
+default_exposure_mode: private
+
+runtime:
+  engine: docker_compose
+  compose_file: docker-compose.runtime.yml
+  generated_compose_path: /opt/konnaxion/instances/<KX_INSTANCE_ID>/state/docker-compose.runtime.yml
+
+canonical_services:
+  required:
+    - traefik
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - media-nginx
+  optional:
+    - flower
+    - kx-agent
+
+forbidden_service_aliases:
+  backend: django-api
+  api: django-api
+  web: frontend-next
+  next: frontend-next
+  frontend: frontend-next
+  db: postgres
+  database: postgres
+  cache: redis
+  worker: celeryworker
+  scheduler: celerybeat
+  media: media-nginx
+  agent: kx-agent
+
+entrypoint:
+  service: traefik
+  allowed_public_ports:
+    - 80
+    - 443
+  restricted_admin_ports:
+    - 22
+  allowed_routes:
+    "/": frontend-next
+    "/api/": django-api
+    "/admin/": django-api
+    "/media/": media-nginx
+
+ports:
+  internal_only:
+    frontend-next:
+      - 3000
+    django-api:
+      - 5000
+      - 8000
+    postgres:
+      - 5432
+    redis:
+      - 6379
+    flower:
+      - 5555
+  forbidden_public:
+    - 3000
+    - 5000
+    - 5432
+    - 6379
+    - 5555
+    - 8000
+  docker_daemon_tcp_forbidden: true
+  docker_socket_mount_forbidden: true
+
+networks:
+  deny_by_default: true
+  allowed_profiles:
+    - local_only
+    - intranet_private
+    - private_tunnel
+    - public_temporary
+    - public_vps
+    - offline
+  public_exposure_requires_explicit_profile: true
+  public_temporary_requires_expiration: true
+  public_vps_requires_hardened_host: true
+  internal_services_must_not_publish_ports:
+    - frontend-next
+    - django-api
+    - postgres
+    - redis
+    - celeryworker
+    - celerybeat
+    - flower
+    - media-nginx
+
+container_security:
+  privileged_allowed: false
+  host_network_allowed: false
+  host_pid_allowed: false
+  host_ipc_allowed: false
+  docker_socket_mount_allowed: false
+  arbitrary_host_path_mounts_allowed: false
+  unknown_images_allowed: false
+  pull_unknown_images_allowed: false
+  run_arbitrary_commands_from_ui_allowed: false
+  restart_policy_allowed_values:
+    - "no"
+    - unless-stopped
+    - on-failure
+  required_read_only_root_filesystem_where_possible: true
+  require_non_root_user_where_possible: true
+
+allowed_mount_roots:
+  instance:
+    - /opt/konnaxion/instances/<KX_INSTANCE_ID>/env
+    - /opt/konnaxion/instances/<KX_INSTANCE_ID>/postgres
+    - /opt/konnaxion/instances/<KX_INSTANCE_ID>/redis
+    - /opt/konnaxion/instances/<KX_INSTANCE_ID>/media
+    - /opt/konnaxion/instances/<KX_INSTANCE_ID>/logs
+    - /opt/konnaxion/instances/<KX_INSTANCE_ID>/state
+  backups:
+    - /opt/konnaxion/backups/<KX_INSTANCE_ID>
+  shared:
+    - /opt/konnaxion/shared
+
+forbidden_mounts:
+  - /var/run/docker.sock
+  - /run/docker.sock
+  - /etc
+  - /root
+  - /home
+  - /var/lib/docker
+  - /tmp
+  - /dev
+  - /proc
+  - /sys
+  - /boot
+  - /usr/bin/docker
+  - /usr/local/bin/docker
+
+environment:
+  required_kx_variables:
+    - KX_INSTANCE_ID
+    - KX_CAPSULE_ID
+    - KX_CAPSULE_VERSION
+    - KX_APP_VERSION
+    - KX_PARAM_VERSION
+    - KX_NETWORK_PROFILE
+    - KX_EXPOSURE_MODE
+    - KX_PUBLIC_MODE_ENABLED
+    - KX_REQUIRE_SIGNED_CAPSULE
+    - KX_GENERATE_SECRETS_ON_INSTALL
+    - KX_BACKUP_ENABLED
+    - KX_BACKUP_ROOT
+    - KX_COMPOSE_FILE
+    - KX_HOST
+  forbidden_in_capsule:
+    - real DJANGO_SECRET_KEY
+    - real POSTGRES_PASSWORD
+    - real DATABASE_URL
+    - SSH private key
+    - API token
+    - Git token
+    - provider token
+    - unencrypted production DB dump
+    - complete .env file containing secrets
+    - private certificate key
+  secret_placeholders_allowed:
+    - <GENERATED_ON_INSTALL>
+    - <GENERATED_FROM_PROFILE>
+
+security_gate:
+  run_before_start: true
+  blocking_failure_state: security_blocked
+  mandatory_checks:
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - firewall_enabled
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
+    - admin_surface_private
+    - backup_configured
+  blocking_checks:
+    - capsule_signature
+    - image_checksums
+    - manifest_schema
+    - secrets_present
+    - secrets_not_default
+    - dangerous_ports_blocked
+    - postgres_not_public
+    - redis_not_public
+    - docker_socket_not_mounted
+    - no_privileged_containers
+    - no_host_network
+    - allowed_images_only
+  statuses:
+    - PASS
+    - WARN
+    - FAIL_BLOCKING
+    - SKIPPED
+    - UNKNOWN
+
+backup_runtime:
+  enabled_by_default: true
+  canonical_root: /opt/konnaxion/backups/<INSTANCE_ID>
+  instance_pointer_path: /opt/konnaxion/instances/<INSTANCE_ID>/backups
+  retention:
+    manual_days: 14
+    daily_days: 14
+    weekly_weeks: 8
+    monthly_months: 12
+    pre_update_count: 5
+    pre_restore_count: 5
+  must_not_backup:
+    - full disk image
+    - /tmp
+    - /dev/shm
+    - system crontabs
+    - user crontabs
+    - old authorized_keys
+    - old sudoers files
+    - unknown Docker volumes
+    - Docker daemon state
+    - Docker socket
+    - unverified host binaries
+
+enforcement:
+  builder_must_validate: true
+  agent_must_validate_before_start: true
+  manager_must_not_bypass_agent: true
+  reject_on_unknown_service: true
+  reject_on_unknown_profile: true
+  reject_on_unknown_public_port: true
+  reject_on_forbidden_mount: true
+  reject_on_dangerous_container_feature: true
+  reject_unsigned_capsules: true
