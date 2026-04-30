@@ -347,6 +347,119 @@ class InstanceUiState:
 
 
 @dataclass(frozen=True)
+class TargetModeUiState:
+    """Selected GUI target mode state."""
+
+    target_mode: str = "intranet"
+    network_profile: str = DEFAULT_NETWORK_PROFILE.value
+    exposure_mode: str = DEFAULT_EXPOSURE_MODE.value
+    runtime_root: str | None = None
+    capsule_dir: str | None = None
+    host: str | None = None
+    public_mode_expires_at: str | None = None
+    confirmed: bool = False
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "TargetModeUiState":
+        """Create target mode UI state from form/API data."""
+
+        if not data:
+            return cls()
+
+        return cls(
+            target_mode=str(data.get("target_mode") or "intranet"),
+            network_profile=normalize_network_profile(data.get("network_profile")),
+            exposure_mode=normalize_exposure_mode(data.get("exposure_mode")),
+            runtime_root=_optional_str(data.get("runtime_root") or data.get("target_runtime_root")),
+            capsule_dir=_optional_str(data.get("capsule_dir") or data.get("target_capsule_dir")),
+            host=_optional_str(data.get("host") or data.get("target_host")),
+            public_mode_expires_at=_optional_str(data.get("public_mode_expires_at")),
+            confirmed=_to_bool(data.get("confirmed")),
+        )
+
+
+@dataclass(frozen=True)
+class DropletTargetUiState(TargetModeUiState):
+    """Droplet/VPS target state for UI display."""
+
+    target_mode: str = "droplet"
+    network_profile: str = "public_vps"
+    exposure_mode: str = "public"
+    droplet_name: str | None = None
+    droplet_host: str | None = None
+    droplet_user: str | None = None
+    ssh_key_path: str | None = None
+    ssh_port: int = 22
+    remote_kx_root: str | None = "/opt/konnaxion"
+    remote_capsule_dir: str | None = "/opt/konnaxion/capsules"
+    domain: str | None = None
+    remote_agent_url: str | None = None
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "DropletTargetUiState":
+        """Create Droplet target UI state from form/API data."""
+
+        if not data:
+            return cls()
+
+        return cls(
+            target_mode="droplet",
+            network_profile="public_vps",
+            exposure_mode="public",
+            runtime_root=_optional_str(data.get("remote_kx_root") or data.get("runtime_root")),
+            capsule_dir=_optional_str(data.get("remote_capsule_dir") or data.get("capsule_dir")),
+            host=_optional_str(data.get("droplet_host") or data.get("host")),
+            public_mode_expires_at=None,
+            confirmed=_to_bool(data.get("confirmed")),
+            droplet_name=_optional_str(data.get("droplet_name")),
+            droplet_host=_optional_str(data.get("droplet_host") or data.get("host")),
+            droplet_user=_optional_str(data.get("droplet_user") or data.get("ssh_user")),
+            ssh_key_path=_optional_str(data.get("ssh_key_path")),
+            ssh_port=_optional_int(data.get("ssh_port"), default=22),
+            remote_kx_root=_optional_str(data.get("remote_kx_root")),
+            remote_capsule_dir=_optional_str(data.get("remote_capsule_dir")),
+            domain=_optional_str(data.get("domain")),
+            remote_agent_url=_optional_str(data.get("remote_agent_url")),
+        )
+
+
+@dataclass(frozen=True)
+class BuildTargetUiState:
+    """Build/capsule target state for UI display."""
+
+    source_dir: str | None = None
+    capsule_output_dir: str | None = None
+    capsule_id: str | None = None
+    capsule_version: str | None = None
+    capsule_file: str | None = None
+    target: TargetModeUiState = field(default_factory=TargetModeUiState)
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "BuildTargetUiState":
+        """Create build target UI state from form/API data."""
+
+        if not data:
+            return cls()
+
+        target_mode = str(data.get("target_mode") or "intranet")
+        target: TargetModeUiState
+
+        if target_mode == "droplet":
+            target = DropletTargetUiState.from_mapping(data)
+        else:
+            target = TargetModeUiState.from_mapping(data)
+
+        return cls(
+            source_dir=_optional_str(data.get("source_dir")),
+            capsule_output_dir=_optional_str(data.get("capsule_output_dir") or data.get("output_dir")),
+            capsule_id=_optional_str(data.get("capsule_id")),
+            capsule_version=_optional_str(data.get("capsule_version") or data.get("version")),
+            capsule_file=_optional_str(data.get("capsule_file") or data.get("capsule_path")),
+            target=target,
+        )
+
+
+@dataclass(frozen=True)
 class ManagerUiState:
     """Top-level UI state for the Capsule Manager."""
 
@@ -721,6 +834,18 @@ def _optional_str(value: Any) -> str | None:
     return str(value)
 
 
+def _optional_int(value: Any, *, default: int) -> int:
+    """Convert optional values to integers."""
+
+    if value in {None, ""}:
+        return default
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _tuple_str(value: Any) -> tuple[str, ...]:
     """Convert API list-ish values to a tuple of strings."""
 
@@ -756,12 +881,15 @@ def _utc_now_iso() -> str:
 
 __all__ = [
     "BackupUiState",
+    "BuildTargetUiState",
     "CapsuleUiState",
+    "DropletTargetUiState",
     "InstanceUiState",
     "ManagerUiState",
     "NetworkUiState",
     "SecurityCheckUiState",
     "SecurityUiState",
+    "TargetModeUiState",
     "UiBadge",
     "UiSeverity",
     "badge_for_backup_status",

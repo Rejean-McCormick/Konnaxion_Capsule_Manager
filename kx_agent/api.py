@@ -457,4 +457,50 @@ def create_agent_api(action_handler: AgentActionHandler | None = None) -> FastAP
     return app
 
 
-app = create_agent_api()
+def create_app(
+    *,
+    config: Any | None = None,
+    action_handler: AgentActionHandler | None = None,
+) -> FastAPI:
+    """Compatibility factory used by kx_agent.main."""
+
+    app = create_agent_api(action_handler=action_handler)
+    app.state.config = config
+    return app
+
+
+app = create_app()
+
+
+__all__ = [
+    "API_PREFIX",
+    "API_VERSION",
+    "ActionResponse",
+    "AgentAPIError",
+    "AgentActionHandler",
+    "AgentActionName",
+    "AgentInfoResponse",
+    "CapsuleImportRequest",
+    "CapsuleVerifyRequest",
+    "ErrorResponse",
+    "HealthResponse",
+    "InstanceBackupRequest",
+    "InstanceCreateRequest",
+    "InstanceHealthRequest",
+    "InstanceLogsRequest",
+    "InstanceRequest",
+    "InstanceRestoreNewRequest",
+    "InstanceRestoreRequest",
+    "InstanceRollbackRequest",
+    "InstanceStartRequest",
+    "InstanceStatusRequest",
+    "InstanceStopRequest",
+    "InstanceUpdateRequest",
+    "NetworkSetProfileRequest",
+    "SecurityCheckRequest",
+    "UnconfiguredActionHandler",
+    "app",
+    "create_agent_api",
+    "create_app",
+    "router",
+]
