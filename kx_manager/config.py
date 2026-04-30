@@ -11,6 +11,7 @@ This module:
 - validates private-by-default posture
 - builds the local Konnaxion Agent base URL
 - centralizes filesystem locations used by Manager API/UI code
+- provides `get_manager_config()` for Manager API/route compatibility
 """
 
 from __future__ import annotations
@@ -154,7 +155,7 @@ class ManagerSecurityConfig:
     @classmethod
     def from_environment(cls) -> "ManagerSecurityConfig":
         return cls(
-            require_agent_token=read_bool_env("KX_MANAGER_REQUIRE_AGENT_TOKEN", True),
+            require_agent_token=read_bool_env("KX_MANAGER_REQUIRE_AGENT_TOKEN", False),
             allow_public_manager_bind=read_bool_env("KX_MANAGER_ALLOW_PUBLIC_BIND", False),
             allow_agent_remote_host=read_bool_env("KX_MANAGER_ALLOW_REMOTE_AGENT", False),
             require_signed_capsules=read_bool_env(
@@ -220,8 +221,10 @@ class ManagerConfig:
     environment: ManagerEnvironment
     host: str
     port: int
+    scheme: str
     debug: bool
     log_level: str
+    allowed_cors_origins: tuple[str, ...]
     instance_id: str
     network_profile: str
     exposure_mode: str
@@ -235,14 +238,44 @@ class ManagerConfig:
 
     @property
     def base_url(self) -> str:
-        scheme = "http" if self.debug else "https"
-        return f"{scheme}://{self.host}:{self.port}"
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def agent_base_url(self) -> str:
+        """Compatibility property used by older Manager route modules."""
+
+        return self.agent.base_url
+
+    @property
+    def KX_AGENT_BASE_URL(self) -> str:
+        """Compatibility alias for legacy route helpers."""
+
+        return self.agent.base_url
+
+    @property
+    def KX_AGENT_HOST(self) -> str:
+        """Compatibility alias for legacy route helpers."""
+
+        return self.agent.host
+
+    @property
+    def KX_AGENT_PORT(self) -> int:
+        """Compatibility alias for legacy route helpers."""
+
+        return self.agent.port
+
+    @property
+    def KX_AGENT_TOKEN(self) -> str:
+        """Compatibility alias for legacy route helpers."""
+
+        return self.agent.token
 
     @classmethod
     def from_environment(cls) -> "ManagerConfig":
         paths = ManagerPaths.from_environment()
         agent = read_agent_config()
         security = ManagerSecurityConfig.from_environment()
+        debug = read_bool_env("KX_MANAGER_DEBUG", False)
 
         return cls(
             name=MANAGER_NAME,
@@ -253,8 +286,13 @@ class ManagerConfig:
             ),
             host=os.getenv("KX_MANAGER_HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=read_int_env("KX_MANAGER_PORT", 8780),
-            debug=read_bool_env("KX_MANAGER_DEBUG", False),
+            scheme=os.getenv("KX_MANAGER_SCHEME", "http").strip().lower() or "http",
+            debug=debug,
             log_level=os.getenv("KX_MANAGER_LOG_LEVEL", "INFO").strip().upper() or "INFO",
+            allowed_cors_origins=parse_csv_env(
+                "KX_MANAGER_ALLOWED_CORS_ORIGINS",
+                default=("http://127.0.0.1:8780", "http://localhost:8780"),
+            ),
             instance_id=os.getenv("KX_INSTANCE_ID", DEFAULT_INSTANCE_ID).strip()
             or DEFAULT_INSTANCE_ID,
             network_profile=os.getenv(
@@ -283,6 +321,9 @@ class ManagerConfig:
 
         if not 1 <= self.port <= 65535:
             raise ManagerConfigError("KX_MANAGER_PORT must be between 1 and 65535.")
+
+        if self.scheme not in {"http", "https"}:
+            raise ManagerConfigError("KX_MANAGER_SCHEME must be either http or https.")
 
         if self.host not in {"127.0.0.1", "localhost", "::1"}:
             if not self.security.allow_public_manager_bind:
@@ -325,8 +366,10 @@ class ManagerConfig:
             "environment": self.environment.value,
             "host": self.host,
             "port": self.port,
+            "scheme": self.scheme,
             "debug": self.debug,
             "log_level": self.log_level,
+            "allowed_cors_origins": list(self.allowed_cors_origins),
             "instance_id": self.instance_id,
             "network_profile": self.network_profile,
             "exposure_mode": self.exposure_mode,
@@ -339,6 +382,35 @@ class ManagerConfig:
             "security": self.security.safe_dict(),
             "extra": dict(self.extra),
         }
+
+
+_MANAGER_CONFIG_CACHE: ManagerConfig | None = None
+
+
+def get_manager_config(
+    *,
+    ensure_paths: bool = False,
+    validate: bool = True,
+    refresh: bool = False,
+) -> ManagerConfig:
+    """
+    Return the process-wide Manager configuration.
+
+    This compatibility function is used by `kx_manager.api` and route modules.
+    Use `refresh=True` in tests after changing environment variables.
+    """
+
+    global _MANAGER_CONFIG_CACHE
+
+    if refresh or _MANAGER_CONFIG_CACHE is None:
+        _MANAGER_CONFIG_CACHE = load_config(
+            ensure_paths=ensure_paths,
+            validate=validate,
+        )
+    elif ensure_paths:
+        _MANAGER_CONFIG_CACHE.ensure_paths()
+
+    return _MANAGER_CONFIG_CACHE
 
 
 def load_config(*, ensure_paths: bool = False, validate: bool = True) -> ManagerConfig:
@@ -377,7 +449,7 @@ def read_agent_config() -> AgentClientConfig:
     return AgentClientConfig(
         host=os.getenv("KX_AGENT_HOST", "127.0.0.1").strip() or "127.0.0.1",
         port=read_int_env("KX_AGENT_PORT", 8765),
-        scheme=os.getenv("KX_AGENT_SCHEME", "http").strip() or "http",
+        scheme=os.getenv("KX_AGENT_SCHEME", "http").strip().lower() or "http",
         timeout_seconds=read_int_env("KX_AGENT_TIMEOUT_SECONDS", 30),
         token=os.getenv("KX_AGENT_TOKEN", "").strip(),
     )
@@ -403,6 +475,16 @@ def parse_environment(value: str) -> ManagerEnvironment:
         raise ManagerConfigError(
             f"Invalid KX_MANAGER_ENV={value!r}. Allowed: {allowed}."
         ) from exc
+
+
+def parse_csv_env(key: str, *, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(key, "").strip()
+
+    if not raw:
+        return default
+
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return values or default
 
 
 def read_int_env(key: str, default: int) -> int:
@@ -446,7 +528,7 @@ def env_template(config: ManagerConfig | None = None) -> dict[str, str]:
     Return a Manager `.env` template with canonical safe defaults.
 
     Secrets are intentionally blank. Operators or installers should inject
-    `KX_AGENT_TOKEN` through a local secret mechanism.
+    `KX_AGENT_TOKEN` through a local secret mechanism when token auth is enabled.
     """
 
     cfg = config or ManagerConfig.from_environment()
@@ -455,8 +537,10 @@ def env_template(config: ManagerConfig | None = None) -> dict[str, str]:
         "KX_MANAGER_ENV": cfg.environment.value,
         "KX_MANAGER_HOST": cfg.host,
         "KX_MANAGER_PORT": str(cfg.port),
+        "KX_MANAGER_SCHEME": cfg.scheme,
         "KX_MANAGER_DEBUG": "true" if cfg.debug else "false",
         "KX_MANAGER_LOG_LEVEL": cfg.log_level,
+        "KX_MANAGER_ALLOWED_CORS_ORIGINS": ",".join(cfg.allowed_cors_origins),
         "KX_MANAGER_REQUIRE_AGENT_TOKEN": "true"
         if cfg.security.require_agent_token
         else "false",
@@ -491,3 +575,17 @@ def env_template(config: ManagerConfig | None = None) -> dict[str, str]:
         "KX_ALLOW_DOCKER_SOCKET_MOUNT": "false",
         "KX_ALLOW_HOST_NETWORK": "false",
     }
+
+
+__all__ = [
+    "AgentClientConfig",
+    "ManagerConfig",
+    "ManagerConfigError",
+    "ManagerEnvironment",
+    "ManagerPaths",
+    "ManagerSecurityConfig",
+    "env_template",
+    "get_manager_config",
+    "load_config",
+    "read_agent_config",
+]

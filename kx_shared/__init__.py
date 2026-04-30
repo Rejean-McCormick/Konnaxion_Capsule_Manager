@@ -9,7 +9,7 @@ Konnaxion Agent, Konnaxion Capsule Builder, and kx CLI.
 from .konnaxion_constants import (
     AGENT_NAME,
     APP_VERSION,
-    BACKUP_STATUS,
+    BackupStatus,
     BLOCKING_SECURITY_CHECKS,
     BOX_NAME,
     BUILDER_NAME,
@@ -50,7 +50,7 @@ from .konnaxion_constants import (
 __all__ = [
     "AGENT_NAME",
     "APP_VERSION",
-    "BACKUP_STATUS",
+    "BackupStatus",
     "BLOCKING_SECURITY_CHECKS",
     "BOX_NAME",
     "BUILDER_NAME",

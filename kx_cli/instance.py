@@ -1,24 +1,14 @@
 """
-`kx instance` CLI commands for Konnaxion.
+`kx instance` command handlers for the canonical Konnaxion CLI.
 
-Canonical public/operator commands implemented here:
+This module is imported by ``kx_cli.main``. It does not own the root parser;
+``kx_cli.main`` parses canonical public commands and dispatches here with
+``handler(args=args, context=context)``.
 
-    kx instance create
-    kx instance start
-    kx instance stop
-    kx instance status
-    kx instance logs
-    kx instance backup
-    kx instance restore
-    kx instance restore-new
-    kx instance update
-    kx instance rollback
-    kx instance health
-
-The CLI is an operator interface. It must not directly control Docker, firewall,
-database services, backups, or host networking. It sends requests to the local
-Konnaxion Capsule Manager, which delegates privileged operations to the
-Konnaxion Agent.
+The CLI must not execute Docker, firewall, database, backup, restore, or host
+networking operations directly. Every operation below calls the local
+Konnaxion Agent API and returns a structured mapping that ``kx_cli.main`` can
+normalize into a ``CliResult``.
 """
 
 from __future__ import annotations
@@ -26,641 +16,577 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Mapping, Sequence
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+
+import httpx
 
 from kx_shared.konnaxion_constants import (
+    DEFAULT_CAPSULE_ID,
     DEFAULT_EXPOSURE_MODE,
     DEFAULT_INSTANCE_ID,
     DEFAULT_NETWORK_PROFILE,
     InstanceState,
-    NetworkProfile,
-    ExposureMode,
 )
 
 
+DEFAULT_AGENT_URL = "http://127.0.0.1:8765"
+REQUEST_TIMEOUT_SECONDS = 120.0
+
+
 class InstanceCliError(RuntimeError):
-    """Raised when an instance CLI command fails."""
+    """Raised when an instance CLI operation fails."""
 
 
 class OutputFormat(StrEnum):
-    """Supported CLI output formats."""
+    """Standalone compatibility output formats."""
 
     TEXT = "text"
     JSON = "json"
 
 
 @dataclass(frozen=True)
-class ManagerClientConfig:
-    """Connection settings for the local Capsule Manager API."""
+class InstanceCommandResult:
+    """Structured result returned to ``kx_cli.main``."""
 
-    base_url: str
+    ok: bool
+    command: str
+    message: str = ""
+    data: Mapping[str, Any] = field(default_factory=dict)
+    issues: tuple[Mapping[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AgentRequestConfig:
+    """Connection settings for the local Konnaxion Agent API."""
+
+    base_url: str = DEFAULT_AGENT_URL
+    timeout_seconds: float = REQUEST_TIMEOUT_SECONDS
     token: str = ""
-    timeout_seconds: int = 30
 
     @classmethod
-    def from_environment(cls) -> "ManagerClientConfig":
-        host = os.getenv("KX_MANAGER_HOST", "127.0.0.1").strip() or "127.0.0.1"
-        port = os.getenv("KX_MANAGER_PORT", "8780").strip() or "8780"
-        scheme = os.getenv("KX_MANAGER_SCHEME", "http").strip() or "http"
-        explicit_url = os.getenv("KX_MANAGER_URL", "").strip()
-
-        base_url = explicit_url.rstrip("/") if explicit_url else f"{scheme}://{host}:{port}"
+    def from_context(cls, context: Any | None = None) -> "AgentRequestConfig":
+        context_url = str(getattr(context, "agent_url", "") or "").strip()
+        env_url = os.getenv("KX_AGENT_URL", "").strip()
+        base_url = context_url or env_url or DEFAULT_AGENT_URL
 
         return cls(
-            base_url=base_url,
-            token=os.getenv("KX_MANAGER_TOKEN", "").strip(),
-            timeout_seconds=read_int_env("KX_CLI_TIMEOUT_SECONDS", 30),
+            base_url=base_url.rstrip("/"),
+            timeout_seconds=_read_float_env(
+                "KX_CLI_TIMEOUT_SECONDS",
+                REQUEST_TIMEOUT_SECONDS,
+            ),
+            token=os.getenv("KX_AGENT_TOKEN", "").strip(),
         )
 
 
-class ManagerClient:
-    """Small standard-library HTTP client for Manager API calls."""
-
-    def __init__(self, config: ManagerClientConfig) -> None:
-        self.config = config
-        self.base_url = config.base_url.rstrip("/")
-
-    def get(self, path: str, *, params: Mapping[str, Any] | None = None) -> Any:
-        return self.request("GET", path, params=params)
-
-    def post(self, path: str, *, body: Mapping[str, Any] | None = None) -> Any:
-        return self.request("POST", path, body=body)
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: Mapping[str, Any] | None = None,
-        body: Mapping[str, Any] | None = None,
-    ) -> Any:
-        query = ""
-
-        if params:
-            clean_params = {
-                key: value
-                for key, value in params.items()
-                if value is not None and value != ""
-            }
-            if clean_params:
-                query = "?" + urlencode(clean_params)
-
-        url = f"{self.base_url}{path}{query}"
-        payload = None
-
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "kx-cli/instance",
-        }
-
-        if body is not None:
-            payload = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-
-        if self.config.token:
-            headers["Authorization"] = f"Bearer {self.config.token}"
-
-        request = Request(url, data=payload, headers=headers, method=method)
-
-        try:
-            with urlopen(request, timeout=self.config.timeout_seconds) as response:
-                response_body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise InstanceCliError(
-                f"Manager API returned HTTP {exc.code}: {detail or exc.reason}"
-            ) from exc
-        except URLError as exc:
-            raise InstanceCliError(f"Cannot reach Konnaxion Capsule Manager: {exc}") from exc
-        except TimeoutError as exc:
-            raise InstanceCliError("Konnaxion Capsule Manager request timed out.") from exc
-
-        if not response_body:
-            return {}
-
-        try:
-            return json.loads(response_body)
-        except json.JSONDecodeError as exc:
-            raise InstanceCliError("Manager API returned invalid JSON.") from exc
+# ---------------------------------------------------------------------------
+# Handlers called by kx_cli.main
+# ---------------------------------------------------------------------------
 
 
-def register_instance_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Register `kx instance ...` commands on the root CLI parser."""
-
-    parser = subparsers.add_parser(
-        "instance",
-        help="Manage Konnaxion Instances.",
-    )
-
-    parser.add_argument(
-        "--manager-url",
-        default=os.getenv("KX_MANAGER_URL", ""),
-        help="Override Konnaxion Capsule Manager API URL.",
-    )
-    parser.add_argument(
-        "--token",
-        default=os.getenv("KX_MANAGER_TOKEN", ""),
-        help="Bearer token for Konnaxion Capsule Manager API.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=read_int_env("KX_CLI_TIMEOUT_SECONDS", 30),
-        help="Manager API timeout in seconds.",
-    )
-    parser.add_argument(
-        "--output",
-        choices=[item.value for item in OutputFormat],
-        default=OutputFormat.TEXT.value,
-        help="Output format.",
-    )
-
-    instance_subparsers = parser.add_subparsers(dest="instance_command")
-
-    create_parser = instance_subparsers.add_parser("create", help="Create a Konnaxion Instance.")
-    create_parser.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
-    create_parser.add_argument("--capsule-id", default="")
-    create_parser.add_argument(
-        "--network",
-        "--network-profile",
-        dest="network_profile",
-        default=DEFAULT_NETWORK_PROFILE.value,
-        choices=[item.value for item in NetworkProfile],
-    )
-    create_parser.add_argument(
-        "--exposure",
-        "--exposure-mode",
-        dest="exposure_mode",
-        default=DEFAULT_EXPOSURE_MODE.value,
-        choices=[item.value for item in ExposureMode],
-    )
-    create_parser.add_argument("--host", default="")
-    create_parser.add_argument("--admin-email", default="")
-    create_parser.add_argument("--generate-secrets", action=argparse.BooleanOptionalAction, default=True)
-    create_parser.set_defaults(func=cmd_create)
-
-    start_parser = instance_subparsers.add_parser("start", help="Start a Konnaxion Instance.")
-    start_parser.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
-    start_parser.add_argument(
-        "--network",
-        "--network-profile",
-        dest="network_profile",
-        default="",
-        choices=[""] + [item.value for item in NetworkProfile],
-    )
-    start_parser.add_argument(
-        "--exposure",
-        "--exposure-mode",
-        dest="exposure_mode",
-        default="",
-        choices=[""] + [item.value for item in ExposureMode],
-    )
-    start_parser.add_argument("--host", default="")
-    start_parser.add_argument("--public-mode-expires-at", default="")
-    start_parser.add_argument("--wait", action="store_true")
-    start_parser.set_defaults(func=cmd_start)
-
-    stop_parser = instance_subparsers.add_parser("stop", help="Stop a Konnaxion Instance.")
-    stop_parser.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
-    stop_parser.add_argument("--force", action="store_true")
-    stop_parser.add_argument("--timeout-seconds", type=int, default=60)
-    stop_parser.set_defaults(func=cmd_stop)
-
-    status_parser = instance_subparsers.add_parser("status", help="Show Konnaxion Instance status.")
-    status_parser.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
-    status_parser.set_defaults(func=cmd_status)
-
-    logs_parser = instance_subparsers.add_parser("logs", help="Show Konnaxion Instance logs.")
-    logs_parser.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
-    logs_parser.add_argument("--service", default="")
-    logs_parser.add_argument("--tail", type=int, default=200)
-    logs_parser.add_argument("--since", default="")
-    logs_parser.add_argument("--follow", action="store_true")
-    logs_parser.set_defaults(func=cmd_logs)
-
-    backup_parser = instance_subparsers.add_parser("backup", help="Create an instance backup.")
-    backup_parser.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
-    backup_parser.add_argument("--class", dest="backup_class", default="manual")
-    backup_parser.add_argument("--label", default="")
-    backup_parser.add_argument("--reason", default="")
-    backup_parser.add_argument("--verify", action=argparse.BooleanOptionalAction, default=True)
-    backup_parser.set_defaults(func=cmd_backup)
-
-    restore_parser = instance_subparsers.add_parser("restore", help="Restore an instance from backup.")
-    restore_parser.add_argument("instance_id")
-    restore_parser.add_argument("--from", dest="backup_id", required=True)
-    restore_parser.add_argument("--reason", default="")
-    restore_parser.add_argument("--pre-restore-backup", action=argparse.BooleanOptionalAction, default=True)
-    restore_parser.add_argument("--run-migrations", action=argparse.BooleanOptionalAction, default=True)
-    restore_parser.add_argument("--run-security-gate", action=argparse.BooleanOptionalAction, default=True)
-    restore_parser.add_argument("--run-healthchecks", action=argparse.BooleanOptionalAction, default=True)
-    restore_parser.set_defaults(func=cmd_restore)
-
-    restore_new_parser = instance_subparsers.add_parser(
-        "restore-new",
-        help="Restore a backup into a new Konnaxion Instance.",
-    )
-    restore_new_parser.add_argument("--from", dest="backup_id", required=True)
-    restore_new_parser.add_argument("--new-instance-id", required=True)
-    restore_new_parser.add_argument(
-        "--network",
-        "--network-profile",
-        dest="network_profile",
-        default=DEFAULT_NETWORK_PROFILE.value,
-        choices=[item.value for item in NetworkProfile],
-    )
-    restore_new_parser.add_argument(
-        "--exposure",
-        "--exposure-mode",
-        dest="exposure_mode",
-        default=DEFAULT_EXPOSURE_MODE.value,
-        choices=[item.value for item in ExposureMode],
-    )
-    restore_new_parser.add_argument("--reason", default="")
-    restore_new_parser.set_defaults(func=cmd_restore_new)
-
-    update_parser = instance_subparsers.add_parser("update", help="Update an instance to a new capsule.")
-    update_parser.add_argument("instance_id")
-    update_parser.add_argument("--capsule-id", required=True)
-    update_parser.add_argument("--backup-first", action=argparse.BooleanOptionalAction, default=True)
-    update_parser.add_argument("--run-migrations", action=argparse.BooleanOptionalAction, default=True)
-    update_parser.add_argument("--run-security-gate", action=argparse.BooleanOptionalAction, default=True)
-    update_parser.add_argument("--run-healthchecks", action=argparse.BooleanOptionalAction, default=True)
-    update_parser.set_defaults(func=cmd_update)
-
-    rollback_parser = instance_subparsers.add_parser("rollback", help="Rollback an instance.")
-    rollback_parser.add_argument("instance_id")
-    rollback_parser.add_argument("--to-capsule-id", default="")
-    rollback_parser.add_argument("--from-backup-id", default="")
-    rollback_parser.add_argument("--reason", default="")
-    rollback_parser.set_defaults(func=cmd_rollback)
-
-    health_parser = instance_subparsers.add_parser("health", help="Run instance healthchecks.")
-    health_parser.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
-    health_parser.add_argument("--wait", action="store_true")
-    health_parser.add_argument("--timeout-seconds", type=int, default=120)
-    health_parser.set_defaults(func=cmd_health)
-
-    parser.set_defaults(func=cmd_instance_help, instance_parser=parser)
-
-
-def cmd_instance_help(args: argparse.Namespace) -> int:
-    """Print instance command help when no subcommand is selected."""
-
-    parser = getattr(args, "instance_parser", None)
-    if parser is not None:
-        parser.print_help()
-    return 2
-
-
-def cmd_create(args: argparse.Namespace) -> int:
-    client = build_client(args)
+def create_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance create``."""
 
     payload = {
         "instance_id": args.instance_id,
-        "capsule_id": args.capsule_id,
-        "network_profile": args.network_profile,
-        "exposure_mode": args.exposure_mode,
-        "host": args.host,
-        "admin_email": args.admin_email,
-        "generate_secrets": args.generate_secrets,
+        "capsule_id": getattr(args, "capsule_id", DEFAULT_CAPSULE_ID),
+        "network_profile": getattr(args, "profile", DEFAULT_NETWORK_PROFILE.value),
+        "exposure_mode": getattr(args, "exposure", DEFAULT_EXPOSURE_MODE.value),
+        "generate_secrets": True,
     }
 
-    response = client.post("/instances", body=payload)
-    return print_response(response, args.output, title="Instance create requested")
-
-
-def cmd_start(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    payload = {
-        "network_profile": args.network_profile,
-        "exposure_mode": args.exposure_mode,
-        "host": args.host,
-        "public_mode_expires_at": args.public_mode_expires_at,
-        "wait": args.wait,
-    }
-
-    response = client.post(f"/instances/{args.instance_id}/start", body=payload)
-    return print_response(response, args.output, title="Instance start requested")
-
-
-def cmd_stop(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    payload = {
-        "force": args.force,
-        "timeout_seconds": args.timeout_seconds,
-    }
-
-    response = client.post(f"/instances/{args.instance_id}/stop", body=payload)
-    return print_response(response, args.output, title="Instance stop requested")
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    client = build_client(args)
-    response = client.get(f"/instances/{args.instance_id}")
-    return print_response(response, args.output, title="Instance status")
-
-
-def cmd_logs(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    response = client.get(
-        f"/instances/{args.instance_id}/logs",
-        params={
-            "service": args.service,
-            "tail": args.tail,
-            "since": args.since,
-            "follow": str(args.follow).lower(),
-        },
+    response = _agent_post(context, "/v1/instances/create", payload)
+    return _result(
+        "instance create",
+        response,
+        fallback_message=f"Create requested for instance {args.instance_id}.",
     )
 
-    if args.output == OutputFormat.JSON.value:
-        return print_response(response, args.output)
 
-    if isinstance(response, dict):
-        logs = response.get("logs") or response.get("data") or response.get("text")
-        if isinstance(logs, str):
-            print(logs)
-            return 0
-
-    return print_response(response, args.output, title="Instance logs")
-
-
-def cmd_backup(args: argparse.Namespace) -> int:
-    client = build_client(args)
+def start_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance start``."""
 
     payload = {
-        "backup_class": args.backup_class,
-        "label": args.label,
-        "reason": args.reason,
-        "verify_after_create": args.verify,
-        "include_database": True,
-        "include_media": True,
-        "include_env_fingerprint": True,
-    }
-
-    response = client.post(f"/instances/{args.instance_id}/backups", body=payload)
-    return print_response(response, args.output, title="Backup requested")
-
-
-def cmd_restore(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    payload = {
-        "backup_id": args.backup_id,
-        "create_pre_restore_backup": args.pre_restore_backup,
-        "run_migrations": args.run_migrations,
-        "run_security_gate": args.run_security_gate,
-        "run_healthchecks": args.run_healthchecks,
-        "reason": args.reason,
-    }
-
-    response = client.post(f"/instances/{args.instance_id}/restore", body=payload)
-    return print_response(response, args.output, title="Restore requested")
-
-
-def cmd_restore_new(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    payload = {
-        "backup_id": args.backup_id,
-        "new_instance_id": args.new_instance_id,
-        "network_profile": args.network_profile,
-        "exposure_mode": args.exposure_mode,
-        "reason": args.reason,
-        "run_migrations": True,
+        "instance_id": args.instance_id,
         "run_security_gate": True,
-        "run_healthchecks": True,
     }
 
-    response = client.post("/instances/restore-new", body=payload)
-    return print_response(response, args.output, title="Restore-new requested")
-
-
-def cmd_update(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    payload = {
-        "capsule_id": args.capsule_id,
-        "backup_first": args.backup_first,
-        "run_migrations": args.run_migrations,
-        "run_security_gate": args.run_security_gate,
-        "run_healthchecks": args.run_healthchecks,
-    }
-
-    response = client.post(f"/instances/{args.instance_id}/update", body=payload)
-    return print_response(response, args.output, title="Instance update requested")
-
-
-def cmd_rollback(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    if not args.to_capsule_id and not args.from_backup_id:
-        raise InstanceCliError(
-            "Rollback requires --to-capsule-id or --from-backup-id."
-        )
-
-    payload = {
-        "to_capsule_id": args.to_capsule_id,
-        "from_backup_id": args.from_backup_id,
-        "reason": args.reason,
-    }
-
-    response = client.post(f"/instances/{args.instance_id}/rollback", body=payload)
-    return print_response(response, args.output, title="Rollback requested")
-
-
-def cmd_health(args: argparse.Namespace) -> int:
-    client = build_client(args)
-
-    response = client.get(
-        f"/instances/{args.instance_id}/health",
-        params={
-            "wait": str(args.wait).lower(),
-            "timeout_seconds": args.timeout_seconds,
-        },
+    # The current Agent API does not accept profile/exposure on start. Profile
+    # changes should go through ``kx network set-profile`` before startup.
+    response = _agent_post(context, "/v1/instances/start", payload)
+    return _result(
+        "instance start",
+        response,
+        fallback_message=f"Start requested for instance {args.instance_id}.",
     )
 
-    return print_response(response, args.output, title="Instance health")
 
+def stop_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance stop``."""
 
-def build_client(args: argparse.Namespace) -> ManagerClient:
-    """Build Manager client from args and environment."""
+    payload = {
+        "instance_id": args.instance_id,
+        "timeout_seconds": int(getattr(args, "timeout", None) or 60),
+    }
 
-    config = ManagerClientConfig.from_environment()
-
-    if getattr(args, "manager_url", ""):
-        config = ManagerClientConfig(
-            base_url=args.manager_url.rstrip("/"),
-            token=args.token or config.token,
-            timeout_seconds=args.timeout,
-        )
-    else:
-        config = ManagerClientConfig(
-            base_url=config.base_url,
-            token=args.token or config.token,
-            timeout_seconds=args.timeout,
-        )
-
-    return ManagerClient(config)
-
-
-def print_response(
-    response: Any,
-    output_format: str,
-    *,
-    title: str = "",
-) -> int:
-    """Print a Manager API response."""
-
-    if output_format == OutputFormat.JSON.value:
-        print(json.dumps(response, indent=2, sort_keys=True))
-        return exit_code_from_response(response)
-
-    if title:
-        print(title)
-
-    if isinstance(response, dict):
-        print_mapping(response)
-    elif isinstance(response, list):
-        print_list(response)
-    else:
-        print(response)
-
-    return exit_code_from_response(response)
-
-
-def print_mapping(data: Mapping[str, Any], *, indent: int = 0) -> None:
-    """Print a readable mapping."""
-
-    prefix = " " * indent
-
-    priority_keys = (
-        "ok",
-        "operation",
-        "instance_id",
-        "new_instance_id",
-        "backup_id",
-        "source_backup_id",
-        "status",
-        "state",
-        "network_profile",
-        "exposure_mode",
-        "url",
-        "host",
-        "message",
+    response = _agent_post(context, "/v1/instances/stop", payload)
+    return _result(
+        "instance stop",
+        response,
+        fallback_message=f"Stop requested for instance {args.instance_id}.",
     )
 
-    printed = set()
 
-    for key in priority_keys:
-        if key in data:
-            print(f"{prefix}{key}: {format_value(data[key])}")
-            printed.add(key)
+def instance_status(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance status``."""
 
-    for key in sorted(k for k in data.keys() if k not in printed):
-        value = data[key]
-        if isinstance(value, dict):
-            print(f"{prefix}{key}:")
-            print_mapping(value, indent=indent + 2)
-        elif isinstance(value, list):
-            print(f"{prefix}{key}:")
-            print_list(value, indent=indent + 2)
-        else:
-            print(f"{prefix}{key}: {format_value(value)}")
+    response = _agent_post(
+        context,
+        "/v1/instances/status",
+        {"instance_id": args.instance_id},
+    )
+    return _result(
+        "instance status",
+        response,
+        fallback_message=f"Status loaded for instance {args.instance_id}.",
+    )
 
 
-def print_list(items: Sequence[Any], *, indent: int = 0) -> None:
-    """Print a readable list."""
+def instance_logs(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance logs``."""
 
-    prefix = " " * indent
+    services = _normalize_services(getattr(args, "service", None))
 
-    if not items:
-        print(f"{prefix}[]")
-        return
+    if len(services) <= 1:
+        payload = {
+            "instance_id": args.instance_id,
+            "service": services[0] if services else None,
+            "tail": int(getattr(args, "lines", 300)),
+        }
+        response = _agent_post(context, "/v1/instances/logs", payload)
+        return _result(
+            "instance logs",
+            response,
+            fallback_message=f"Logs loaded for instance {args.instance_id}.",
+        )
 
-    for index, item in enumerate(items, start=1):
-        if isinstance(item, dict):
-            label = item.get("instance_id") or item.get("backup_id") or item.get("id") or index
-            print(f"{prefix}- {label}")
-            print_mapping(item, indent=indent + 2)
-        else:
-            print(f"{prefix}- {format_value(item)}")
+    responses: dict[str, Any] = {}
+    for service in services:
+        responses[service] = _agent_post(
+            context,
+            "/v1/instances/logs",
+            {
+                "instance_id": args.instance_id,
+                "service": service,
+                "tail": int(getattr(args, "lines", 300)),
+            },
+        )
 
-
-def format_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-
-    if value is None:
-        return ""
-
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, sort_keys=True)
-
-    return str(value)
-
-
-def exit_code_from_response(response: Any) -> int:
-    """Return a process exit code based on response content."""
-
-    if isinstance(response, dict):
-        ok = response.get("ok")
-        if ok is False:
-            return 1
-
-        state = response.get("state") or response.get("status")
-
-        if state in {
-            InstanceState.FAILED.value,
-            InstanceState.SECURITY_BLOCKED.value,
-            "failed",
-            "FAIL",
-            "FAIL_BLOCKING",
-        }:
-            return 1
-
-    return 0
+    return InstanceCommandResult(
+        ok=all(_response_ok(item) for item in responses.values()),
+        command="instance logs",
+        message=f"Logs loaded for {len(responses)} service(s).",
+        data={"instance_id": args.instance_id, "services": responses},
+    )
 
 
-def read_int_env(key: str, default: int) -> int:
-    raw = os.getenv(key)
+def backup_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance backup``."""
 
-    if raw is None or raw.strip() == "":
-        return default
+    payload = {
+        "instance_id": args.instance_id,
+        "backup_class": getattr(args, "backup_class", "manual"),
+        "verify_after_create": True,
+    }
 
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+    response = _agent_post(context, "/v1/instances/backup", payload)
+    return _result(
+        "instance backup",
+        response,
+        fallback_message=f"Backup requested for instance {args.instance_id}.",
+    )
+
+
+def restore_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance restore``."""
+
+    payload = {
+        "instance_id": args.instance_id,
+        "backup_id": args.backup_id,
+        "create_pre_restore_backup": not bool(getattr(args, "force", False)),
+    }
+
+    response = _agent_post(context, "/v1/instances/restore", payload)
+    return _result(
+        "instance restore",
+        response,
+        fallback_message=f"Restore requested for instance {args.instance_id}.",
+    )
+
+
+def restore_new_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance restore-new``."""
+
+    payload = {
+        "source_backup_id": args.backup_id,
+        "new_instance_id": args.new_instance_id,
+        "network_profile": DEFAULT_NETWORK_PROFILE.value,
+    }
+
+    response = _agent_post(context, "/v1/instances/restore-new", payload)
+    return _result(
+        "instance restore-new",
+        response,
+        fallback_message=f"Restore-new requested for instance {args.new_instance_id}.",
+    )
+
+
+def update_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance update``."""
+
+    capsule_path = Path(args.capsule)
+    payload = {
+        "instance_id": args.instance_id,
+        "capsule_path": str(capsule_path),
+        "create_pre_update_backup": not bool(getattr(args, "skip_backup", False)),
+    }
+
+    response = _agent_post(context, "/v1/instances/update", payload)
+    return _result(
+        "instance update",
+        response,
+        fallback_message=f"Update requested for instance {args.instance_id}.",
+    )
+
+
+def rollback_instance(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance rollback``."""
+
+    payload = {
+        "instance_id": args.instance_id,
+        "target_release_id": getattr(args, "to_capsule_id", None),
+        "restore_data": bool(getattr(args, "force", False)),
+    }
+
+    response = _agent_post(context, "/v1/instances/rollback", payload)
+    return _result(
+        "instance rollback",
+        response,
+        fallback_message=f"Rollback requested for instance {args.instance_id}.",
+    )
+
+
+def instance_health(*, args: argparse.Namespace, context: Any) -> InstanceCommandResult:
+    """Handle ``kx instance health``."""
+
+    response = _agent_post(
+        context,
+        "/v1/instances/health",
+        {"instance_id": args.instance_id},
+    )
+    return _result(
+        "instance health",
+        response,
+        fallback_message=f"Health loaded for instance {args.instance_id}.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optional standalone compatibility parser
+# ---------------------------------------------------------------------------
+
+
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register ``kx instance`` commands for standalone argparse use."""
+
+    parser = subparsers.add_parser("instance", help="Manage Konnaxion Instances.")
+    parser.add_argument("--agent-url", default=DEFAULT_AGENT_URL)
+    parser.add_argument("--json", action="store_true")
+    instance_sub = parser.add_subparsers(dest="instance_command", required=True)
+
+    create = instance_sub.add_parser("create")
+    create.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
+    create.add_argument("--capsule-id", default=DEFAULT_CAPSULE_ID)
+    create.add_argument("--network", dest="profile", default=DEFAULT_NETWORK_PROFILE.value)
+    create.add_argument("--exposure", default=DEFAULT_EXPOSURE_MODE.value)
+    create.set_defaults(func=create_instance)
+
+    start = instance_sub.add_parser("start")
+    start.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
+    start.add_argument("--network", dest="profile", default=None)
+    start.add_argument("--force-security-check", action="store_true")
+    start.set_defaults(func=start_instance)
+
+    stop = instance_sub.add_parser("stop")
+    stop.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
+    stop.add_argument("--timeout", type=int, default=None)
+    stop.set_defaults(func=stop_instance)
+
+    status = instance_sub.add_parser("status")
+    status.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
+    status.set_defaults(func=instance_status)
+
+    logs = instance_sub.add_parser("logs")
+    logs.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
+    logs.add_argument("--service", action="append", default=None)
+    logs.add_argument("--lines", type=int, default=300)
+    logs.add_argument("--no-timestamps", action="store_true")
+    logs.set_defaults(func=instance_logs)
+
+    backup = instance_sub.add_parser("backup")
+    backup.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
+    backup.add_argument("--class", dest="backup_class", default="manual")
+    backup.add_argument("--note", default="")
+    backup.set_defaults(func=backup_instance)
+
+    restore = instance_sub.add_parser("restore")
+    restore.add_argument("instance_id")
+    restore.add_argument("--from", dest="backup_id", required=True)
+    restore.add_argument("--force", action="store_true")
+    restore.set_defaults(func=restore_instance)
+
+    restore_new = instance_sub.add_parser("restore-new")
+    restore_new.add_argument("--from", dest="backup_id", required=True)
+    restore_new.add_argument("--new-instance-id", required=True)
+    restore_new.set_defaults(func=restore_new_instance)
+
+    update = instance_sub.add_parser("update")
+    update.add_argument("instance_id")
+    update.add_argument("--capsule", type=Path, required=True)
+    update.add_argument("--skip-backup", action="store_true")
+    update.set_defaults(func=update_instance)
+
+    rollback = instance_sub.add_parser("rollback")
+    rollback.add_argument("instance_id")
+    rollback.add_argument("--to-capsule-id", default=None)
+    rollback.add_argument("--force", action="store_true")
+    rollback.set_defaults(func=rollback_instance)
+
+    health = instance_sub.add_parser("health")
+    health.add_argument("instance_id", nargs="?", default=DEFAULT_INSTANCE_ID)
+    health.set_defaults(func=instance_health)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="kx")
+    subparsers = parser.add_subparsers(dest="group", required=True)
+    register(subparsers)
+    return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Standalone debug entrypoint for this module."""
-
-    parser = argparse.ArgumentParser(prog="kx")
-    subparsers = parser.add_subparsers(dest="command")
-    register_instance_commands(subparsers)
+    parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not hasattr(args, "func"):
+    context = argparse.Namespace(
+        agent_url=getattr(args, "agent_url", DEFAULT_AGENT_URL),
+        json_output=bool(getattr(args, "json", False)),
+        verbose=False,
+    )
+
+    handler = getattr(args, "func", None)
+    if handler is None:
         parser.print_help()
         return 2
 
     try:
-        return int(args.func(args))
+        result = handler(args=args, context=context)
     except InstanceCliError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        if context.json_output:
+            print(json.dumps({"ok": False, "message": str(exc)}, indent=2))
+        else:
+            print(f"ERROR: {exc}")
         return 1
 
+    payload = result.to_dict() if isinstance(result, InstanceCommandResult) else result
+    if context.json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(payload.get("message") or payload.get("command") or "Command completed.")
+    return 0 if bool(payload.get("ok", True)) else 1
 
-if __name__ == "__main__":
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+
+def _agent_post(context: Any, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    config = AgentRequestConfig.from_context(context)
+    url = _join_agent_url(config.base_url, path)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "kx-cli/instance",
+    }
+
+    if config.token:
+        headers["Authorization"] = f"Bearer {config.token}"
+
+    try:
+        with httpx.Client(timeout=config.timeout_seconds, headers=headers) as client:
+            response = client.post(url, json=_clean_payload(payload))
+    except httpx.TimeoutException as exc:
+        raise InstanceCliError("Timed out while contacting Konnaxion Agent.") from exc
+    except httpx.HTTPError as exc:
+        raise InstanceCliError(f"Unable to contact Konnaxion Agent: {exc}") from exc
+
+    if response.status_code >= 400:
+        raise InstanceCliError(_extract_error_detail(response))
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise InstanceCliError("Konnaxion Agent returned invalid JSON.") from exc
+
+    if not isinstance(data, dict):
+        raise InstanceCliError("Konnaxion Agent returned an invalid payload.")
+
+    return data
+
+
+def _join_agent_url(base_url: str, path: str) -> str:
+    base = base_url.rstrip("/")
+    clean_path = "/" + path.lstrip("/")
+
+    if base.endswith("/v1") and clean_path.startswith("/v1/"):
+        clean_path = clean_path[3:]
+
+    return f"{base}{clean_path}"
+
+
+def _clean_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: _jsonable(value)
+        for key, value in payload.items()
+        if value is not None and value != ""
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "value"):
+        return value.value
+    return value
+
+
+def _extract_error_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text or f"Konnaxion Agent returned HTTP {response.status_code}."
+
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, str):
+            return detail
+
+        error = payload.get("error")
+        if isinstance(error, str):
+            return error
+        if isinstance(error, Mapping):
+            message = error.get("message")
+            if isinstance(message, str):
+                return message
+
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message
+
+    return f"Konnaxion Agent returned HTTP {response.status_code}."
+
+
+def _result(command: str, response: Mapping[str, Any], *, fallback_message: str) -> InstanceCommandResult:
+    data = dict(response)
+    ok = _response_ok(data)
+    message = str(data.get("message") or fallback_message)
+
+    return InstanceCommandResult(
+        ok=ok,
+        command=command,
+        message=message,
+        data=data,
+    )
+
+
+def _response_ok(response: Mapping[str, Any]) -> bool:
+    if response.get("ok") is False:
+        return False
+
+    status_value = str(
+        response.get("status")
+        or response.get("state")
+        or response.get("security_status")
+        or response.get("restore_status")
+        or response.get("rollback_status")
+        or ""
+    )
+
+    if status_value in {
+        InstanceState.FAILED.value,
+        InstanceState.SECURITY_BLOCKED.value,
+        "failed",
+        "FAIL",
+        "FAIL_BLOCKING",
+    }:
+        return False
+
+    return True
+
+
+def _normalize_services(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, Sequence):
+        return tuple(str(item) for item in value if str(item).strip())
+    return (str(value),)
+
+
+def _read_float_env(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# Backward-compatible alias for the older generated file name.
+register_instance_commands = register
+
+
+__all__ = [
+    "AgentRequestConfig",
+    "InstanceCliError",
+    "InstanceCommandResult",
+    "OutputFormat",
+    "backup_instance",
+    "build_parser",
+    "create_instance",
+    "instance_health",
+    "instance_logs",
+    "instance_status",
+    "main",
+    "register",
+    "register_instance_commands",
+    "restore_instance",
+    "restore_new_instance",
+    "rollback_instance",
+    "start_instance",
+    "stop_instance",
+    "update_instance",
+]
+
+
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

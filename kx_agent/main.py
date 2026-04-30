@@ -113,6 +113,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 2
 
 
+def app() -> int:
+    """
+    Console-script entrypoint.
+
+    `pyproject.toml` exposes the command as:
+
+        kx-agent = "kx_agent.main:app"
+
+    Keep this wrapper thin so service supervisors, package scripts, and direct
+    Python execution all share the same `main()` behavior.
+    """
+
+    return main()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the Agent CLI parser."""
 
@@ -364,7 +379,7 @@ def _read_bool(value: str) -> bool:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(app())
     except AgentStartupError as exc:
         configure_logging(os.getenv("KX_AGENT_LOG_LEVEL", "INFO"))
         LOGGER.error("%s", exc)

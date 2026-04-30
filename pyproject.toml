@@ -24,8 +24,7 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Private :: Do Not Upload"
+  "Programming Language :: Python :: 3.12"
 ]
 
 dependencies = [
@@ -54,7 +53,7 @@ dev = [
 
 [project.scripts]
 kx = "kx_cli.main:app"
-kx-agent = "kx_agent.main:app"
+kx-agent = "kx_agent.main:main"
 kx-manager = "kx_manager.main:app"
 kx-builder = "kx_builder.main:app"
 
@@ -65,6 +64,11 @@ packages = [
   "kx_manager",
   "kx_builder",
   "kx_cli"
+]
+include = [
+  "templates",
+  "profiles",
+  "policies"
 ]
 
 [tool.hatch.build.targets.sdist]
