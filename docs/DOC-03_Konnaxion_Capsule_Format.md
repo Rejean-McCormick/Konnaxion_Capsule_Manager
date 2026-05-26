@@ -7,6 +7,7 @@ param_version: kx-param-2026.04.30
 status: draft
 owner: Konnaxion Architecture
 created_at: 2026-04-30
+updated_at: 2026-05-03
 depends_on:
   - DOC-00_Konnaxion_Canonical_Variables.md
   - DOC-02_Konnaxion_Capsule_Architecture.md
@@ -16,6 +17,7 @@ related_docs:
   - DOC-06_Konnaxion_Network_Profiles.md
   - DOC-07_Konnaxion_Security_Gate.md
   - DOC-08_Konnaxion_Runtime_Docker_Compose.md
+  - DOC-10_Konnaxion_Builder_CLI.md
 ---
 
 # DOC-03 — Konnaxion Capsule Format
@@ -33,7 +35,7 @@ The capsule must support plug-and-play deployment while preserving the security 
 ```text
 Konnaxion Capsule
 = one portable .kxcap file
-= application code + container images + manifest + profiles + templates + checksums + signature
+= application runtime contract + container images + manifest + profiles + templates + checksums + signature
 = no real secrets
 = no real production database
 = no host-specific runtime state
@@ -74,6 +76,10 @@ The capsule format follows these rules:
 8. No production database dump inside the capsule unless encrypted and explicitly marked.
 9. No direct public exposure of internal services.
 10. No privileged containers unless explicitly approved by a future security review.
+11. No runtime dependency on public package registries.
+12. No runtime dependency on Docker image pulls.
+13. No healthcheck dependency on tools absent from the selected image.
+14. No public_vps runtime may silently fall back to 127.0.0.1 as its public host.
 ```
 
 The capsule is not the installed instance.
@@ -107,7 +113,7 @@ Instance is created or updated
 
 ### 5.1 Physical format
 
-The initial MVP format should be:
+The MVP format is:
 
 ```text
 tar archive + zstd compression
@@ -161,6 +167,8 @@ Every `.kxcap` file must contain this root structure:
 ```
 
 The root entries are mandatory unless explicitly marked optional in this document.
+
+A capsule whose `images/` directory contains only placeholder files such as `README.json` is invalid for deployable runtime profiles.
 
 ## 7. Root file responsibilities
 
@@ -217,25 +225,29 @@ Canonical service names:
 services:
   traefik:
     role: reverse_proxy
-    image: konnaxion/traefik:2026.04.30
+    image: traefik:v3.1
+    image_archive: images/traefik_v3.1_linux-amd64.oci.tar
     public_entrypoint: true
     internal: false
 
   frontend-next:
     role: frontend
-    image: konnaxion/frontend-next:2026.04.30
+    image: konnaxion/frontend-next:v14
+    image_archive: images/konnaxion-frontend-next_v14_linux-amd64.oci.tar
     internal_port: 3000
     internal: true
 
   django-api:
     role: backend_api
-    image: konnaxion/django-api:2026.04.30
+    image: konnaxion/django-api:v14
+    image_archive: images/konnaxion-django-api_v14_linux-amd64.oci.tar
     internal_port: 5000
     internal: true
 
   postgres:
     role: database
-    image: konnaxion/postgres:16-kx
+    image: postgres:16
+    image_archive: images/postgres_16_linux-amd64.oci.tar
     internal_port: 5432
     internal: true
     persistent: true
@@ -243,23 +255,27 @@ services:
   redis:
     role: broker
     image: redis:7
+    image_archive: images/redis_7_linux-amd64.oci.tar
     internal_port: 6379
     internal: true
     persistent: true
 
   celeryworker:
     role: background_worker
-    image: konnaxion/django-api:2026.04.30
+    image: konnaxion/django-api:v14
+    image_archive: images/konnaxion-django-api_v14_linux-amd64.oci.tar
     internal: true
 
   celerybeat:
     role: scheduler
-    image: konnaxion/django-api:2026.04.30
+    image: konnaxion/django-api:v14
+    image_archive: images/konnaxion-django-api_v14_linux-amd64.oci.tar
     internal: true
 
   media-nginx:
     role: media_server
-    image: konnaxion/media-nginx:2026.04.30
+    image: nginx:stable
+    image_archive: images/nginx_stable_linux-amd64.oci.tar
     internal_port: 80
     internal: true
 ```
@@ -269,7 +285,8 @@ services:
 ```yaml
   flower:
     role: celery_monitoring
-    image: konnaxion/django-api:2026.04.30
+    image: konnaxion/django-api:v14
+    image_archive: images/konnaxion-django-api_v14_linux-amd64.oci.tar
     internal_port: 5555
     internal: true
     enabled_by_default: false
@@ -299,6 +316,8 @@ routes:
 ```
 
 No capsule may route public traffic directly to `postgres`, `redis`, `celeryworker`, `celerybeat`, or `flower`.
+
+A route is considered infrastructure-reachable when Traefik forwards to the expected upstream. Application-level `4xx` responses from Django for `/api/`, `/admin/`, or `/media/` are not automatically infrastructure failures. Traefik’s own unmatched-router `404` is a failure.
 
 ### 8.4 Network profile declarations
 
@@ -384,9 +403,11 @@ The Agent is responsible for injecting:
 KX_INSTANCE_ID
 KX_NETWORK_PROFILE
 KX_EXPOSURE_MODE
+KX_HOST
 runtime env files
 volume paths
 profile-specific network bindings
+Traefik dynamic file-provider config
 ```
 
 ### 9.1 Compose rules
@@ -402,6 +423,8 @@ The compose file must obey:
 6. Traefik is the only public entrypoint.
 7. Postgres and Redis are internal only.
 8. Flower is disabled by default or private only.
+9. public_vps must use the configured public host, never 127.0.0.1.
+10. Runtime healthchecks must use commands available inside the selected image.
 ```
 
 ### 9.2 Canonical internal networks
@@ -428,6 +451,72 @@ Expected network placement:
 | `celerybeat` | no | yes |
 | `flower` | no | yes |
 
+### 9.3 Traefik file-provider runtime config
+
+The canonical generated runtime must use Traefik file-provider config for instance routes.
+
+Canonical generated file:
+
+```text
+/opt/konnaxion/instances/<INSTANCE_ID>/state/traefik-dynamic.yml
+```
+
+Example for public VPS:
+
+```yaml
+http:
+  routers:
+    kx-frontend:
+      rule: "Host(`{{KX_HOST}}`) && PathPrefix(`/`)"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: kx-frontend
+      priority: 1
+
+    kx-api:
+      rule: "Host(`{{KX_HOST}}`) && PathPrefix(`/api/`)"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: kx-api
+      priority: 100
+
+    kx-admin:
+      rule: "Host(`{{KX_HOST}}`) && PathPrefix(`/admin/`)"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: kx-api
+      priority: 100
+
+    kx-media:
+      rule: "Host(`{{KX_HOST}}`) && PathPrefix(`/media/`)"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: kx-media
+      priority: 100
+
+  services:
+    kx-frontend:
+      loadBalancer:
+        servers:
+          - url: "http://kx-{{INSTANCE_ID}}-frontend-next:3000"
+
+    kx-api:
+      loadBalancer:
+        servers:
+          - url: "http://kx-{{INSTANCE_ID}}-django-api:5000"
+
+    kx-media:
+      loadBalancer:
+        servers:
+          - url: "http://kx-{{INSTANCE_ID}}-media-nginx:80"
+```
+
+Docker labels may be emitted as metadata, but file-provider config is canonical for generated instance routing. Docker labels alone are not sufficient.
+
 ## 10. `images/`
 
 The `images/` directory contains OCI-compatible image archives.
@@ -436,10 +525,10 @@ Canonical layout:
 
 ```text
 images/
-├── konnaxion-frontend-next_2026.04.30_linux-amd64.oci.tar
-├── konnaxion-django-api_2026.04.30_linux-amd64.oci.tar
-├── konnaxion-traefik_2026.04.30_linux-amd64.oci.tar
-├── konnaxion-media-nginx_2026.04.30_linux-amd64.oci.tar
+├── konnaxion-frontend-next_v14_linux-amd64.oci.tar
+├── konnaxion-django-api_v14_linux-amd64.oci.tar
+├── traefik_v3.1_linux-amd64.oci.tar
+├── nginx_stable_linux-amd64.oci.tar
 ├── postgres_16_linux-amd64.oci.tar
 └── redis_7_linux-amd64.oci.tar
 ```
@@ -450,9 +539,70 @@ No image may be loaded if:
 
 ```text
 1. It is not declared in manifest.yaml.
-2. Its digest does not match checksums.txt.
-3. Its signature or provenance policy fails.
-4. Its name collides with an existing unknown local image unless explicitly approved.
+2. Its archive is missing from images/.
+3. Its digest does not match checksums.txt.
+4. Its signature or provenance policy fails.
+5. Its name collides with an existing unknown local image unless explicitly approved.
+```
+
+A capsule is invalid if:
+
+```text
+images/ contains only README.json
+images/ is empty
+manifest.yaml declares an image_archive that does not exist
+checksums.txt omits an image_archive
+a required runtime service has neither a declared image_archive nor an approved external-pull policy
+```
+
+### 10.1 Frontend image requirements
+
+The `frontend-next` runtime image must be self-contained.
+
+It must include:
+
+```text
+package.json
+node_modules/
+.next/
+public/
+next.config.*
+env.mjs
+```
+
+It must not require runtime network access to install dependencies.
+
+The canonical runtime command is:
+
+```text
+node node_modules/next/dist/bin/next start -H 0.0.0.0 -p 3000
+```
+
+The frontend image must not use runtime `pnpm start` if that requires Corepack to download `pnpm`.
+
+### 10.2 Django image requirements
+
+The `django-api` runtime image must contain the actual application source tree used for the build.
+
+The Builder must prevent polluted or incorrect Docker build contexts. A built `django-api` image is invalid if application files are overwritten by migration files, virtualenv files, cache files, or generated artifacts.
+
+The runtime must start the backend on:
+
+```text
+0.0.0.0:5000
+```
+
+### 10.3 Support image requirements
+
+Support images may be based on upstream images, but the capsule must still include their offline-loadable archives unless the selected profile explicitly allows controlled image pulls.
+
+Canonical support images for MVP:
+
+```text
+traefik:v3.1
+nginx:stable
+postgres:16
+redis:7
 ```
 
 ## 11. `profiles/`
@@ -538,6 +688,24 @@ allow_lan: true
 allow_wan: true
 requires_expiration: false
 requires_security_review: true
+requires_public_host: true
+```
+
+For `public_vps`, the Manager must provide a canonical public host. The Agent must reject or fail configuration if the host is empty.
+
+Valid examples:
+
+```text
+demo.example.com
+138.197.174.76.sslip.io
+```
+
+Invalid generated public VPS host values:
+
+```text
+127.0.0.1
+localhost
+0.0.0.0
 ```
 
 ## 12. `env-templates/`
@@ -560,13 +728,31 @@ env-templates/kx.env.template
 DJANGO_SETTINGS_MODULE=config.settings.production
 DJANGO_SECRET_KEY={{GENERATED_ON_INSTALL}}
 DJANGO_DEBUG=False
-DJANGO_ALLOWED_HOSTS={{GENERATED_FROM_NETWORK_PROFILE}}
+DJANGO_ALLOWED_HOSTS={{GENERATED_ALLOWED_HOSTS}}
+DJANGO_CSRF_TRUSTED_ORIGINS={{GENERATED_CSRF_TRUSTED_ORIGINS}}
 DJANGO_ADMIN_URL=admin/
 USE_DOCKER=yes
 DATABASE_URL=postgres://konnaxion:{{POSTGRES_PASSWORD}}@postgres:5432/konnaxion
 REDIS_URL=redis://redis:6379/0
 CELERY_BROKER_URL=redis://redis:6379/0
 SENTRY_DSN={{OPTIONAL_SENTRY_DSN}}
+```
+
+For `public_vps`, generated `DJANGO_ALLOWED_HOSTS` must include:
+
+```text
+127.0.0.1
+localhost
+{{KX_HOST}}
+django-api
+kx-{{INSTANCE_ID}}-django-api
+```
+
+For `public_vps`, generated `DJANGO_CSRF_TRUSTED_ORIGINS` must include:
+
+```text
+https://{{KX_HOST}}
+http://{{KX_HOST}}
 ```
 
 ### 12.2 Postgres template
@@ -579,7 +765,15 @@ POSTGRES_USER=konnaxion
 POSTGRES_PASSWORD={{GENERATED_ON_INSTALL}}
 ```
 
-### 12.3 Frontend template
+### 12.3 Redis template
+
+```env
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_URL=redis://redis:6379/0
+```
+
+### 12.4 Frontend template
 
 ```env
 NEXT_PUBLIC_API_BASE={{KX_BASE_URL}}/api
@@ -588,7 +782,15 @@ NEXT_TELEMETRY_DISABLED=1
 NODE_OPTIONS=--max-old-space-size=4096
 ```
 
-### 12.4 Konnaxion Manager template
+For `public_vps`, `KX_BASE_URL` must resolve to:
+
+```text
+https://{{KX_HOST}}
+```
+
+It must not resolve to `https://127.0.0.1`.
+
+### 12.5 Konnaxion runtime template
 
 ```env
 KX_INSTANCE_ID={{INSTANCE_ID}}
@@ -600,6 +802,7 @@ KX_NETWORK_PROFILE={{NETWORK_PROFILE}}
 KX_EXPOSURE_MODE={{EXPOSURE_MODE}}
 KX_PUBLIC_MODE_ENABLED=false
 KX_PUBLIC_MODE_EXPIRES_AT=
+KX_HOST={{GENERATED_FROM_NETWORK_PROFILE}}
 KX_REQUIRE_SIGNED_CAPSULE=true
 KX_GENERATE_SECRETS_ON_INSTALL=true
 KX_ALLOW_UNKNOWN_IMAGES=false
@@ -608,6 +811,15 @@ KX_ALLOW_DOCKER_SOCKET_MOUNT=false
 KX_ALLOW_HOST_NETWORK=false
 KX_BACKUP_ENABLED=true
 KX_BACKUP_RETENTION_DAYS=14
+```
+
+For `public_vps`, generated values must include:
+
+```env
+KX_NETWORK_PROFILE=public_vps
+KX_EXPOSURE_MODE=public
+KX_PUBLIC_MODE_ENABLED=true
+KX_HOST={{PUBLIC_HOST}}
 ```
 
 ## 13. `migrations/`
@@ -692,16 +904,28 @@ checks:
   - id: frontend_ready
     type: http
     url: http://frontend-next:3000/
-    expected_status: 200
+    expected_status_any:
+      - 200
+      - 301
+      - 302
+      - 308
     required: true
 
-  - id: django_ready
+  - id: django_socket_ready
+    type: tcp
+    host: django-api
+    port: 5000
+    required: true
+
+  - id: django_route_reachable
     type: http
     url: http://django-api:5000/api/
     expected_status_any:
       - 200
+      - 400
       - 401
       - 403
+      - 404
     required: true
 
   - id: postgres_ready
@@ -727,6 +951,41 @@ checks:
     required: true
 ```
 
+### 15.1 Healthcheck tool rules
+
+Healthchecks must not depend on absent tools.
+
+Examples of fragile healthchecks:
+
+```text
+wget inside an image that does not include wget
+curl inside an image that does not include curl
+shell pipelines that assume bash in an sh-only image
+```
+
+Canonical Django runtime healthcheck:
+
+```text
+python -c "import socket; sock=socket.create_connection(('127.0.0.1',5000),5); sock.close()"
+```
+
+The Django healthcheck validates that Gunicorn/Uvicorn is listening. Public HTTP route validation is a separate Traefik route check.
+
+### 15.2 Route check classification
+
+Route checks must distinguish:
+
+```text
+Traefik unmatched-router 404     = FAIL
+Frontend / returns 2xx/3xx       = PASS
+Django /api/ returns Django 4xx  = PASS for infrastructure reachability
+Django /admin/ returns Django 4xx = PASS for infrastructure reachability
+Django 5xx                       = FAIL
+Connection refused/timeout       = FAIL
+```
+
+A Django `404` or `400` with Uvicorn/Django headers proves the route reached Django. It is not equivalent to Traefik’s default `404 page not found`.
+
 ## 16. `policies/`
 
 The `policies/` directory contains validation policies enforced before import and before start.
@@ -747,6 +1006,7 @@ security_policy:
   require_signature: true
   require_checksums: true
   block_unknown_images: true
+  block_missing_image_archives: true
   block_privileged_containers: true
   block_host_network: true
   block_docker_socket_mount: true
@@ -772,7 +1032,8 @@ network_policy:
     - 5555
     - 6379
     - 8000
-  public_mode_requires_expiration: true
+  public_mode_requires_expiration: false
+  public_vps_requires_public_host: true
 ```
 
 ### 16.3 Runtime policy
@@ -784,6 +1045,7 @@ runtime_policy:
   allow_serverless: false
   allow_custom_shell_commands: false
   allow_arbitrary_compose_override: false
+  require_offline_runtime_images: true
 ```
 
 ## 17. `metadata/`
@@ -826,6 +1088,21 @@ compatibility:
   minimum_disk_free_gb: 20
 ```
 
+### 17.3 `provenance.json`
+
+`provenance.json` must identify:
+
+```text
+source commit
+builder version
+image tags
+image digests
+image archive filenames
+build platform
+timestamp
+signing key identity or key fingerprint
+```
+
 ## 18. `checksums.txt`
 
 `checksums.txt` must contain a digest for every file except `signature.sig`.
@@ -835,8 +1112,12 @@ Canonical format:
 ```text
 sha256  manifest.yaml  <digest>
 sha256  docker-compose.capsule.yml  <digest>
-sha256  images/konnaxion-frontend-next_2026.04.30_linux-amd64.oci.tar  <digest>
-sha256  images/konnaxion-django-api_2026.04.30_linux-amd64.oci.tar  <digest>
+sha256  images/konnaxion-frontend-next_v14_linux-amd64.oci.tar  <digest>
+sha256  images/konnaxion-django-api_v14_linux-amd64.oci.tar  <digest>
+sha256  images/traefik_v3.1_linux-amd64.oci.tar  <digest>
+sha256  images/nginx_stable_linux-amd64.oci.tar  <digest>
+sha256  images/postgres_16_linux-amd64.oci.tar  <digest>
+sha256  images/redis_7_linux-amd64.oci.tar  <digest>
 ```
 
 The Agent must refuse import if:
@@ -846,6 +1127,8 @@ The Agent must refuse import if:
 2. a listed file is missing.
 3. an unlisted file exists, unless allowed by schema.
 4. any digest mismatch occurs.
+5. a required image archive is missing.
+6. images/ contains only placeholder files.
 ```
 
 ## 19. `signature.sig`
@@ -902,6 +1185,11 @@ old systemd service files from compromised hosts
 /tmp contents
 /dev/shm contents
 unknown Docker volumes
+local .venv or virtualenv content
+node_modules from the developer workstation
+Docker build cache
+test reports
+coverage reports
 ```
 
 If a forbidden item is detected, the Agent must return:
@@ -921,13 +1209,13 @@ KX_INSTANCE_ID if not provided
 initial admin password or invite token
 local TLS material if using local/intranet profile
 runtime env files
-instance-specific Traefik labels/config
+instance-specific Traefik dynamic config
 backup encryption key if enabled
 ```
 
 ## 22. Instance output after import
 
-After import and start, the Manager creates:
+After import and start, the Manager/Agent creates:
 
 ```text
 /opt/konnaxion/instances/<INSTANCE_ID>/
@@ -943,6 +1231,8 @@ After import and start, the Manager creates:
 ├── logs/
 ├── backups/
 ├── state/
+│   ├── docker-compose.runtime.yml
+│   └── traefik-dynamic.yml
 └── runtime/
 ```
 
@@ -950,6 +1240,12 @@ The capsule remains stored separately:
 
 ```text
 /opt/konnaxion/capsules/<CAPSULE_ID>.kxcap
+```
+
+Extracted capsule contents remain stored separately:
+
+```text
+/opt/konnaxion/shared/capsules/<CAPSULE_ID>/
 ```
 
 ## 23. Validation flow
@@ -964,9 +1260,11 @@ Before import:
 5. Verify signature.sig.
 6. Validate service allowlist.
 7. Validate image allowlist.
-8. Validate profiles.
-9. Validate security policies.
-10. Confirm compatibility with Manager and Agent versions.
+8. Validate required image archives exist.
+9. Validate image archive checksums.
+10. Validate profiles.
+11. Validate security policies.
+12. Confirm compatibility with Manager and Agent versions.
 ```
 
 Before start:
@@ -975,14 +1273,16 @@ Before start:
 1. Generate missing secrets.
 2. Render env templates.
 3. Render network profile.
-4. Create internal Docker networks.
-5. Create persistent volumes.
-6. Load allowed images.
-7. Apply firewall/profile rules.
-8. Run Security Gate.
-9. Run migrations.
-10. Start services.
-11. Run healthchecks.
+4. Validate public host for public_vps.
+5. Create internal Docker networks.
+6. Create persistent volumes.
+7. Load allowed images.
+8. Apply firewall/profile rules.
+9. Render Traefik dynamic config.
+10. Run Security Gate.
+11. Run migrations.
+12. Start services.
+13. Run healthchecks.
 ```
 
 ## 24. Security Gate required checks
@@ -992,6 +1292,7 @@ Every capsule must support the following Security Gate checks:
 ```text
 capsule_signature
 image_checksums
+image_archives_present
 manifest_schema
 secrets_present
 secrets_not_default
@@ -1005,6 +1306,8 @@ no_host_network
 allowed_images_only
 admin_surface_private
 backup_configured
+public_host_valid
+runtime_routes_valid
 ```
 
 Status values:
@@ -1022,6 +1325,7 @@ Any of these must block startup if they fail:
 ```text
 capsule_signature
 image_checksums
+image_archives_present
 manifest_schema
 dangerous_ports_blocked
 postgres_not_public
@@ -1030,6 +1334,7 @@ docker_socket_not_mounted
 no_privileged_containers
 no_host_network
 allowed_images_only
+public_host_valid
 ```
 
 ## 25. Update semantics
@@ -1090,24 +1395,39 @@ kx capsule build \
   --output konnaxion-v14-demo-2026.04.30.kxcap
 ```
 
+Public VPS demo command:
+
+```bash
+kx capsule build \
+  --channel demo \
+  --app-version v14 \
+  --profile public_vps \
+  --output konnaxion-v14-demo-2026.04.30.kxcap
+```
+
 Expected builder phases:
 
 ```text
 1. verify clean source tree
-2. install dependencies
-3. run backend tests
-4. run frontend typecheck
-5. build frontend
-6. build backend image
-7. build frontend image
-8. build support images
-9. export OCI images
-10. generate manifest
-11. generate checksums
-12. generate SBOM/provenance
-13. sign capsule
-14. verify final capsule
+2. create clean backend Docker build context
+3. create clean frontend Docker build context
+4. install dependencies
+5. run backend tests
+6. run frontend typecheck
+7. build frontend
+8. build backend image
+9. build frontend image
+10. build support images
+11. export OCI images into images/
+12. generate manifest
+13. verify image archives exist
+14. generate checksums
+15. generate SBOM/provenance
+16. sign capsule
+17. verify final capsule
 ```
+
+The Builder must fail if required image archives are missing. It must not produce a deployable-looking capsule containing only `images/README.json`.
 
 ## 28. Manager import command
 
@@ -1129,6 +1449,17 @@ Canonical verification command:
 kx security check demo-001
 ```
 
+For Droplet/VPS deployment, the Manager must reach the private Droplet Agent through SSH-local HTTP unless a real non-loopback `remote_agent_url` is explicitly configured:
+
+```text
+Manager on Windows
+  -> ssh root@<droplet_host>
+  -> curl http://127.0.0.1:8765/v1/...
+  -> Droplet Agent
+```
+
+The Manager must not require a temporary localhost tunnel for normal Droplet deploy.
+
 ## 29. MVP scope
 
 The MVP capsule format includes:
@@ -1145,6 +1476,8 @@ healthchecks
 checksums
 signature
 Security Gate policies
+Traefik file-provider runtime config
+public_vps host propagation
 ```
 
 The MVP does not include:
@@ -1167,16 +1500,23 @@ A capsule is valid only if:
 1. It imports on a clean Konnaxion Box.
 2. It starts in local_only mode with no network exposure.
 3. It starts in intranet_private mode with only HTTPS exposed to LAN.
-4. It refuses to expose Postgres publicly.
-5. It refuses to expose Redis publicly.
-6. It refuses to expose Next.js direct port 3000 publicly.
-7. It refuses Docker socket mounts.
-8. It generates fresh secrets on install.
-9. It runs database migrations successfully.
-10. It passes healthchecks.
-11. It can be backed up.
-12. It can be stopped and restarted.
-13. It can be updated with rollback metadata.
+4. It starts in public_vps mode with a configured public host.
+5. It refuses public_vps mode if host is missing or loopback-only.
+6. It refuses to expose Postgres publicly.
+7. It refuses to expose Redis publicly.
+8. It refuses to expose Next.js direct port 3000 publicly.
+9. It refuses Docker socket mounts.
+10. It generates fresh secrets on install.
+11. It renders DJANGO_ALLOWED_HOSTS from the selected network profile.
+12. It renders NEXT_PUBLIC_API_BASE from the selected network profile.
+13. It renders Traefik dynamic routes for the selected host.
+14. It runs database migrations successfully.
+15. It passes healthchecks.
+16. It can be backed up.
+17. It can be stopped and restarted.
+18. It can be updated with rollback metadata.
+19. It contains required OCI image archives.
+20. It fails verification when required image archives are missing.
 ```
 
 ## 31. Open decisions
@@ -1190,6 +1530,8 @@ These are intentionally not finalized in DOC-03:
 4. Whether seed data should be split by module.
 5. Whether frontend build occurs only at capsule-build time or may be host-rebuilt in developer mode.
 6. Whether Konnaxion Box should support rootless Docker in MVP.
+7. Whether support images must always be embedded or may use a signed/pinned external registry policy.
+8. Whether public_vps should require a real DNS domain or allow sslip.io/nip.io style demo hosts.
 ```
 
 These decisions belong in:
@@ -1207,6 +1549,8 @@ DOC-11_Konnaxion_Box_Appliance_Image.md
 The Konnaxion Capsule format defines a secure, portable, plug-and-play package for deploying Konnaxion without exposing the user to Docker, Traefik, env files, database setup, firewall rules, or manual migrations.
 
 The capsule is immutable and signed. The instance is generated locally. Secrets are created at install time. Network exposure is controlled by predefined profiles. Internal services remain private. Public mode is never the default.
+
+For VPS deployment, the capsule must include offline-loadable image archives, the Agent must generate correct public runtime configuration, and healthchecks must distinguish infrastructure failure from application-level route responses.
 
 Canonical target:
 

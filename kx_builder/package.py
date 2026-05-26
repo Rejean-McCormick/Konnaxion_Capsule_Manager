@@ -12,10 +12,13 @@ MVP physical format:
 
     tar archive + zstd compression
 
-This module is responsible for packaging an already-prepared capsule staging
-directory. It does not build Docker images, generate the manifest, or sign the
-capsule; those steps belong to builder modules such as images.py, manifest.py,
-checksums.py, and signature.py.
+This module can package an already-prepared capsule staging directory, and it
+also provides the bootstrap build_package() adapter used by kx_builder.main.
+When build_package() receives a normal source tree, it creates a canonical
+staging directory first, then packages it.
+
+It does not start services, load Docker images, change firewall rules, or mutate
+runtime host state.
 """
 
 from __future__ import annotations
@@ -28,11 +31,11 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
 from kx_shared.konnaxion_constants import (
     CAPSULE_EXTENSION,
@@ -46,6 +49,7 @@ PACKAGE_SCHEMA_VERSION = "kx-package/v1"
 
 MANIFEST_FILENAME = "manifest.yaml"
 COMPOSE_FILENAME = "docker-compose.capsule.yml"
+IMAGE_METADATA_FILENAME = "images.yaml"
 CHECKSUMS_FILENAME = "checksums.txt"
 SIGNATURE_FILENAME = "signature.sig"
 
@@ -53,6 +57,7 @@ REQUIRED_ROOT_FILES = frozenset(
     {
         MANIFEST_FILENAME,
         COMPOSE_FILENAME,
+        IMAGE_METADATA_FILENAME,
         CHECKSUMS_FILENAME,
         SIGNATURE_FILENAME,
     }
@@ -77,6 +82,120 @@ OPTIONAL_ROOT_DIRS = frozenset(
 )
 
 ALLOWED_ROOT_ENTRIES = REQUIRED_ROOT_FILES | REQUIRED_ROOT_DIRS | OPTIONAL_ROOT_DIRS
+
+REQUIRED_ENV_TEMPLATES = frozenset(
+    {
+        "env-templates/django.env.template",
+        "env-templates/frontend.env.template",
+        "env-templates/postgres.env.template",
+        "env-templates/redis.env.template",
+    }
+)
+
+REQUIRED_PROFILE_FILES = frozenset(
+    {
+        "profiles/local_only.yaml",
+        "profiles/intranet_private.yaml",
+        "profiles/private_tunnel.yaml",
+        "profiles/public_temporary.yaml",
+        "profiles/public_vps.yaml",
+        "profiles/offline.yaml",
+    }
+)
+
+# Runtime image archives that must be present for a deployable MVP capsule.
+# Celery services reuse the django-api image, but each canonical runtime service
+# still receives a manifest-visible archive so verification can prove service
+# coverage.
+REQUIRED_IMAGE_ARCHIVES = frozenset(
+    {
+        "images/frontend-next.oci.tar",
+        "images/django-api.oci.tar",
+        "images/traefik.oci.tar",
+        "images/postgres.oci.tar",
+        "images/redis.oci.tar",
+        "images/celeryworker.oci.tar",
+        "images/celerybeat.oci.tar",
+        "images/media-nginx.oci.tar",
+    }
+)
+
+OPTIONAL_IMAGE_ARCHIVES = frozenset(
+    {
+        "images/flower.oci.tar",
+    }
+)
+
+CANONICAL_IMAGE_TAGS = {
+    "frontend-next": "konnaxion/frontend-next:{app_version}",
+    "django-api": "konnaxion/django-api:{app_version}",
+    "traefik": "traefik:v3.1",
+    "postgres": "postgres:16",
+    "redis": "redis:7",
+    "celeryworker": "konnaxion/django-api:{app_version}",
+    "celerybeat": "konnaxion/django-api:{app_version}",
+    "flower": "konnaxion/django-api:{app_version}",
+    "media-nginx": "nginx:stable",
+}
+
+EXTERNAL_RUNTIME_SERVICES = frozenset(
+    {
+        "traefik",
+        "postgres",
+        "redis",
+        "media-nginx",
+    }
+)
+
+DJANGO_IMAGE_ALIAS_SERVICES = frozenset(
+    {
+        "celeryworker",
+        "celerybeat",
+        "flower",
+    }
+)
+
+
+PROFILE_SPECS: dict[str, dict[str, Any]] = {
+    "local_only": {
+        "exposure_mode": "private",
+        "public_mode_enabled": False,
+        "binding": "loopback",
+        "description": "Accessible only from the local machine.",
+    },
+    "intranet_private": {
+        "exposure_mode": "private",
+        "public_mode_enabled": False,
+        "binding": "lan",
+        "description": "Private LAN or intranet deployment.",
+    },
+    "private_tunnel": {
+        "exposure_mode": "vpn",
+        "public_mode_enabled": False,
+        "binding": "vpn",
+        "description": "Accessible through a private tunnel or VPN.",
+    },
+    "public_temporary": {
+        "exposure_mode": "temporary_tunnel",
+        "public_mode_enabled": True,
+        "binding": "tunnel",
+        "requires_expiration": True,
+        "description": "Temporary public demo deployment.",
+    },
+    "public_vps": {
+        "exposure_mode": "public",
+        "public_mode_enabled": True,
+        "binding": "public",
+        "requires_hardened_host": True,
+        "description": "Permanent public VPS deployment.",
+    },
+    "offline": {
+        "exposure_mode": "private",
+        "public_mode_enabled": False,
+        "binding": "none",
+        "description": "No external network exposure.",
+    },
+}
 
 FORBIDDEN_CAPSULE_FILENAMES = frozenset(
     {
@@ -133,6 +252,17 @@ TEXT_SCAN_EXTENSIONS = frozenset(
 DEFAULT_COMPRESSION_LEVEL = 19
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 
+SIGNING_KEY_ENV_VARS = (
+    "KX_BUILDER_SIGNING_KEY_FILE",
+    "KX_CAPSULE_SIGNING_KEY_FILE",
+    "KX_SIGNING_KEY_FILE",
+)
+SIGNING_KEY_PASSWORD_ENV_VARS = (
+    "KX_BUILDER_SIGNING_KEY_PASSWORD",
+    "KX_CAPSULE_SIGNING_KEY_PASSWORD",
+    "KX_SIGNING_KEY_PASSWORD",
+)
+
 
 class PackageCompression(StrEnum):
     """Supported capsule compression modes."""
@@ -165,11 +295,19 @@ class PackageValidationResult:
 
     @property
     def blocking_issues(self) -> tuple[PackageIssue, ...]:
-        return tuple(issue for issue in self.issues if issue.severity == PackageIssueSeverity.BLOCKING)
+        return tuple(
+            issue
+            for issue in self.issues
+            if issue.severity == PackageIssueSeverity.BLOCKING
+        )
 
     @property
     def warnings(self) -> tuple[PackageIssue, ...]:
-        return tuple(issue for issue in self.issues if issue.severity == PackageIssueSeverity.WARNING)
+        return tuple(
+            issue
+            for issue in self.issues
+            if issue.severity == PackageIssueSeverity.WARNING
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,14 +441,20 @@ def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
 def _safe_relative_path(path: Path, root: Path) -> str:
     resolved_path = path.resolve(strict=False)
     resolved_root = root.resolve(strict=False)
+
     try:
         relative = resolved_path.relative_to(resolved_root)
     except ValueError as exc:
         raise PackageError(f"path escapes staging root: {path}") from exc
 
     relative_text = relative.as_posix()
-    if relative_text == "." or relative_text.startswith("../") or relative_text.startswith("/"):
+    if (
+        relative_text == "."
+        or relative_text.startswith("../")
+        or relative_text.startswith("/")
+    ):
         raise PackageError(f"unsafe relative path: {relative_text}")
+
     return relative_text
 
 
@@ -381,6 +525,26 @@ def validate_required_layout(
                 )
             )
 
+    for required_template in sorted(REQUIRED_ENV_TEMPLATES):
+        if not (root / required_template).is_file():
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    required_template,
+                    f"required capsule env template is missing: {required_template}",
+                )
+            )
+
+    for required_profile in sorted(REQUIRED_PROFILE_FILES):
+        if not (root / required_profile).is_file():
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    required_profile,
+                    f"required capsule network profile is missing: {required_profile}",
+                )
+            )
+
     if strict_root:
         extra = sorted(root_entries(root) - ALLOWED_ROOT_ENTRIES)
         for entry in extra:
@@ -393,6 +557,199 @@ def validate_required_layout(
             )
 
     return issues
+
+
+def validate_required_image_archives(staging_dir: Path | str) -> list[PackageIssue]:
+    """Validate that canonical runtime image archives and images.yaml exist.
+
+    A capsule that contains only ``images/README.json`` is structurally
+    incomplete for deployment. The Builder must fail before signing/packaging
+    such an artifact.
+    """
+
+    root = Path(staging_dir)
+    issues: list[PackageIssue] = []
+    images_dir = root / "images"
+    metadata_file = root / IMAGE_METADATA_FILENAME
+
+    if not images_dir.is_dir():
+        return issues
+
+    if not metadata_file.is_file():
+        issues.append(
+            PackageIssue(
+                PackageIssueSeverity.BLOCKING,
+                IMAGE_METADATA_FILENAME,
+                f"required image metadata file is missing: {IMAGE_METADATA_FILENAME}",
+            )
+        )
+
+    image_archives = sorted(
+        path
+        for path in images_dir.glob("*.oci.tar")
+        if path.is_file()
+    )
+    if not image_archives:
+        issues.append(
+            PackageIssue(
+                PackageIssueSeverity.BLOCKING,
+                "images",
+                "capsule images directory contains no .oci.tar image archives",
+            )
+        )
+
+    for archive in sorted(REQUIRED_IMAGE_ARCHIVES):
+        path = root / archive
+        if not path.is_file():
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    archive,
+                    f"required runtime image archive is missing: {archive}",
+                )
+            )
+            continue
+
+        if path.stat().st_size <= 0:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    archive,
+                    f"required runtime image archive is empty: {archive}",
+                )
+            )
+
+    if metadata_file.is_file():
+        issues.extend(_validate_images_yaml(root, metadata_file))
+
+    return issues
+
+
+def _validate_images_yaml(root: Path, metadata_file: Path) -> list[PackageIssue]:
+    """Best-effort validation for images.yaml."""
+
+    issues: list[PackageIssue] = []
+
+    try:
+        payload = _read_yaml_file(metadata_file)
+    except Exception as exc:
+        return [
+            PackageIssue(
+                PackageIssueSeverity.BLOCKING,
+                IMAGE_METADATA_FILENAME,
+                f"could not parse {IMAGE_METADATA_FILENAME}: {exc}",
+            )
+        ]
+
+    images = payload.get("images") if isinstance(payload, Mapping) else None
+    if not isinstance(images, list) or not images:
+        return [
+            PackageIssue(
+                PackageIssueSeverity.BLOCKING,
+                IMAGE_METADATA_FILENAME,
+                f"{IMAGE_METADATA_FILENAME} must contain a non-empty images list",
+            )
+        ]
+
+    by_archive: dict[str, Mapping[str, Any]] = {}
+    by_service: dict[str, Mapping[str, Any]] = {}
+
+    for item in images:
+        if not isinstance(item, Mapping):
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    IMAGE_METADATA_FILENAME,
+                    f"invalid image metadata entry: {item!r}",
+                )
+            )
+            continue
+
+        service = str(item.get("service") or "").strip()
+        archive = str(item.get("archive") or "").strip()
+        sha256 = str(item.get("sha256") or "").strip()
+        size_bytes = int(item.get("size_bytes") or 0)
+
+        if not service:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    IMAGE_METADATA_FILENAME,
+                    "image metadata entry missing service",
+                )
+            )
+
+        if not archive:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    IMAGE_METADATA_FILENAME,
+                    f"image metadata entry for {service or '<unknown>'} missing archive",
+                )
+            )
+            continue
+
+        archive_path = archive if archive.startswith("images/") else f"images/{archive}"
+        by_archive[archive_path] = item
+        if service:
+            by_service[service] = item
+
+        file_path = root / archive_path
+        if not file_path.is_file():
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    archive_path,
+                    f"image metadata references missing archive: {archive_path}",
+                )
+            )
+            continue
+
+        if size_bytes and file_path.stat().st_size != size_bytes:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    archive_path,
+                    f"image archive size mismatch for {archive_path}",
+                )
+            )
+
+        if sha256:
+            actual = sha256_file(file_path)
+            if actual != sha256:
+                issues.append(
+                    PackageIssue(
+                        PackageIssueSeverity.BLOCKING,
+                        archive_path,
+                        f"image archive checksum mismatch for {archive_path}",
+                    )
+                )
+
+    for required_archive in sorted(REQUIRED_IMAGE_ARCHIVES):
+        if required_archive not in by_archive:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    IMAGE_METADATA_FILENAME,
+                    f"{IMAGE_METADATA_FILENAME} missing required archive entry: {required_archive}",
+                )
+            )
+
+    for required_service in sorted(_service_from_archive(path) for path in REQUIRED_IMAGE_ARCHIVES):
+        if required_service not in by_service:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    IMAGE_METADATA_FILENAME,
+                    f"{IMAGE_METADATA_FILENAME} missing required service entry: {required_service}",
+                )
+            )
+
+    return issues
+
+
+def _service_from_archive(path: str) -> str:
+    return Path(path).name.removesuffix(".oci.tar")
 
 
 def _filename_is_forbidden(path: Path) -> bool:
@@ -466,6 +823,7 @@ def scan_staging_for_secrets(staging_dir: Path | str) -> list[PackageIssue]:
                 )
             )
             continue
+
         issues.extend(scan_file_for_secret_patterns(path, root))
 
     return issues
@@ -488,10 +846,16 @@ def validate_staging_dir(
         )
     )
 
+    issues.extend(validate_required_image_archives(staging_dir))
+
     if resolved_options.scan_for_secrets:
         issues.extend(scan_staging_for_secrets(staging_dir))
 
-    blocking = [issue for issue in issues if issue.severity == PackageIssueSeverity.BLOCKING]
+    blocking = [
+        issue
+        for issue in issues
+        if issue.severity == PackageIssueSeverity.BLOCKING
+    ]
     return PackageValidationResult(ok=not blocking, issues=tuple(issues))
 
 
@@ -508,10 +872,12 @@ def _deterministic_tarinfo(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
     tarinfo.uname = "root"
     tarinfo.gname = "root"
     tarinfo.mtime = 0
+
     if tarinfo.isfile():
         tarinfo.mode = 0o644
     elif tarinfo.isdir():
         tarinfo.mode = 0o755
+
     return tarinfo
 
 
@@ -530,11 +896,11 @@ def create_tar_archive(
     filter_func = _deterministic_tarinfo if deterministic else None
 
     with tarfile.open(output, "w", format=tarfile.PAX_FORMAT) as tar:
-        # Add directories first for stable extraction behavior.
         dirs = sorted(
             [path for path in root.rglob("*") if path.is_dir()],
             key=lambda item: _safe_relative_path(item, root),
         )
+
         for directory in dirs:
             arcname = _safe_relative_path(directory, root)
             tar.add(directory, arcname=arcname, recursive=False, filter=filter_func)
@@ -562,6 +928,7 @@ def _compress_with_python_zstandard(
     compressor = zstd.ZstdCompressor(level=level)
     with tar_path.open("rb") as source, output_path.open("wb") as target:
         compressor.copy_stream(source, target)
+
     return True
 
 
@@ -579,6 +946,7 @@ def _decompress_with_python_zstandard(
     decompressor = zstd.ZstdDecompressor()
     with capsule_path.open("rb") as source, tar_path.open("wb") as target:
         decompressor.copy_stream(source, target)
+
     return True
 
 
@@ -713,10 +1081,19 @@ def write_package_metadata(
         "extension": CAPSULE_EXTENSION,
         "package_result": dict(package_result or {}),
     }
+
     metadata_file.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, default=_json_default) + "\n",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            default=_json_default,
+        )
+        + "\n",
         encoding="utf-8",
     )
+
     return metadata_file
 
 
@@ -752,6 +1129,7 @@ def package_capsule(
 
     with tempfile.TemporaryDirectory(prefix="kxcap-package-") as tmp_dir:
         tar_path = Path(tmp_dir) / "capsule.tar"
+
         create_tar_archive(
             root,
             tar_path,
@@ -799,6 +1177,7 @@ def read_tar_entries(tar_path: Path | str) -> tuple[CapsuleArchiveEntry, ...]:
     """Read archive entries from an uncompressed tar archive."""
 
     entries: list[CapsuleArchiveEntry] = []
+
     with tarfile.open(tar_path, "r") as tar:
         for member in tar.getmembers():
             if member.isdir():
@@ -872,10 +1251,11 @@ def validate_capsule_archive(capsule_file: Path | str) -> PackageValidationResul
             ),
         )
 
-    entry_names = {entry.path.split("/", 1)[0] for entry in info.entries}
+    file_entries = {entry.path for entry in info.entries if entry.type == "file"}
+    root_entries_in_archive = {entry.path.split("/", 1)[0] for entry in info.entries}
 
     for required_file in sorted(REQUIRED_ROOT_FILES):
-        if required_file not in {entry.path for entry in info.entries if entry.type == "file"}:
+        if required_file not in file_entries:
             issues.append(
                 PackageIssue(
                     PackageIssueSeverity.BLOCKING,
@@ -885,7 +1265,7 @@ def validate_capsule_archive(capsule_file: Path | str) -> PackageValidationResul
             )
 
     for required_dir in sorted(REQUIRED_ROOT_DIRS):
-        if required_dir not in entry_names:
+        if required_dir not in root_entries_in_archive:
             issues.append(
                 PackageIssue(
                     PackageIssueSeverity.BLOCKING,
@@ -894,8 +1274,55 @@ def validate_capsule_archive(capsule_file: Path | str) -> PackageValidationResul
                 )
             )
 
+    for required_template in sorted(REQUIRED_ENV_TEMPLATES):
+        if required_template not in file_entries:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    required_template,
+                    f"required capsule env template is missing from archive: {required_template}",
+                )
+            )
+
+    for required_profile in sorted(REQUIRED_PROFILE_FILES):
+        if required_profile not in file_entries:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    required_profile,
+                    f"required capsule network profile is missing from archive: {required_profile}",
+                )
+            )
+
+    for required_archive in sorted(REQUIRED_IMAGE_ARCHIVES):
+        if required_archive not in file_entries:
+            issues.append(
+                PackageIssue(
+                    PackageIssueSeverity.BLOCKING,
+                    required_archive,
+                    f"required runtime image archive is missing from archive: {required_archive}",
+                )
+            )
+
+    image_archive_entries = [
+        entry.path
+        for entry in info.entries
+        if entry.type == "file"
+        and entry.path.startswith("images/")
+        and entry.path.endswith(".oci.tar")
+    ]
+    if not image_archive_entries:
+        issues.append(
+            PackageIssue(
+                PackageIssueSeverity.BLOCKING,
+                "images",
+                "capsule archive images directory contains no .oci.tar image archives",
+            )
+        )
+
     for entry in info.entries:
         path = Path(entry.path)
+
         if path.name in FORBIDDEN_CAPSULE_FILENAMES:
             issues.append(
                 PackageIssue(
@@ -904,6 +1331,7 @@ def validate_capsule_archive(capsule_file: Path | str) -> PackageValidationResul
                     f"forbidden filename present in archive: {entry.path}",
                 )
             )
+
         if entry.type == "symlink":
             issues.append(
                 PackageIssue(
@@ -913,7 +1341,11 @@ def validate_capsule_archive(capsule_file: Path | str) -> PackageValidationResul
                 )
             )
 
-    blocking = [issue for issue in issues if issue.severity == PackageIssueSeverity.BLOCKING]
+    blocking = [
+        issue
+        for issue in issues
+        if issue.severity == PackageIssueSeverity.BLOCKING
+    ]
     return PackageValidationResult(ok=not blocking, issues=tuple(issues))
 
 
@@ -944,12 +1376,19 @@ def extract_capsule(
         with tarfile.open(tar_path, "r") as tar:
             for member in tar.getmembers():
                 target = (destination / member.name).resolve(strict=False)
+
                 try:
                     target.relative_to(destination.resolve(strict=False))
                 except ValueError as exc:
-                    raise PackageError(f"archive member escapes destination: {member.name}") from exc
+                    raise PackageError(
+                        f"archive member escapes destination: {member.name}"
+                    ) from exc
+
                 if member.issym() or member.islnk():
-                    raise PackageError(f"archive member is a link and is not allowed: {member.name}")
+                    raise PackageError(
+                        f"archive member is a link and is not allowed: {member.name}"
+                    )
+
             tar.extractall(destination)
 
     return destination
@@ -967,21 +1406,1256 @@ def validation_result_to_dict(result: PackageValidationResult) -> dict[str, Any]
     return json.loads(json.dumps(asdict(result), default=_json_default))
 
 
+def _builder_versions() -> tuple[str, str]:
+    """Return Builder-visible app/param versions without hard-failing old imports."""
+
+    try:
+        from kx_shared.konnaxion_constants import APP_VERSION, PARAM_VERSION
+
+        return str(APP_VERSION), str(PARAM_VERSION)
+    except Exception:
+        return "v14", "kx-param-2026.04.30"
+
+
+def _write_json_file(path: Path, payload: Mapping[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            default=_json_default,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _json_safe_payload(value: Any) -> Any:
+    """Return a JSON/YAML-safe representation of a nested payload."""
+
+    return json.loads(json.dumps(value, default=_json_default))
+
+
+def _yaml_scalar(value: Any) -> str:
+    """Render one scalar as YAML-safe text."""
+
+    value = _json_safe_payload(value)
+
+    if value is None:
+        return "null"
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+
+    if isinstance(value, (int, float)):
+        return str(value)
+
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _yaml_lines(value: Any, *, indent: int = 0) -> list[str]:
+    """Render a simple JSON-like object as deterministic YAML lines."""
+
+    prefix = " " * indent
+    value = _json_safe_payload(value)
+
+    if isinstance(value, Mapping):
+        if not value:
+            return [prefix + "{}"]
+
+        lines: list[str] = []
+        for key, item in value.items():
+            key_text = str(key)
+
+            if isinstance(item, Mapping):
+                if item:
+                    lines.append(f"{prefix}{key_text}:")
+                    lines.extend(_yaml_lines(item, indent=indent + 2))
+                else:
+                    lines.append(f"{prefix}{key_text}: {{}}")
+                continue
+
+            if isinstance(item, list):
+                if item:
+                    lines.append(f"{prefix}{key_text}:")
+                    lines.extend(_yaml_lines(item, indent=indent + 2))
+                else:
+                    lines.append(f"{prefix}{key_text}: []")
+                continue
+
+            lines.append(f"{prefix}{key_text}: {_yaml_scalar(item)}")
+
+        return lines
+
+    if isinstance(value, list):
+        if not value:
+            return [prefix + "[]"]
+
+        lines = []
+        for item in value:
+            if isinstance(item, Mapping):
+                lines.append(prefix + "-")
+                lines.extend(_yaml_lines(item, indent=indent + 2))
+            elif isinstance(item, list):
+                lines.append(prefix + "-")
+                lines.extend(_yaml_lines(item, indent=indent + 2))
+            else:
+                lines.append(f"{prefix}- {_yaml_scalar(item)}")
+
+        return lines
+
+    return [prefix + _yaml_scalar(value)]
+
+
+def _write_yaml_file(path: Path, payload: Mapping[str, Any]) -> Path:
+    """Write a YAML file without requiring PyYAML at bootstrap time."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    safe_payload = _json_safe_payload(payload)
+
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        content = yaml.safe_dump(
+            safe_payload,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+    except Exception:
+        content = "\n".join(_yaml_lines(safe_payload)) + "\n"
+
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _read_yaml_file(path: Path) -> dict[str, Any]:
+    """Read a YAML or JSON-compatible file."""
+
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        value = yaml.safe_load(text) or {}
+    except Exception:
+        value = json.loads(text)
+
+    if not isinstance(value, dict):
+        raise PackageError(f"{path} must contain a mapping")
+
+    return value
+
+
+def _write_text_file(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _source_path_is_excluded(path: Path, source_root: Path) -> bool:
+    excluded_parts = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".next",
+        "dist",
+        "build",
+        "runtime",
+        "capsules",
+        "backups",
+        "logs",
+    }
+
+    try:
+        relative = path.relative_to(source_root)
+    except ValueError:
+        return True
+
+    if any(part in excluded_parts for part in relative.parts):
+        return True
+
+    if path.name.startswith(".") and path.name not in {".dockerignore"}:
+        return True
+
+    if _filename_is_forbidden(path):
+        return True
+
+    if path.suffix.lower() in {".pyc", ".pyo", ".sqlite3", ".db", ".log", ".tmp"}:
+        return True
+
+    return False
+
+
+def _build_source_inventory(source_dir: Path, *, max_files: int = 20_000) -> dict[str, Any]:
+    """Create a deterministic source inventory without copying source/secrets into the capsule."""
+
+    files: list[dict[str, Any]] = []
+
+    for path in sorted(source_dir.rglob("*"), key=lambda item: item.as_posix().lower()):
+        if _source_path_is_excluded(path, source_dir):
+            continue
+
+        if not path.is_file():
+            continue
+
+        try:
+            relative = path.relative_to(source_dir).as_posix()
+            stat = path.stat()
+        except OSError:
+            continue
+
+        files.append(
+            {
+                "path": relative,
+                "size_bytes": stat.st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+
+    truncated = len(files) > max_files
+
+    return {
+        "source_dir": str(source_dir),
+        "generated_at": utc_now(),
+        "file_count": len(files),
+        "truncated": truncated,
+        "files": files[:max_files],
+    }
+
+
+def _find_existing_compose(source_dir: Path) -> Path | None:
+    candidates = (
+        source_dir / "docker-compose.capsule.yml",
+        source_dir / "docker-compose.yml",
+        source_dir / "docker-compose.yaml",
+        source_dir / "compose.yml",
+        source_dir / "compose.yaml",
+        source_dir / "deploy" / "docker-compose.capsule.yml",
+        source_dir / "deploy" / "docker-compose.yml",
+        source_dir / "deploy" / "compose.yml",
+    )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    return None
+
+
+def _write_compose_file(staging_dir: Path, source_dir: Path, *, capsule_id: str) -> Path:
+    """Use a real compose file when present; otherwise create a harmless placeholder compose."""
+
+    output = staging_dir / COMPOSE_FILENAME
+    existing = _find_existing_compose(source_dir)
+
+    if existing is not None:
+        output.write_text(existing.read_text(encoding="utf-8"), encoding="utf-8")
+        return output
+
+    output.write_text(
+        "\n".join(
+            [
+                "services:",
+                "  konnaxion-placeholder:",
+                "    image: busybox:1.36",
+                "    command:",
+                "      - sh",
+                "      - -c",
+                f"      - echo 'Capsule {capsule_id} contains metadata only; add real image archives before production deploy.' && sleep 3600",
+                "    restart: 'no'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    return output
+
+
+def _default_manifest_images(*, app_version: str) -> list[dict[str, str]]:
+    """Return canonical runtime images declared in manifest.yaml."""
+
+    services = (
+        "frontend-next",
+        "django-api",
+        "traefik",
+        "postgres",
+        "redis",
+        "celeryworker",
+        "celerybeat",
+        "media-nginx",
+    )
+
+    result: list[dict[str, str]] = []
+    for service in services:
+        result.append(
+            {
+                "service": service,
+                "archive": f"images/{service}.oci.tar",
+                "image": CANONICAL_IMAGE_TAGS[service].format(app_version=app_version),
+            }
+        )
+
+    return result
+
+
+def _copy_source_tree_for_docker_context(source: Path, destination: Path) -> None:
+    """Copy a source tree into a clean temporary Docker build context."""
+
+    if destination.exists():
+        shutil.rmtree(destination)
+
+    def ignore(_dir: str, names: list[str]) -> set[str]:
+        ignored: set[str] = set()
+        for name in names:
+            lower = name.lower()
+            if name in {
+                ".git",
+                ".hg",
+                ".svn",
+                ".venv",
+                "venv",
+                "env",
+                "node_modules",
+                "__pycache__",
+                ".pytest_cache",
+                ".mypy_cache",
+                ".ruff_cache",
+                ".next",
+                "out",
+                "dist",
+                "build",
+                "runtime",
+                "capsules",
+                "backups",
+                "logs",
+                "media",
+                "staticfiles",
+                "coverage",
+                "reports",
+                "test-results",
+                "playwright-report",
+                ".cache",
+                ".turbo",
+                ".vercel",
+            }:
+                ignored.add(name)
+                continue
+            if lower.endswith((".pyc", ".pyo", ".pyd", ".sqlite3", ".db", ".log", ".tmp")):
+                ignored.add(name)
+                continue
+            if name in FORBIDDEN_CAPSULE_FILENAMES:
+                ignored.add(name)
+                continue
+            if any(pattern.fullmatch(name) for pattern in FORBIDDEN_FILENAME_PATTERNS):
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(source, destination, ignore=ignore)
+
+
+def _write_frontend_capsule_dockerfile(context_dir: Path) -> Path:
+    """Write the production frontend Dockerfile used by capsule builds."""
+
+    dockerfile = context_dir / "Dockerfile.capsule"
+    dockerfile.write_text(
+        "\n".join(
+            [
+                "FROM node:20-alpine AS builder",
+                "WORKDIR /app",
+                "RUN corepack enable",
+                "COPY package.json pnpm-lock.yaml* ./",
+                "RUN pnpm install --no-frozen-lockfile",
+                "COPY . .",
+                "ENV NODE_ENV=production",
+                "ENV NODE_OPTIONS=--max-old-space-size=4096",
+                "RUN pnpm build",
+                "FROM node:20-alpine AS runner",
+                "WORKDIR /app",
+                "ENV NODE_ENV=production",
+                "ENV PORT=3000",
+                "ENV HOSTNAME=0.0.0.0",
+                "ENV NEXT_TELEMETRY_DISABLED=1",
+                "COPY --from=builder /app/package.json ./package.json",
+                "COPY --from=builder /app/node_modules ./node_modules",
+                "COPY --from=builder /app/.next ./.next",
+                "COPY --from=builder /app/public ./public",
+                "COPY --from=builder /app/next.config.* ./",
+                "COPY --from=builder /app/env.mjs ./env.mjs",
+                "EXPOSE 3000",
+                'CMD ["node", "node_modules/next/dist/bin/next", "start", "-H", "0.0.0.0", "-p", "3000"]',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return dockerfile
+
+
+def _run_docker_command(
+    argv: tuple[str, ...],
+    *,
+    action: str,
+    timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Run one Docker command for the build/export phase."""
+
+    try:
+        completed = subprocess.run(
+            argv,
+            shell=False,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        raise PackageError("Docker CLI was not found on this host.") from exc
+    except subprocess.TimeoutExpired as exc:
+        output = "\n".join(
+            str(part or "")
+            for part in (exc.stdout, exc.stderr)
+            if part
+        )
+        raise PackageError(f"Docker command timed out while trying to {action}: {output}") from exc
+
+    if completed.returncode != 0:
+        output = "\n".join(
+            part
+            for part in (completed.stdout, completed.stderr)
+            if part
+        )
+        raise PackageError(
+            f"Docker command failed while trying to {action} "
+            f"with exit code {completed.returncode}: {output}"
+        )
+
+    return completed
+
+
+def _docker_image_exists(image: str) -> bool:
+    completed = subprocess.run(
+        ("docker", "image", "inspect", image, "--format", "{{.Id}}"),
+        shell=False,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return completed.returncode == 0 and bool(completed.stdout.strip())
+
+
+def _docker_build_image(
+    *,
+    context_dir: Path,
+    dockerfile: Path,
+    image: str,
+    action: str,
+) -> None:
+    _run_docker_command(
+        (
+            "docker",
+            "build",
+            "--file",
+            str(dockerfile),
+            "--tag",
+            image,
+            str(context_dir),
+        ),
+        action=action,
+        timeout_seconds=1800,
+    )
+
+
+def _docker_pull_image(image: str) -> None:
+    if _docker_image_exists(image):
+        return
+
+    _run_docker_command(
+        ("docker", "pull", image),
+        action=f"pull image {image}",
+        timeout_seconds=900,
+    )
+
+
+def _docker_save_image(*, image: str, archive: Path) -> None:
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if archive.exists():
+        archive.unlink()
+
+    if not _docker_image_exists(image):
+        raise PackageError(f"Docker image is not available locally: {image}")
+
+    _run_docker_command(
+        ("docker", "save", "--output", str(archive), image),
+        action=f"export image {image}",
+        timeout_seconds=1800,
+    )
+
+    if not archive.is_file() or archive.stat().st_size <= 0:
+        raise PackageError(f"Docker did not create expected image archive: {archive}")
+
+
+def _discover_backend_source(source_dir: Path) -> Path:
+    candidate = source_dir / "backend"
+    if candidate.is_dir():
+        return candidate
+    if (source_dir / "manage.py").is_file():
+        return source_dir
+    raise PackageError(
+        "Could not find backend source directory. Expected either "
+        "<source>/backend or a source directory containing manage.py."
+    )
+
+
+def _discover_frontend_source(source_dir: Path) -> Path:
+    candidate = source_dir / "frontend"
+    if candidate.is_dir():
+        return candidate
+    if (source_dir / "package.json").is_file():
+        return source_dir
+    raise PackageError(
+        "Could not find frontend source directory. Expected either "
+        "<source>/frontend or a source directory containing package.json."
+    )
+
+
+def _validate_backend_context(context: Path) -> None:
+    models_py = context / "konnaxion" / "ethikos" / "models.py"
+    if models_py.is_file():
+        text = models_py.read_text(encoding="utf-8", errors="replace")
+        if "class Migration" in text and "class ArgumentImpactVote" not in text:
+            raise PackageError(
+                "Backend context appears corrupted: "
+                "konnaxion/ethikos/models.py contains migration content."
+            )
+
+
+def _write_images_metadata(
+    staging_dir: Path,
+    exported: list[dict[str, Any]],
+) -> Path:
+    """Write canonical root images.yaml and compatibility metadata/images.json."""
+
+    payload = {
+        "schema_version": "kx-images/v1",
+        "generated_at": utc_now(),
+        "images": exported,
+    }
+
+    root_metadata = _write_yaml_file(staging_dir / IMAGE_METADATA_FILENAME, payload)
+
+    # Compatibility copy for older diagnostics. The root images.yaml is canonical.
+    _write_json_file(
+        staging_dir / "metadata" / "images.json",
+        payload,
+    )
+
+    return root_metadata
+
+
+def _export_runtime_image_archives(
+    source_dir: Path,
+    staging_dir: Path,
+    *,
+    capsule_id: str,
+) -> list[dict[str, Any]]:
+    """Build/export canonical runtime image archives into staging/images.
+
+    This fixes the historical failure where Builder produced a deployable-looking
+    capsule with only ``images/README.json``. The function intentionally builds
+    from clean temporary Docker contexts so local virtualenvs, node_modules, and
+    generated test output cannot corrupt image contents.
+    """
+
+    app_version, _param_version = _builder_versions()
+    images_dir = staging_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    backend_source = _discover_backend_source(source_dir)
+    frontend_source = _discover_frontend_source(source_dir)
+
+    django_image = CANONICAL_IMAGE_TAGS["django-api"].format(app_version=app_version)
+    frontend_image = CANONICAL_IMAGE_TAGS["frontend-next"].format(app_version=app_version)
+
+    with tempfile.TemporaryDirectory(prefix="kxcap-image-build-") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+
+        backend_context = tmp_root / "backend"
+        _copy_source_tree_for_docker_context(backend_source, backend_context)
+        _validate_backend_context(backend_context)
+
+        backend_dockerfile = backend_context / "compose" / "production" / "django" / "Dockerfile"
+        if not backend_dockerfile.is_file():
+            raise PackageError(
+                "Backend production Dockerfile is missing: "
+                f"{backend_source / 'compose' / 'production' / 'django' / 'Dockerfile'}"
+            )
+
+        _docker_build_image(
+            context_dir=backend_context,
+            dockerfile=backend_dockerfile,
+            image=django_image,
+            action="build django-api image",
+        )
+
+        frontend_context = tmp_root / "frontend"
+        _copy_source_tree_for_docker_context(frontend_source, frontend_context)
+        frontend_dockerfile = _write_frontend_capsule_dockerfile(frontend_context)
+        if not (frontend_context / "env.mjs").is_file():
+            raise PackageError("Frontend env.mjs is required by next.config and is missing.")
+
+        _docker_build_image(
+            context_dir=frontend_context,
+            dockerfile=frontend_dockerfile,
+            image=frontend_image,
+            action="build frontend-next image",
+        )
+
+    for service in sorted(EXTERNAL_RUNTIME_SERVICES):
+        image = CANONICAL_IMAGE_TAGS[service].format(app_version=app_version)
+        _docker_pull_image(image)
+
+    image_specs = [
+        ("frontend-next", frontend_image, images_dir / "frontend-next.oci.tar"),
+        ("django-api", django_image, images_dir / "django-api.oci.tar"),
+        ("traefik", CANONICAL_IMAGE_TAGS["traefik"].format(app_version=app_version), images_dir / "traefik.oci.tar"),
+        ("postgres", CANONICAL_IMAGE_TAGS["postgres"].format(app_version=app_version), images_dir / "postgres.oci.tar"),
+        ("redis", CANONICAL_IMAGE_TAGS["redis"].format(app_version=app_version), images_dir / "redis.oci.tar"),
+        ("celeryworker", django_image, images_dir / "celeryworker.oci.tar"),
+        ("celerybeat", django_image, images_dir / "celerybeat.oci.tar"),
+        ("media-nginx", CANONICAL_IMAGE_TAGS["media-nginx"].format(app_version=app_version), images_dir / "media-nginx.oci.tar"),
+    ]
+
+    exported: list[dict[str, Any]] = []
+    for service, image, archive in image_specs:
+        _docker_save_image(image=image, archive=archive)
+        exported.append(
+            {
+                "service": service,
+                "image": image,
+                "archive": archive.name,
+                "archive_path": f"images/{archive.name}",
+                "sha256": sha256_file(archive),
+                "size_bytes": archive.stat().st_size,
+                "capsule_id": capsule_id,
+                "exported_at": utc_now(),
+            }
+        )
+
+    _write_images_metadata(staging_dir, exported)
+
+    return exported
+
+
+def _write_manifest_file(
+    staging_dir: Path,
+    *,
+    source_dir: Path,
+    channel: str,
+    capsule_id: str,
+    capsule_version: str,
+    profile: str,
+    sign: bool,
+) -> Path:
+    """Write the canonical capsule manifest as actual YAML."""
+
+    app_version, param_version = _builder_versions()
+
+    payload = {
+        "schema_version": "kx-capsule-manifest/v1",
+        "app_name": "Konnaxion",
+        "app_version": app_version,
+        "param_version": param_version,
+        "capsule_id": capsule_id,
+        "capsule_version": capsule_version,
+        "channel": channel,
+        "profile": profile,
+        "profiles": sorted(PROFILE_SPECS),
+        "created_at": utc_now(),
+        "source": {
+            "source_dir": str(source_dir),
+        },
+        "package": {
+            "format": "tar+zstd",
+            "extension": CAPSULE_EXTENSION,
+            "signed": bool(sign),
+        },
+        "runtime": {
+            "compose_file": COMPOSE_FILENAME,
+            "images_dir": "images",
+            "image_metadata": IMAGE_METADATA_FILENAME,
+            "images": _default_manifest_images(app_version=app_version),
+        },
+    }
+
+    return _write_yaml_file(staging_dir / MANIFEST_FILENAME, payload)
+
+
+def _write_default_capsule_dirs(staging_dir: Path) -> None:
+    for dirname in sorted(REQUIRED_ROOT_DIRS | OPTIONAL_ROOT_DIRS):
+        (staging_dir / dirname).mkdir(parents=True, exist_ok=True)
+
+    readme_payload = {
+        "generated_at": utc_now(),
+        "note": "Directory intentionally present for canonical capsule layout.",
+    }
+
+    for dirname in sorted(REQUIRED_ROOT_DIRS):
+        marker = staging_dir / dirname / "README.json"
+        if dirname != "metadata" and not marker.exists():
+            _write_json_file(marker, readme_payload)
+
+
+def _write_profile_files(staging_dir: Path, *, default_profile: str) -> None:
+    """Write all canonical network profile files expected by the verifier."""
+
+    for profile_name, spec in sorted(PROFILE_SPECS.items()):
+        payload = {
+            "schema_version": "kx-network-profile/v1",
+            "profile": profile_name,
+            "default_for_capsule": profile_name == default_profile,
+            "generated_at": utc_now(),
+            **spec,
+        }
+
+        _write_yaml_file(staging_dir / "profiles" / f"{profile_name}.yaml", payload)
+
+
+def _write_env_templates(staging_dir: Path) -> None:
+    """Write all canonical env templates expected by the verifier."""
+
+    _write_text_file(
+        staging_dir / "env-templates" / "django.env.template",
+        "\n".join(
+            [
+                "# Konnaxion Django runtime environment template.",
+                "# Real secrets are generated or provided on the target host.",
+                "DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-konnaxion.settings}",
+                "DJANGO_SECRET_KEY=<GENERATED_ON_INSTALL>",
+                "DJANGO_ALLOWED_HOSTS=<GENERATED_FROM_PROFILE>",
+                "DJANGO_CSRF_TRUSTED_ORIGINS=<GENERATED_FROM_PROFILE>",
+                "CSRF_TRUSTED_ORIGINS=<GENERATED_FROM_PROFILE>",
+                "DATABASE_URL=${DATABASE_URL}",
+                "REDIS_URL=${REDIS_URL}",
+                "KX_INSTANCE_ID=${KX_INSTANCE_ID}",
+                "KX_NETWORK_PROFILE=${KX_NETWORK_PROFILE}",
+                "KX_EXPOSURE_MODE=${KX_EXPOSURE_MODE}",
+                "",
+            ]
+        ),
+    )
+
+    _write_text_file(
+        staging_dir / "env-templates" / "postgres.env.template",
+        "\n".join(
+            [
+                "# Konnaxion Postgres runtime environment template.",
+                "POSTGRES_DB=${POSTGRES_DB:-konnaxion}",
+                "POSTGRES_USER=${POSTGRES_USER:-konnaxion}",
+                "POSTGRES_PASSWORD=<GENERATED_ON_INSTALL>",
+                "",
+            ]
+        ),
+    )
+
+    _write_text_file(
+        staging_dir / "env-templates" / "redis.env.template",
+        "\n".join(
+            [
+                "# Konnaxion Redis runtime environment template.",
+                "REDIS_URL=${REDIS_URL}",
+                "REDIS_APPENDONLY=${REDIS_APPENDONLY:-yes}",
+                "",
+            ]
+        ),
+    )
+
+    _write_text_file(
+        staging_dir / "env-templates" / "frontend.env.template",
+        "\n".join(
+            [
+                "# Konnaxion frontend runtime environment template.",
+                "NEXT_PUBLIC_API_BASE=<GENERATED_FROM_PROFILE>",
+                "NEXT_PUBLIC_BACKEND_BASE=<GENERATED_FROM_PROFILE>",
+                "NEXT_TELEMETRY_DISABLED=1",
+                "NODE_OPTIONS=--max-old-space-size=4096",
+                "KX_PUBLIC_HOST=<GENERATED_FROM_PROFILE>",
+                "KX_NETWORK_PROFILE=${KX_NETWORK_PROFILE}",
+                "",
+            ]
+        ),
+    )
+
+
+def _write_healthcheck(staging_dir: Path) -> None:
+    healthcheck = staging_dir / "healthchecks" / "capsule-healthcheck.json"
+    _write_json_file(
+        healthcheck,
+        {
+            "schema_version": "kx-healthcheck/v1",
+            "checks": [
+                {
+                    "name": "compose-file-present",
+                    "type": "file_exists",
+                    "path": COMPOSE_FILENAME,
+                },
+                {
+                    "name": "image-metadata-present",
+                    "type": "file_exists",
+                    "path": IMAGE_METADATA_FILENAME,
+                },
+            ],
+        },
+    )
+
+
+def _write_policy(staging_dir: Path, *, profile: str) -> None:
+    _write_json_file(
+        staging_dir / "policies" / "capsule-policy.json",
+        {
+            "schema_version": "kx-policy/v1",
+            "profile": profile,
+            "secrets_in_capsule_allowed": False,
+            "docker_socket_mount_allowed": False,
+            "privileged_containers_allowed": False,
+            "host_network_allowed": False,
+            "generated_at": utc_now(),
+        },
+    )
+
+
+def _write_migration_marker(staging_dir: Path) -> None:
+    _write_json_file(
+        staging_dir / "migrations" / "README.json",
+        {
+            "schema_version": "kx-migrations/v1",
+            "migrations": [],
+            "generated_at": utc_now(),
+        },
+    )
+
+
+def _write_checksums_file(staging_dir: Path) -> Path:
+    entries: list[str] = []
+
+    for path in iter_staging_files(staging_dir):
+        relative = _safe_relative_path(path, staging_dir)
+
+        if relative in {CHECKSUMS_FILENAME, SIGNATURE_FILENAME}:
+            continue
+
+        entries.append(f"{sha256_file(path)}  {relative}")
+
+    checksums = staging_dir / CHECKSUMS_FILENAME
+    checksums.write_text("\n".join(sorted(entries)) + "\n", encoding="utf-8")
+    return checksums
+
+
+def _first_existing_env_path(names: tuple[str, ...]) -> Path | None:
+    """Return the first non-empty signing path from the environment."""
+
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return Path(value).expanduser()
+    return None
+
+
+def _first_env_bytes(names: tuple[str, ...]) -> bytes | None:
+    """Return the first non-empty signing password from the environment."""
+
+    for name in names:
+        value = os.getenv(name, "")
+        if value:
+            return value.encode("utf-8")
+    return None
+
+
+def _coerce_password_bytes(value: str | bytes | None) -> bytes | None:
+    if value in (None, "", b""):
+        return None
+    if isinstance(value, bytes):
+        return value
+    return str(value).encode("utf-8")
+
+
+def _write_unsigned_signature_file(
+    staging_dir: Path,
+    *,
+    capsule_id: str,
+    capsule_version: str,
+) -> Path:
+    """Write an explicit unsigned development envelope."""
+
+    manifest = staging_dir / MANIFEST_FILENAME
+    checksums = staging_dir / CHECKSUMS_FILENAME
+
+    payload = {
+        "schema_version": "kx-signature/v1",
+        "capsule_id": capsule_id,
+        "capsule_version": capsule_version,
+        "mode": "unsigned-development",
+        "manifest_sha256": sha256_file(manifest),
+        "checksums_sha256": sha256_file(checksums),
+        "created_at": utc_now(),
+        "warning": "This capsule is intentionally unsigned and must not be deployed with KX_REQUIRE_SIGNED_CAPSULE=true.",
+    }
+
+    return _write_json_file(staging_dir / SIGNATURE_FILENAME, payload)
+
+
+def _write_signature_file(
+    staging_dir: Path,
+    *,
+    capsule_id: str,
+    capsule_version: str,
+    sign: bool,
+    signing_key_file: Path | str | None = None,
+    signing_key_password: str | bytes | None = None,
+) -> Path:
+    """Write signature.sig using the real Builder signing flow."""
+
+    if not sign:
+        return _write_unsigned_signature_file(
+            staging_dir,
+            capsule_id=capsule_id,
+            capsule_version=capsule_version,
+        )
+
+    resolved_key = (
+        Path(signing_key_file).expanduser()
+        if signing_key_file not in (None, "")
+        else _first_existing_env_path(SIGNING_KEY_ENV_VARS)
+    )
+
+    if resolved_key is None:
+        raise PackageError(
+            "Signing requested, but no signing key was provided. "
+            "Set KX_BUILDER_SIGNING_KEY_FILE or pass signing_key_file. "
+            "Use sign=False only for local unsigned development artifacts."
+        )
+
+    password = _coerce_password_bytes(signing_key_password)
+    if password is None:
+        password = _first_env_bytes(SIGNING_KEY_PASSWORD_ENV_VARS)
+
+    try:
+        from kx_builder.signature import sign_capsule_root_with_private_key_file
+    except Exception as exc:
+        raise PackageError(
+            "kx_builder.signature.sign_capsule_root_with_private_key_file is required "
+            "to create a signed capsule."
+        ) from exc
+
+    sign_capsule_root_with_private_key_file(
+        staging_dir,
+        resolved_key,
+        private_key_password=password,
+        capsule_id=capsule_id,
+        capsule_version=capsule_version,
+        metadata={
+            "builder": "kx_builder.package",
+            "package_schema_version": PACKAGE_SCHEMA_VERSION,
+        },
+        overwrite=True,
+    )
+
+    signature_path = staging_dir / SIGNATURE_FILENAME
+    if not signature_path.is_file():
+        raise PackageError("Signature helper completed but signature.sig was not written.")
+
+    try:
+        payload = json.loads(signature_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PackageError("signature.sig is not valid JSON after signing.") from exc
+
+    if not isinstance(payload, Mapping) or not payload.get("signature_base64"):
+        raise PackageError("signature.sig does not contain a cryptographic signature.")
+
+    return signature_path
+
+
+def _stage_capsule_from_source(
+    source_dir: Path,
+    staging_dir: Path,
+    *,
+    channel: str,
+    capsule_id: str,
+    capsule_version: str,
+    profile: str,
+    sign: bool,
+    build_images: bool = True,
+    signing_key_file: Path | str | None = None,
+    signing_key_password: str | bytes | None = None,
+) -> Path:
+    """Create a canonical capsule staging directory from a normal source tree."""
+
+    _write_default_capsule_dirs(staging_dir)
+    _write_compose_file(staging_dir, source_dir, capsule_id=capsule_id)
+    _write_manifest_file(
+        staging_dir,
+        source_dir=source_dir,
+        channel=channel,
+        capsule_id=capsule_id,
+        capsule_version=capsule_version,
+        profile=profile,
+        sign=sign,
+    )
+    _write_profile_files(staging_dir, default_profile=profile)
+    _write_env_templates(staging_dir)
+    _write_healthcheck(staging_dir)
+    _write_policy(staging_dir, profile=profile)
+    _write_migration_marker(staging_dir)
+
+    exported_images: list[dict[str, Any]] = []
+    if build_images:
+        exported_images = _export_runtime_image_archives(
+            source_dir,
+            staging_dir,
+            capsule_id=capsule_id,
+        )
+    else:
+        _write_images_metadata(staging_dir, exported_images)
+
+    _write_json_file(
+        staging_dir / "metadata" / "source-inventory.json",
+        _build_source_inventory(source_dir),
+    )
+
+    _write_json_file(
+        staging_dir / "metadata" / "build.json",
+        {
+            "schema_version": "kx-build/v1",
+            "channel": channel,
+            "capsule_id": capsule_id,
+            "capsule_version": capsule_version,
+            "profile": profile,
+            "generated_at": utc_now(),
+            "images_exported": bool(exported_images),
+            "image_count": len(exported_images),
+            "required_image_count": len(REQUIRED_IMAGE_ARCHIVES),
+        },
+    )
+
+    _write_checksums_file(staging_dir)
+    _write_signature_file(
+        staging_dir,
+        capsule_id=capsule_id,
+        capsule_version=capsule_version,
+        sign=sign,
+        signing_key_file=signing_key_file,
+        signing_key_password=signing_key_password,
+    )
+
+    return staging_dir
+
+
+def _looks_like_capsule_staging(path: Path) -> bool:
+    entries = root_entries(path)
+    return REQUIRED_ROOT_FILES.issubset(entries) and REQUIRED_ROOT_DIRS.issubset(entries)
+
+
+def _verify_packaged_capsule(capsule_file: Path) -> dict[str, Any]:
+    """Run the richer builder verifier when available."""
+
+    try:
+        from kx_builder.verify import verify_capsule_file
+    except Exception:
+        validation = validate_capsule_archive(capsule_file)
+        return {
+            "ok": validation.ok,
+            "issues": [
+                {
+                    "severity": issue.severity.value,
+                    "path": issue.path,
+                    "message": issue.message,
+                }
+                for issue in validation.issues
+            ],
+        }
+
+    result = verify_capsule_file(capsule_file, strict=False)
+
+    if isinstance(result, Mapping):
+        return dict(result)
+
+    to_dict = getattr(result, "to_dict", None)
+    if callable(to_dict):
+        value = to_dict()
+        if isinstance(value, Mapping):
+            return dict(value)
+
+    return {
+        "ok": bool(getattr(result, "ok", getattr(result, "valid", False))),
+        "message": str(getattr(result, "message", "")),
+    }
+
+
+def build_package(
+    *,
+    source_dir: Path | str,
+    output: Path | str,
+    channel: str = DEFAULT_CHANNEL,
+    capsule_id: str,
+    capsule_version: str,
+    profile: str,
+    sign: bool = True,
+    verify: bool = True,
+    force: bool = False,
+    build_images: bool = True,
+    signing_key_file: Path | str | None = None,
+    signing_key_password: str | bytes | None = None,
+) -> dict[str, Any]:
+    """Build a .kxcap package from a source tree or prepared capsule staging dir.
+
+    This is the function expected by kx_builder.main.build_capsule().
+    """
+
+    source_root = Path(source_dir).resolve(strict=False)
+    output_path = ensure_capsule_extension(output)
+    app_version, param_version = _builder_versions()
+
+    if not source_root.exists() or not source_root.is_dir():
+        return {
+            "ok": False,
+            "output": str(output_path),
+            "capsule_id": capsule_id,
+            "capsule_version": capsule_version,
+            "app_version": app_version,
+            "param_version": param_version,
+            "message": f"Source directory does not exist: {source_root}",
+        }
+
+    package_options = PackageOptions(
+        overwrite=bool(force),
+        include_package_metadata=False,
+        strict_root=True,
+        scan_for_secrets=True,
+    )
+
+    if _looks_like_capsule_staging(source_root):
+        image_validation = validate_required_image_archives(source_root)
+        blocking_image_validation = [
+            issue
+            for issue in image_validation
+            if issue.severity == PackageIssueSeverity.BLOCKING
+        ]
+        if blocking_image_validation:
+            raise PackageValidationError(
+                PackageValidationResult(ok=False, issues=tuple(blocking_image_validation))
+            )
+
+        _write_checksums_file(source_root)
+        _write_signature_file(
+            source_root,
+            capsule_id=capsule_id,
+            capsule_version=capsule_version,
+            sign=sign,
+            signing_key_file=signing_key_file,
+            signing_key_password=signing_key_password,
+        )
+        package_result = package_capsule(
+            source_root,
+            output_path,
+            options=package_options,
+        )
+        staging_used = source_root
+    else:
+        with tempfile.TemporaryDirectory(prefix="kxcap-build-") as tmp_dir:
+            staging_used = Path(tmp_dir) / "staging"
+            staging_used.mkdir(parents=True, exist_ok=True)
+
+            _stage_capsule_from_source(
+                source_root,
+                staging_used,
+                channel=channel,
+                capsule_id=capsule_id,
+                capsule_version=capsule_version,
+                profile=profile,
+                sign=sign,
+                build_images=build_images,
+                signing_key_file=signing_key_file,
+                signing_key_password=signing_key_password,
+            )
+
+            package_result = package_capsule(
+                staging_used,
+                output_path,
+                options=package_options,
+            )
+
+    verification: dict[str, Any] | None = None
+    ok = True
+    message = "Capsule build completed."
+
+    if verify:
+        verification = _verify_packaged_capsule(package_result.capsule_file)
+        ok = bool(verification.get("ok", False))
+
+        if not ok:
+            message = "Capsule build completed, but verification failed."
+
+    return {
+        "ok": ok,
+        "output": str(package_result.capsule_file),
+        "capsule_file": str(package_result.capsule_file),
+        "capsule_id": capsule_id,
+        "capsule_version": capsule_version,
+        "app_version": app_version,
+        "param_version": param_version,
+        "message": message,
+        "data": {
+            "capsule_file": str(package_result.capsule_file),
+            "staging_dir": str(staging_used),
+            "size_bytes": package_result.size_bytes,
+            "sha256": package_result.sha256,
+            "compression": package_result.compression.value,
+            "created_at": package_result.created_at.isoformat(),
+            "verification": verification,
+        },
+    }
+
+
 __all__ = [
     "ALLOWED_ROOT_ENTRIES",
     "CHECKSUMS_FILENAME",
     "COMPOSE_FILENAME",
     "DEFAULT_COMMAND_TIMEOUT_SECONDS",
     "DEFAULT_COMPRESSION_LEVEL",
+    "DJANGO_IMAGE_ALIAS_SERVICES",
+    "EXTERNAL_RUNTIME_SERVICES",
     "FORBIDDEN_CAPSULE_FILENAMES",
     "FORBIDDEN_FILENAME_PATTERNS",
     "FORBIDDEN_TEXT_PATTERNS",
+    "IMAGE_METADATA_FILENAME",
     "MANIFEST_FILENAME",
+    "OPTIONAL_IMAGE_ARCHIVES",
     "OPTIONAL_ROOT_DIRS",
     "PACKAGE_SCHEMA_VERSION",
+    "PROFILE_SPECS",
+    "REQUIRED_ENV_TEMPLATES",
+    "REQUIRED_IMAGE_ARCHIVES",
+    "REQUIRED_PROFILE_FILES",
     "REQUIRED_ROOT_DIRS",
     "REQUIRED_ROOT_FILES",
     "SIGNATURE_FILENAME",
+    "SIGNING_KEY_ENV_VARS",
+    "SIGNING_KEY_PASSWORD_ENV_VARS",
     "TEXT_SCAN_EXTENSIONS",
     "CapsuleArchiveEntry",
     "CapsuleArchiveInfo",
@@ -994,6 +2668,7 @@ __all__ = [
     "PackageResult",
     "PackageValidationError",
     "PackageValidationResult",
+    "build_package",
     "capsule_filename",
     "compress_tar_to_kxcap",
     "create_tar_archive",
@@ -1014,6 +2689,7 @@ __all__ = [
     "sha256_file",
     "utc_now",
     "validate_capsule_archive",
+    "validate_required_image_archives",
     "validate_required_layout",
     "validate_staging_dir",
     "validation_result_to_dict",

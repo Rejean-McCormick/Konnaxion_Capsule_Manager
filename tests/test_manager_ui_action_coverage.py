@@ -60,6 +60,7 @@ REQUIRED_ACTION_LABELS: dict[str, str] = {
     "deploy_local": "Deploy Local",
     "deploy_intranet": "Deploy Intranet",
     "deploy_droplet": "Deploy Droplet",
+    "bootstrap_droplet_agent": "Bootstrap Droplet Agent",
     "check_droplet_agent": "Check Droplet Agent",
     "copy_capsule_to_droplet": "Copy Capsule to Droplet",
     "start_droplet_instance": "Start Droplet Instance",
@@ -111,6 +112,7 @@ REQUIRED_POST_ACTION_ROUTES: dict[str, str] = {
     "deploy_local": "/ui/actions/deploy-local",
     "deploy_intranet": "/ui/actions/deploy-intranet",
     "deploy_droplet": "/ui/actions/deploy-droplet",
+    "bootstrap_droplet_agent": "/ui/actions/bootstrap-droplet-agent",
     "check_droplet_agent": "/ui/actions/check-droplet-agent",
     "copy_capsule_to_droplet": "/ui/actions/copy-capsule-to-droplet",
     "start_droplet_instance": "/ui/actions/start-droplet-instance",
@@ -265,10 +267,19 @@ def test_droplet_actions_exist() -> None:
     assert {
         "set_target_droplet",
         "deploy_droplet",
+        "bootstrap_droplet_agent",
         "check_droplet_agent",
         "copy_capsule_to_droplet",
         "start_droplet_instance",
     } <= set(REQUIRED_ACTION_LABELS)
+
+
+def test_bootstrap_droplet_agent_action_exists() -> None:
+    assert "bootstrap_droplet_agent" in REQUIRED_ACTION_LABELS
+    assert (
+        REQUIRED_POST_ACTION_ROUTES["bootstrap_droplet_agent"]
+        == "/ui/actions/bootstrap-droplet-agent"
+    )
 
 
 def test_deploy_actions_exist() -> None:
@@ -441,6 +452,35 @@ def test_droplet_deploy_requires_host_user_key_remote_root() -> None:
         payload.pop(required_field)
         with pytest.raises(ValueError):
             _validate_payload("deploy_droplet", payload)
+
+
+def test_bootstrap_droplet_agent_requires_host_user_key_remote_root() -> None:
+    base_payload = {
+        "instance_id": "demo-001",
+        "target_mode": "droplet",
+        "network_profile": "public_vps",
+        "exposure_mode": "public",
+        "droplet_host": "203.0.113.10",
+        "droplet_user": "root",
+        "ssh_key_path": r"C:\Users\user\.ssh\id_ed25519",
+        "remote_kx_root": "/opt/konnaxion",
+        "remote_capsule_dir": "/opt/konnaxion/capsules",
+        "domain": "app.example.com",
+        "confirmed": True,
+    }
+
+    assert _validate_payload("bootstrap_droplet_agent", base_payload) is not None
+
+    for required_field in (
+        "droplet_host",
+        "droplet_user",
+        "ssh_key_path",
+        "remote_kx_root",
+    ):
+        payload = dict(base_payload)
+        payload.pop(required_field)
+        with pytest.raises(ValueError):
+            _validate_payload("bootstrap_droplet_agent", payload)
 
 
 def test_command_fallback_uses_shell_false() -> None:

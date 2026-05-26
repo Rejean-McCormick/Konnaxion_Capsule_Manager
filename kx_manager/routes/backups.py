@@ -7,18 +7,29 @@ backup/restore work to the local Konnaxion Agent.
 
 Route summary:
 - GET    /backups
+- GET    /v1/backups
 - GET    /instances/{instance_id}/backups
+- GET    /v1/instances/{instance_id}/backups
 - POST   /instances/{instance_id}/backups
+- POST   /v1/instances/{instance_id}/backups
 - GET    /backups/{backup_id}
+- GET    /v1/backups/{backup_id}
 - POST   /backups/{backup_id}/verify
+- POST   /v1/backups/{backup_id}/verify
+- POST   /backups/verify
+- POST   /v1/backups/verify
+- POST   /backups/test-restore
+- POST   /v1/backups/test-restore
 - POST   /instances/{instance_id}/restore
+- POST   /v1/instances/{instance_id}/restore
 - POST   /instances/restore-new
+- POST   /v1/instances/restore-new
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -38,6 +49,7 @@ class BackupClass(StrEnum):
     """Backup class values used by Manager and Agent."""
 
     MANUAL = "manual"
+    SCHEDULED = "scheduled"
     SCHEDULED_DAILY = "scheduled_daily"
     SCHEDULED_WEEKLY = "scheduled_weekly"
     SCHEDULED_MONTHLY = "scheduled_monthly"
@@ -104,6 +116,17 @@ class BackupVerifyRequest(BaseModel):
         return value.strip()
 
 
+class BackupVerifyByIdRequest(BackupVerifyRequest):
+    """Verify a backup artifact when backup_id arrives in the body."""
+
+    backup_id: str = Field(min_length=1, max_length=160)
+
+    @field_validator("backup_id")
+    @classmethod
+    def strip_backup_id(cls, value: str) -> str:
+        return value.strip()
+
+
 class RestoreRequest(BaseModel):
     """Restore an existing Konnaxion Instance from a backup."""
 
@@ -139,6 +162,23 @@ class RestoreNewRequest(BaseModel):
         "exposure_mode",
         "reason",
     )
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class BackupTestRestoreRequest(BaseModel):
+    """Run a non-destructive test restore for a backup."""
+
+    backup_id: str = Field(min_length=1, max_length=160)
+    instance_id: str = Field(default="", max_length=120)
+    target_instance_id: str = Field(default="", max_length=120)
+    run_migrations: bool = True
+    run_security_gate: bool = True
+    run_healthchecks: bool = True
+    reason: str = Field(default="", max_length=500)
+
+    @field_validator("backup_id", "instance_id", "target_instance_id", "reason")
     @classmethod
     def strip_text(cls, value: str) -> str:
         return value.strip()
@@ -229,6 +269,38 @@ class AgentClient:
     ) -> Any:
         return await self._request("POST", path, json_body=json_body)
 
+    async def first_available(
+        self,
+        attempts: Sequence[tuple[str, str]],
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Mapping[str, Any] | None = None,
+        continue_statuses: frozenset[int] = frozenset({404}),
+    ) -> Any:
+        """Try Agent paths in order and return the first non-continuation response."""
+
+        last_error: HTTPException | None = None
+
+        for method, path in attempts:
+            try:
+                return await self._request(
+                    method,
+                    path,
+                    params=params if method.upper() == "GET" else None,
+                    json_body=json_body if method.upper() != "GET" else None,
+                )
+            except HTTPException as exc:
+                agent_status = _agent_status_from_http_exception(exc)
+                if agent_status in continue_statuses:
+                    last_error = exc
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+
+        raise BackupRouteError("No Agent backup endpoint attempts were configured.")
+
     async def _request(
         self,
         method: str,
@@ -242,10 +314,10 @@ class AgentClient:
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.request(
-                    method,
+                    method.upper(),
                     url,
-                    params=dict(params or {}),
-                    json=dict(json_body or {}),
+                    params=strip_empty(params or {}),
+                    json=strip_empty(json_body or {}) if method.upper() != "GET" else None,
                     headers=self.headers,
                 )
         except httpx.TimeoutException as exc:
@@ -307,6 +379,11 @@ def get_agent_client(
     response_model=list[BackupSummary],
     summary="List backups",
 )
+@router.get(
+    "/v1/backups",
+    response_model=list[BackupSummary],
+    include_in_schema=False,
+)
 async def list_backups(
     instance_id: str | None = Query(default=None, max_length=120),
     status_filter: BackupStatusValue | None = Query(default=None, alias="status"),
@@ -314,25 +391,59 @@ async def list_backups(
     limit: int = Query(default=50, ge=1, le=500),
     agent: AgentClient = Depends(get_agent_client),
 ) -> list[BackupSummary]:
-    """List backups known to the Agent."""
+    """List backups known to the Agent.
 
-    payload = await agent.get(
-        "/backups",
-        params={
-            "instance_id": instance_id or "",
-            "status": status_filter.value if status_filter else "",
-            "backup_class": backup_class.value if backup_class else "",
-            "limit": limit,
-        },
+    Some staged Agent builds do not expose backup list routes yet. In that case
+    the Manager returns an empty list instead of surfacing a raw 404 into the UI.
+    """
+
+    if instance_id:
+        assert_safe_identifier(instance_id, field_name="instance_id")
+
+    params = {
+        "instance_id": instance_id or "",
+        "status": status_filter.value if status_filter else "",
+        "backup_class": normalize_backup_class(backup_class.value if backup_class else ""),
+        "limit": limit,
+    }
+
+    attempts: list[tuple[str, str]] = []
+
+    if instance_id:
+        quoted_instance = quote_identifier(instance_id)
+        attempts.extend(
+            [
+                ("GET", f"/instances/{quoted_instance}/backups"),
+                ("GET", f"/v1/instances/{quoted_instance}/backups"),
+            ]
+        )
+
+    attempts.extend(
+        [
+            ("GET", "/backups"),
+            ("GET", "/v1/backups"),
+        ]
     )
 
-    return [BackupSummary(**item) for item in as_list(payload)]
+    try:
+        payload = await agent.first_available(attempts, params=params)
+    except HTTPException as exc:
+        if _agent_status_from_http_exception(exc) == 404:
+            return []
+        raise
+
+    return [BackupSummary(**normalize_backup_summary(item)) for item in as_list(payload)]
 
 
 @router.get(
     "/instances/{instance_id}/backups",
     response_model=list[BackupSummary],
     summary="List backups for an instance",
+)
+@router.get(
+    "/v1/instances/{instance_id}/backups",
+    response_model=list[BackupSummary],
+    include_in_schema=False,
 )
 async def list_instance_backups(
     instance_id: str,
@@ -345,16 +456,13 @@ async def list_instance_backups(
 
     assert_safe_identifier(instance_id, field_name="instance_id")
 
-    payload = await agent.get(
-        f"/instances/{instance_id}/backups",
-        params={
-            "status": status_filter.value if status_filter else "",
-            "backup_class": backup_class.value if backup_class else "",
-            "limit": limit,
-        },
+    return await list_backups(
+        instance_id=instance_id,
+        status_filter=status_filter,
+        backup_class=backup_class,
+        limit=limit,
+        agent=agent,
     )
-
-    return [BackupSummary(**item) for item in as_list(payload)]
 
 
 @router.post(
@@ -362,6 +470,12 @@ async def list_instance_backups(
     response_model=BackupOperationResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Create backup",
+)
+@router.post(
+    "/v1/instances/{instance_id}/backups",
+    response_model=BackupOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
 )
 async def create_backup(
     instance_id: str,
@@ -372,18 +486,38 @@ async def create_backup(
 
     assert_safe_identifier(instance_id, field_name="instance_id")
 
-    payload = await agent.post(
-        f"/instances/{instance_id}/backups",
-        json_body=request.model_dump(mode="json"),
+    body = request.model_dump(mode="json")
+    body["backup_class"] = normalize_backup_class(body.get("backup_class"))
+    body["instance_id"] = instance_id
+
+    payload = await agent.first_available(
+        (
+            ("POST", "/instances/backup"),
+            ("POST", "/v1/instances/backup"),
+            ("POST", f"/instances/{quote_identifier(instance_id)}/backups"),
+            ("POST", f"/v1/instances/{quote_identifier(instance_id)}/backups"),
+        ),
+        json_body=body,
     )
 
-    return BackupOperationResponse(**as_mapping(payload, default_operation="backup"))
+    return BackupOperationResponse(
+        **normalize_operation_response(
+            payload,
+            default_operation="backup",
+            default_instance_id=instance_id,
+        )
+    )
 
 
 @router.get(
     "/backups/{backup_id}",
     response_model=BackupDetail,
     summary="Get backup detail",
+)
+@router.get(
+    "/v1/backups/{backup_id}",
+    response_model=BackupDetail,
+    include_in_schema=False,
 )
 async def get_backup(
     backup_id: str,
@@ -393,9 +527,14 @@ async def get_backup(
 
     assert_safe_identifier(backup_id, field_name="backup_id")
 
-    payload = await agent.get(f"/backups/{backup_id}")
+    payload = await agent.first_available(
+        (
+            ("GET", f"/backups/{quote_identifier(backup_id)}"),
+            ("GET", f"/v1/backups/{quote_identifier(backup_id)}"),
+        )
+    )
 
-    return BackupDetail(**as_mapping(payload))
+    return BackupDetail(**normalize_backup_detail(as_mapping(payload)))
 
 
 @router.post(
@@ -403,6 +542,12 @@ async def get_backup(
     response_model=BackupOperationResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Verify backup",
+)
+@router.post(
+    "/v1/backups/{backup_id}/verify",
+    response_model=BackupOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
 )
 async def verify_backup(
     backup_id: str,
@@ -413,14 +558,104 @@ async def verify_backup(
 
     assert_safe_identifier(backup_id, field_name="backup_id")
 
-    payload = await agent.post(
-        f"/backups/{backup_id}/verify",
-        json_body=request.model_dump(mode="json"),
+    body = request.model_dump(mode="json")
+    body["backup_id"] = backup_id
+
+    payload = await agent.first_available(
+        (
+            ("POST", f"/backups/{quote_identifier(backup_id)}/verify"),
+            ("POST", f"/v1/backups/{quote_identifier(backup_id)}/verify"),
+            ("POST", "/backups/verify"),
+            ("POST", "/v1/backups/verify"),
+        ),
+        json_body=body,
     )
 
     return BackupOperationResponse(
-        **as_mapping(payload, default_operation="backup_verify")
+        **normalize_operation_response(
+            payload,
+            default_operation="backup_verify",
+            default_backup_id=backup_id,
+        )
     )
+
+
+@router.post(
+    "/backups/verify",
+    response_model=BackupOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
+)
+@router.post(
+    "/v1/backups/verify",
+    response_model=BackupOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
+)
+async def verify_backup_from_body(
+    request: BackupVerifyByIdRequest,
+    agent: AgentClient = Depends(get_agent_client),
+) -> BackupOperationResponse:
+    """Compatibility route used by GUI action dispatcher."""
+
+    return await verify_backup(
+        backup_id=request.backup_id,
+        request=BackupVerifyRequest(
+            deep=request.deep,
+            reason=request.reason,
+        ),
+        agent=agent,
+    )
+
+
+@router.post(
+    "/backups/test-restore",
+    response_model=RestoreOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Test restore backup",
+)
+@router.post(
+    "/v1/backups/test-restore",
+    response_model=RestoreOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
+)
+async def test_restore_backup(
+    request: BackupTestRestoreRequest,
+    agent: AgentClient = Depends(get_agent_client),
+) -> RestoreOperationResponse:
+    """Request a non-destructive test restore through the local Agent."""
+
+    assert_safe_identifier(request.backup_id, field_name="backup_id")
+
+    if request.instance_id:
+        assert_safe_identifier(request.instance_id, field_name="instance_id")
+
+    if request.target_instance_id:
+        assert_safe_identifier(request.target_instance_id, field_name="target_instance_id")
+
+    body = request.model_dump(mode="json")
+    body["test_only"] = True
+
+    payload = await agent.first_available(
+        (
+            ("POST", "/backups/test-restore"),
+            ("POST", "/v1/backups/test-restore"),
+            ("POST", "/instances/restore-new"),
+            ("POST", "/v1/instances/restore-new"),
+        ),
+        json_body=body,
+    )
+
+    data = normalize_restore_response(
+        payload,
+        default_operation="test_restore",
+        default_source_backup_id=request.backup_id,
+        default_instance_id=request.instance_id,
+        default_new_instance_id=request.target_instance_id,
+    )
+
+    return RestoreOperationResponse(**data)
 
 
 @router.post(
@@ -428,6 +663,12 @@ async def verify_backup(
     response_model=RestoreOperationResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Restore instance from backup",
+)
+@router.post(
+    "/v1/instances/{instance_id}/restore",
+    response_model=RestoreOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
 )
 async def restore_instance(
     instance_id: str,
@@ -439,14 +680,25 @@ async def restore_instance(
     assert_safe_identifier(instance_id, field_name="instance_id")
     assert_safe_identifier(request.backup_id, field_name="backup_id")
 
-    payload = await agent.post(
-        f"/instances/{instance_id}/restore",
-        json_body=request.model_dump(mode="json"),
+    body = request.model_dump(mode="json")
+    body["instance_id"] = instance_id
+
+    payload = await agent.first_available(
+        (
+            ("POST", "/instances/restore"),
+            ("POST", "/v1/instances/restore"),
+            ("POST", f"/instances/{quote_identifier(instance_id)}/restore"),
+            ("POST", f"/v1/instances/{quote_identifier(instance_id)}/restore"),
+        ),
+        json_body=body,
     )
 
-    data = as_mapping(payload, default_operation="restore")
-    data.setdefault("source_backup_id", request.backup_id)
-    data.setdefault("instance_id", instance_id)
+    data = normalize_restore_response(
+        payload,
+        default_operation="restore",
+        default_source_backup_id=request.backup_id,
+        default_instance_id=instance_id,
+    )
 
     return RestoreOperationResponse(**data)
 
@@ -457,6 +709,12 @@ async def restore_instance(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Restore backup into a new instance",
 )
+@router.post(
+    "/v1/instances/restore-new",
+    response_model=RestoreOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
+)
 async def restore_new_instance(
     request: RestoreNewRequest,
     agent: AgentClient = Depends(get_agent_client),
@@ -466,14 +724,23 @@ async def restore_new_instance(
     assert_safe_identifier(request.backup_id, field_name="backup_id")
     assert_safe_identifier(request.new_instance_id, field_name="new_instance_id")
 
-    payload = await agent.post(
-        "/instances/restore-new",
-        json_body=request.model_dump(mode="json"),
+    body = request.model_dump(mode="json")
+    body["source_backup_id"] = request.backup_id
+
+    payload = await agent.first_available(
+        (
+            ("POST", "/instances/restore-new"),
+            ("POST", "/v1/instances/restore-new"),
+        ),
+        json_body=body,
     )
 
-    data = as_mapping(payload, default_operation="restore_new")
-    data.setdefault("source_backup_id", request.backup_id)
-    data.setdefault("new_instance_id", request.new_instance_id)
+    data = normalize_restore_response(
+        payload,
+        default_operation="restore_new",
+        default_source_backup_id=request.backup_id,
+        default_new_instance_id=request.new_instance_id,
+    )
 
     return RestoreOperationResponse(**data)
 
@@ -485,10 +752,20 @@ def as_list(payload: Any) -> list[Mapping[str, Any]]:
         return [as_mapping(item) for item in payload]
 
     if isinstance(payload, dict):
-        for key in ("backups", "items", "results", "data"):
+        for key in ("backups", "items", "results"):
             value = payload.get(key)
             if isinstance(value, list):
                 return [as_mapping(item) for item in value]
+
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [as_mapping(item) for item in data]
+
+        if isinstance(data, dict):
+            for key in ("backups", "items", "results"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [as_mapping(item) for item in value]
 
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
@@ -517,6 +794,99 @@ def as_mapping(payload: Any, *, default_operation: str = "") -> dict[str, Any]:
 
     if default_operation:
         data.setdefault("operation", default_operation)
+
+    return data
+
+
+def normalize_backup_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize backup summary fields from Agent variants."""
+
+    data = dict(payload)
+
+    if isinstance(data.get("data"), Mapping):
+        nested = dict(data["data"])
+        for key, value in nested.items():
+            data.setdefault(key, value)
+
+    data.setdefault("backup_id", str(data.get("id") or data.get("backup") or ""))
+    data.setdefault("instance_id", str(data.get("instance") or ""))
+    data.setdefault("backup_class", str(data.get("class") or data.get("type") or "manual"))
+    data.setdefault("status", str(data.get("state") or "created"))
+    data.setdefault("created_at", "")
+    data.setdefault("completed_at", "")
+    data.setdefault("verified", bool(data.get("verified_at") or data.get("verified", False)))
+    data.setdefault("label", "")
+    data.setdefault("path", str(data.get("display_path") or data.get("root_dir") or ""))
+
+    return data
+
+
+def normalize_backup_detail(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize backup detail fields from Agent variants."""
+
+    data = normalize_backup_summary(payload)
+    data.setdefault("manifest", {})
+    data.setdefault("verification", {})
+    return data
+
+
+def normalize_operation_response(
+    payload: Any,
+    *,
+    default_operation: str,
+    default_instance_id: str = "",
+    default_backup_id: str = "",
+) -> dict[str, Any]:
+    """Normalize Agent action response into BackupOperationResponse shape."""
+
+    data = as_mapping(payload, default_operation=default_operation)
+
+    nested = data.get("data")
+    if isinstance(nested, Mapping):
+        nested_data = dict(nested)
+        for key, value in nested_data.items():
+            data.setdefault(key, value)
+
+    data.setdefault("ok", bool(data.get("success", True)))
+    data.setdefault("operation", data.get("action") or default_operation)
+    data.setdefault("instance_id", default_instance_id)
+    data.setdefault("backup_id", default_backup_id or str(data.get("id") or ""))
+    data.setdefault("status", str(data.get("state") or data.get("backup_status") or ""))
+    data.setdefault("message", "Backup operation accepted.")
+    data.setdefault("data", nested if isinstance(nested, Mapping) else {})
+
+    return data
+
+
+def normalize_restore_response(
+    payload: Any,
+    *,
+    default_operation: str,
+    default_source_backup_id: str,
+    default_instance_id: str = "",
+    default_new_instance_id: str = "",
+) -> dict[str, Any]:
+    """Normalize Agent action response into RestoreOperationResponse shape."""
+
+    data = as_mapping(payload, default_operation=default_operation)
+
+    nested = data.get("data")
+    if isinstance(nested, Mapping):
+        nested_data = dict(nested)
+        for key, value in nested_data.items():
+            data.setdefault(key, value)
+
+    data.setdefault("ok", bool(data.get("success", True)))
+    data.setdefault("operation", data.get("action") or default_operation)
+    data.setdefault(
+        "source_backup_id",
+        str(data.get("source_backup_id") or data.get("backup_id") or default_source_backup_id),
+    )
+    data.setdefault("instance_id", default_instance_id)
+    data.setdefault("new_instance_id", default_new_instance_id)
+    data.setdefault("status", str(data.get("state") or data.get("restore_status") or ""))
+    data.setdefault("message", "Restore operation accepted.")
+    data.setdefault("data", nested if isinstance(nested, Mapping) else {})
 
     return data
 
@@ -596,7 +966,7 @@ def assert_safe_identifier(value: str, *, field_name: str) -> None:
             },
         )
 
-    forbidden_tokens = ("..", "/", "\\", "$", "`", ";", "|", "&", "\\x00")
+    forbidden_tokens = ("..", "/", "\\", "$", "`", ";", "|", "&", "\x00", "\\x00")
 
     if any(token in value for token in forbidden_tokens):
         raise HTTPException(
@@ -608,3 +978,84 @@ def assert_safe_identifier(value: str, *, field_name: str) -> None:
                 "message": f"{field_name} contains a forbidden token.",
             },
         )
+
+
+def quote_identifier(value: str) -> str:
+    """Return a safe URL-path identifier after validation."""
+
+    assert_safe_identifier(value, field_name="identifier")
+    return value
+
+
+def normalize_backup_class(value: Any) -> str:
+    """Normalize Manager backup class variants to Agent-compatible values."""
+
+    raw = str(getattr(value, "value", value) or "").strip()
+
+    aliases = {
+        "scheduled_daily": "scheduled",
+        "scheduled_weekly": "scheduled",
+        "scheduled_monthly": "scheduled",
+    }
+
+    return aliases.get(raw, raw)
+
+
+def strip_empty(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove None and empty string values before sending JSON/query data."""
+
+    return {key: value for key, value in payload.items() if value is not None and value != ""}
+
+
+def _agent_status_from_http_exception(exc: HTTPException) -> int | None:
+    detail = exc.detail
+
+    if isinstance(detail, Mapping):
+        agent_status = detail.get("agent_status_code")
+        if isinstance(agent_status, int):
+            return agent_status
+
+    return exc.status_code
+
+
+__all__ = [
+    "AgentClient",
+    "AgentErrorResponse",
+    "BackupClass",
+    "BackupCreateRequest",
+    "BackupDetail",
+    "BackupOperationResponse",
+    "BackupRouteError",
+    "BackupStatusValue",
+    "BackupSummary",
+    "BackupTestRestoreRequest",
+    "BackupVerifyByIdRequest",
+    "BackupVerifyRequest",
+    "RestoreNewRequest",
+    "RestoreOperationResponse",
+    "RestoreRequest",
+    "RestoreStatusValue",
+    "as_list",
+    "as_mapping",
+    "assert_safe_identifier",
+    "create_backup",
+    "get_agent_client",
+    "get_backup",
+    "get_manager_config",
+    "http_exception_from_agent_response",
+    "list_backups",
+    "list_instance_backups",
+    "normalize_backup_class",
+    "normalize_backup_detail",
+    "normalize_backup_summary",
+    "normalize_operation_response",
+    "normalize_restore_response",
+    "quote_identifier",
+    "restore_instance",
+    "restore_new_instance",
+    "router",
+    "strip_empty",
+    "test_restore_backup",
+    "verify_backup",
+    "verify_backup_from_body",
+]

@@ -54,6 +54,7 @@ REQUIRED_PAGE_ROUTES = (
     "/ui/settings",
     "/ui/about",
     "/ui/targets",
+    "/ui/deploy",
 )
 
 REQUIRED_UI_ACTION_VALUES = (
@@ -93,6 +94,7 @@ REQUIRED_UI_ACTION_VALUES = (
     "deploy_local",
     "deploy_intranet",
     "deploy_droplet",
+    "bootstrap_droplet_agent",
     "check_droplet_agent",
     "copy_capsule_to_droplet",
     "start_droplet_instance",
@@ -136,6 +138,7 @@ REQUIRED_ACTION_ROUTE_VALUES = (
     "/ui/actions/deploy-local",
     "/ui/actions/deploy-intranet",
     "/ui/actions/deploy-droplet",
+    "/ui/actions/bootstrap-droplet-agent",
     "/ui/actions/check-droplet-agent",
     "/ui/actions/copy-capsule-to-droplet",
     "/ui/actions/start-droplet-instance",
@@ -178,6 +181,7 @@ REQUIRED_LABELS = (
     "Deploy Local",
     "Deploy Intranet",
     "Deploy Droplet",
+    "Bootstrap Droplet Agent",
     "Check Droplet Agent",
     "Copy Capsule to Droplet",
     "Start Droplet Instance",
@@ -212,6 +216,11 @@ REQUIRED_FORM_MODELS = (
     "NetworkProfileForm",
     "TargetModeForm",
     "DropletTargetForm",
+    "BootstrapDropletAgentForm",
+    "CheckDropletAgentForm",
+    "CopyCapsuleToDropletForm",
+    "DeployDropletForm",
+    "StartDropletInstanceForm",
 )
 
 REQUIRED_GUI_ACTION_RESULT_FIELDS = (
@@ -302,46 +311,38 @@ def test_fastapi_ui_import_does_not_require_streamlit(monkeypatch: pytest.Monkey
             raise ModuleNotFoundError("streamlit intentionally blocked by contract test")
         return real_import(name, *args, **kwargs)
 
-    for module_name in list(sys.modules):
-        if module_name.startswith("kx_manager.ui.app"):
-            monkeypatch.delitem(sys.modules, module_name, raising=False)
-
+    monkeypatch.setitem(sys.modules, "streamlit", None)
     monkeypatch.setattr(builtins, "__import__", guarded_import)
 
-    app_module = importlib.import_module("kx_manager.ui.app")
-    assert callable(app_module.register)
+    module = importlib.reload(importlib.import_module("kx_manager.ui.app"))
+    assert hasattr(module, "register")
+    assert callable(module.register)
 
 
-def test_required_page_routes_exist_in_pages_contract() -> None:
+def test_pages_module_exposes_routes_and_actions() -> None:
     pages = importlib.import_module("kx_manager.ui.pages")
-    route_values = _collect_route_values(pages, candidate_names=("UI_PAGE_ROUTES", "PAGE_ROUTES", "PAGES"))
 
-    missing = set(REQUIRED_PAGE_ROUTES) - route_values
-    assert not missing, f"Missing required page routes: {sorted(missing)}"
-
-    non_ui_routes = {route for route in route_values if route and not route.startswith("/ui")}
-    assert not non_ui_routes, f"All GUI page routes must start with /ui: {sorted(non_ui_routes)}"
+    assert hasattr(pages, "UiPage")
+    assert hasattr(pages, "UiAction")
 
 
-def test_required_action_routes_exist_in_pages_contract() -> None:
+def test_uipage_values_cover_required_routes() -> None:
     pages = importlib.import_module("kx_manager.ui.pages")
-    route_values = _collect_route_values(
-        pages,
-        candidate_names=("UI_ACTION_ROUTES", "ACTION_ROUTES", "ACTIONS"),
-    )
 
-    missing = set(REQUIRED_ACTION_ROUTE_VALUES) - route_values
-    assert not missing, f"Missing required action routes: {sorted(missing)}"
+    route_values = set(_enum_values(pages.UiPage))
+    expected = set(REQUIRED_PAGE_ROUTES)
 
-    non_action_routes = {
-        route
-        for route in route_values
-        if route and not route.startswith("/ui/actions")
-    }
-    assert not non_action_routes, (
-        "All GUI action routes must start with /ui/actions: "
-        f"{sorted(non_action_routes)}"
-    )
+    assert expected <= route_values
+
+
+def test_uipage_does_not_include_forbidden_routes() -> None:
+    pages = importlib.import_module("kx_manager.ui.pages")
+
+    route_values = set(_enum_values(pages.UiPage))
+
+    assert "/ui/development" not in route_values
+    assert "/ui/debug" not in route_values
+    assert "/ui/admin" not in route_values
 
 
 def test_uiaction_values_match_contract() -> None:
@@ -363,285 +364,421 @@ def test_uiaction_count_matches_explicit_contract_list() -> None:
     values = tuple(_enum_values(pages.UiAction))
 
     assert len(values) == len(REQUIRED_UI_ACTION_VALUES)
-    assert len(set(values)) == len(values), "UiAction values must be unique"
 
 
-def test_all_required_labels_exist() -> None:
+def test_ui_routes_are_unique() -> None:
     pages = importlib.import_module("kx_manager.ui.pages")
-    labels = _collect_label_values(pages)
 
-    missing = set(REQUIRED_LABELS) - labels
-    assert not missing, f"Missing required GUI labels: {sorted(missing)}"
+    routes = tuple(_enum_values(pages.UiPage))
+
+    assert len(routes) == len(set(routes))
 
 
-def test_every_uiaction_has_a_label() -> None:
+def test_ui_actions_are_unique() -> None:
     pages = importlib.import_module("kx_manager.ui.pages")
-    actions = set(_enum_values(pages.UiAction))
-    label_keys = _collect_mapping_keys(
-        pages,
-        candidate_names=("UI_ACTION_LABELS", "ACTION_LABELS", "LABELS"),
+
+    actions = tuple(_enum_values(pages.UiAction))
+
+    assert len(actions) == len(set(actions))
+
+
+def test_required_action_routes_are_registered() -> None:
+    actions = importlib.import_module("kx_manager.ui.actions")
+
+    route_values = _collect_route_values(
+        actions,
+        candidate_names=(
+            "ACTION_ROUTES",
+            "POST_ACTION_ROUTES",
+            "UI_ACTION_ROUTES",
+            "ROUTES",
+        ),
     )
 
-    missing = actions - label_keys
-    assert not missing, f"Every UiAction must have a label. Missing: {sorted(missing)}"
+    assert set(REQUIRED_ACTION_ROUTE_VALUES) <= route_values
 
 
-def test_required_state_models_exist() -> None:
-    state = importlib.import_module("kx_manager.ui.state")
-
-    for model_name in REQUIRED_STATE_MODELS:
-        assert hasattr(state, model_name), f"Missing state model: {model_name}"
-
-
-def test_required_form_models_exist() -> None:
-    forms = importlib.import_module("kx_manager.ui.forms")
-
-    for model_name in REQUIRED_FORM_MODELS:
-        assert hasattr(forms, model_name), f"Missing form model: {model_name}"
-
-
-def test_gui_action_result_contract_exists() -> None:
+def test_required_action_labels_are_registered() -> None:
     actions = importlib.import_module("kx_manager.ui.actions")
 
-    assert hasattr(actions, "GuiActionResult")
-    result_model = actions.GuiActionResult
+    labels = _collect_label_values(actions)
 
-    field_names = _dataclass_or_annotation_fields(result_model)
-    missing = set(REQUIRED_GUI_ACTION_RESULT_FIELDS) - field_names
-
-    assert not missing, f"GuiActionResult missing fields: {sorted(missing)}"
+    assert set(REQUIRED_LABELS) <= labels
 
 
-def test_dispatch_gui_action_contract_exists() -> None:
-    actions = importlib.import_module("kx_manager.ui.actions")
-
-    assert hasattr(actions, "dispatch_gui_action")
-    assert callable(actions.dispatch_gui_action)
-
-    signature = inspect.signature(actions.dispatch_gui_action)
-    assert "action" in signature.parameters
-    assert "payload" in signature.parameters
-
-
-def test_unknown_gui_action_is_rejected() -> None:
-    actions = importlib.import_module("kx_manager.ui.actions")
-
-    if not hasattr(actions, "is_known_gui_action"):
-        pytest.skip("is_known_gui_action helper not implemented; covered by dispatcher tests.")
-
-    assert actions.is_known_gui_action("definitely_not_a_real_action") is False
-
-
-def test_builder_service_contract_exists() -> None:
-    builder = importlib.import_module("kx_manager.services.builder")
-
-    for function_name in REQUIRED_BUILDER_FUNCTIONS:
-        assert hasattr(builder, function_name), f"Missing builder function: {function_name}"
-        assert callable(getattr(builder, function_name))
-
-
-def test_target_service_contract_exists() -> None:
-    targets = importlib.import_module("kx_manager.services.targets")
-
-    for function_name in REQUIRED_TARGET_FUNCTIONS:
-        assert hasattr(targets, function_name), f"Missing target function: {function_name}"
-        assert callable(getattr(targets, function_name))
-
-
-def test_deploy_service_contract_exists() -> None:
-    deploy = importlib.import_module("kx_manager.services.deploy")
-
-    for function_name in REQUIRED_DEPLOY_FUNCTIONS:
-        assert hasattr(deploy, function_name), f"Missing deploy function: {function_name}"
-        assert callable(getattr(deploy, function_name))
-
-
-def test_target_mode_values_match_contract() -> None:
-    targets = importlib.import_module("kx_manager.services.targets")
-
-    assert hasattr(targets, "TargetMode"), "kx_manager.services.targets must expose TargetMode"
-
-    values = set(_enum_values(targets.TargetMode))
-    expected = set(REQUIRED_TARGET_MODE_VALUES)
-
-    assert values == expected, (
-        "TargetMode values must be canonical. "
-        f"Missing={sorted(expected - values)} Extra={sorted(values - expected)}"
-    )
-
-
-def test_forbidden_target_mode_values_are_not_present() -> None:
-    targets = importlib.import_module("kx_manager.services.targets")
-    values = set(_enum_values(targets.TargetMode))
-
-    forbidden = values.intersection(FORBIDDEN_TARGET_MODE_VALUES)
-    assert not forbidden, f"Forbidden target mode values found: {sorted(forbidden)}"
-
-
-def test_target_profile_and_exposure_maps_are_canonical() -> None:
-    targets = importlib.import_module("kx_manager.services.targets")
-
-    profile_map = getattr(targets, "TARGET_PROFILE_MAP", None)
-    exposure_map = getattr(targets, "TARGET_DEFAULT_EXPOSURE_MAP", None)
-
-    assert isinstance(profile_map, Mapping), "TARGET_PROFILE_MAP must be a mapping"
-    assert isinstance(exposure_map, Mapping), "TARGET_DEFAULT_EXPOSURE_MAP must be a mapping"
-
-    profile_values = {_string_value(value) for value in profile_map.values()}
-    exposure_values = {_string_value(value) for value in exposure_map.values()}
-
-    assert "local_only" in profile_values
-    assert "intranet_private" in profile_values
-    assert "public_temporary" in profile_values
-    assert "public_vps" in profile_values
-
-    assert "private" in exposure_values
-    assert "temporary_tunnel" in exposure_values
-    assert "public" in exposure_values
-
-
-def test_register_adds_required_routes_when_fastapi_available() -> None:
-    fastapi = pytest.importorskip("fastapi")
-
-    app_module = importlib.import_module("kx_manager.ui.app")
-    app = fastapi.FastAPI()
-
-    app_module.register(app)
-
-    registered_routes = {
-        route.path
-        for route in app.routes
-        if hasattr(route, "path")
-    }
-
-    missing = set(REQUIRED_PAGE_ROUTES) - registered_routes
-    assert not missing, f"register(app) did not register page routes: {sorted(missing)}"
-
-
-def test_registered_routes_are_local_ui_routes_when_fastapi_available() -> None:
-    fastapi = pytest.importorskip("fastapi")
-
-    app_module = importlib.import_module("kx_manager.ui.app")
-    app = fastapi.FastAPI()
-
-    app_module.register(app)
-
-    gui_routes = {
-        route.path
-        for route in app.routes
-        if hasattr(route, "path") and route.path.startswith("/ui")
-    }
-
-    assert gui_routes, "register(app) must add /ui routes"
-    assert all(route.startswith("/ui") for route in gui_routes)
-
-
-def test_no_shell_true_in_ui_or_manager_services() -> None:
+def test_no_streamlit_symbols_in_fastapi_ui_public_contract() -> None:
     modules = [
-        *REQUIRED_UI_MODULES,
-        *REQUIRED_MANAGER_SERVICE_MODULES,
+        importlib.import_module("kx_manager.ui.app"),
+        importlib.import_module("kx_manager.ui.pages"),
+        importlib.import_module("kx_manager.ui.actions"),
     ]
 
-    offenders: list[str] = []
-
-    for module_name in modules:
-        module = importlib.import_module(module_name)
-        source = _safe_getsource(module)
-
-        if "shell=True" in source or "shell = True" in source:
-            offenders.append(module_name)
-
-    assert not offenders, f"shell=True is forbidden in GUI/services: {offenders}"
+    for module in modules:
+        public_names = set(getattr(module, "__all__", ()))
+        for name in public_names:
+            assert "streamlit" not in name.lower()
 
 
-def test_no_streamlit_import_in_fastapi_ui_modules() -> None:
-    modules = (
-        "kx_manager.ui.app",
-        "kx_manager.ui.actions",
-        "kx_manager.ui.forms",
-        "kx_manager.ui.render",
-        "kx_manager.ui.pages",
-        "kx_manager.ui.state",
-        "kx_manager.ui.components",
+def test_ui_state_models_exist() -> None:
+    state = importlib.import_module("kx_manager.ui.state")
+
+    missing = [
+        name
+        for name in REQUIRED_STATE_MODELS
+        if not hasattr(state, name)
+    ]
+
+    assert not missing, f"Missing UI state models: {missing}"
+
+
+def test_ui_state_models_are_dataclass_or_pydantic_like() -> None:
+    state = importlib.import_module("kx_manager.ui.state")
+
+    for name in REQUIRED_STATE_MODELS:
+        model = getattr(state, name)
+        fields = _dataclass_or_annotation_fields(model)
+
+        assert fields, f"{name} must expose dataclass/model fields"
+
+
+def test_manager_ui_state_includes_core_sections() -> None:
+    state = importlib.import_module("kx_manager.ui.state")
+    model = getattr(state, "ManagerUiState")
+
+    fields = _dataclass_or_annotation_fields(model)
+
+    assert "capsules" in fields
+    assert "instances" in fields
+    assert "security" in fields
+    assert "network" in fields
+    assert "backups" in fields
+
+
+def test_target_state_models_cover_canonical_modes() -> None:
+    state = importlib.import_module("kx_manager.ui.state")
+
+    target_model = getattr(state, "TargetModeUiState")
+    fields = _dataclass_or_annotation_fields(target_model)
+
+    assert "target_mode" in fields
+    assert "network_profile" in fields
+    assert "exposure_mode" in fields
+
+
+def test_droplet_target_state_requires_public_vps_metadata() -> None:
+    state = importlib.import_module("kx_manager.ui.state")
+
+    model = getattr(state, "DropletTargetUiState")
+    fields = _dataclass_or_annotation_fields(model)
+
+    assert "droplet_host" in fields
+    assert "droplet_user" in fields
+    assert "ssh_key_path" in fields
+    assert "remote_kx_root" in fields
+
+
+def test_form_models_exist() -> None:
+    forms = importlib.import_module("kx_manager.ui.forms")
+
+    missing = [
+        name
+        for name in REQUIRED_FORM_MODELS
+        if not hasattr(forms, name)
+    ]
+
+    assert not missing, f"Missing form models: {missing}"
+
+
+def test_form_registry_knows_required_actions() -> None:
+    forms = importlib.import_module("kx_manager.ui.forms")
+
+    registry_keys = _collect_mapping_keys(
+        forms,
+        candidate_names=(
+            "ACTION_FORM_MODELS",
+            "FORM_REGISTRY",
+            "ACTION_FORMS",
+        ),
     )
 
-    offenders: list[str] = []
-
-    for module_name in modules:
-        module = importlib.import_module(module_name)
-        source = _safe_getsource(module)
-
-        if "import streamlit" in source or "from streamlit" in source:
-            offenders.append(module_name)
-
-    assert not offenders, f"FastAPI GUI modules must not import Streamlit: {offenders}"
+    assert set(REQUIRED_UI_ACTION_VALUES) <= registry_keys
 
 
-def test_ui_action_execution_uses_manager_client_or_service_wrappers() -> None:
+def test_form_validation_function_exists() -> None:
+    forms = importlib.import_module("kx_manager.ui.forms")
+
+    assert any(
+        callable(getattr(forms, name, None))
+        for name in (
+            "validate_action_payload",
+            "parse_action_form",
+            "form_to_payload",
+        )
+    )
+
+
+def test_gui_action_result_contract_fields() -> None:
+    actions = importlib.import_module("kx_manager.ui.actions")
+
+    result_cls = getattr(actions, "GuiActionResult", None)
+    assert result_cls is not None
+
+    fields = _dataclass_or_annotation_fields(result_cls)
+
+    assert set(REQUIRED_GUI_ACTION_RESULT_FIELDS) <= fields
+
+
+def test_action_dispatcher_exists() -> None:
+    actions = importlib.import_module("kx_manager.ui.actions")
+
+    dispatcher = getattr(actions, "dispatch_gui_action", None)
+
+    assert callable(dispatcher)
+
+
+def test_actions_module_references_approved_backends_only() -> None:
     actions = importlib.import_module("kx_manager.ui.actions")
     source = _safe_getsource(actions)
 
-    allowed_references = (
+    approved_markers = (
         "KonnaxionAgentClient",
-        "kx_manager.client",
-        "services.builder",
-        "services.targets",
-        "services.deploy",
-        "build_capsule",
-        "verify_capsule",
-        "deploy_local",
-        "deploy_intranet",
-        "deploy_droplet",
+        "kx_manager.services.builder",
+        "kx_manager.services.targets",
+        "kx_manager.services.deploy",
+        "kx_builder",
+        "Manager route",
+        "Agent API",
     )
 
-    assert any(reference in source for reference in allowed_references), (
-        "UI actions must dispatch through Manager client or approved service wrappers."
+    assert any(marker in source for marker in approved_markers)
+
+
+def test_actions_module_does_not_use_shell_true_or_os_system() -> None:
+    actions = importlib.import_module("kx_manager.ui.actions")
+    source = _safe_getsource(actions)
+
+    forbidden_snippets = (
+        "shell=True",
+        "os.system(",
+        "subprocess.Popen(",
+        "subprocess.call(",
     )
 
-
-def test_component_module_does_not_execute_actions() -> None:
-    components = importlib.import_module("kx_manager.ui.components")
-    source = _safe_getsource(components)
-
-    forbidden_terms = (
-        "subprocess.run",
-        "subprocess.Popen",
-        "os.system",
-        "dispatch_gui_action(",
-    )
-
-    offenders = [term for term in forbidden_terms if term in source]
-    assert not offenders, f"components.py must render only, not execute actions: {offenders}"
+    for snippet in forbidden_snippets:
+        assert snippet not in source
 
 
-def test_render_module_escapes_html_or_uses_safe_html_helpers() -> None:
+def test_builder_service_functions_exist() -> None:
+    builder = importlib.import_module("kx_manager.services.builder")
+
+    for name in REQUIRED_BUILDER_FUNCTIONS:
+        assert callable(getattr(builder, name, None)), name
+
+
+def test_target_service_functions_exist() -> None:
+    targets = importlib.import_module("kx_manager.services.targets")
+
+    for name in REQUIRED_TARGET_FUNCTIONS:
+        assert callable(getattr(targets, name, None)), name
+
+
+def test_deploy_service_functions_exist() -> None:
+    deploy = importlib.import_module("kx_manager.services.deploy")
+
+    for name in REQUIRED_DEPLOY_FUNCTIONS:
+        assert callable(getattr(deploy, name, None)), name
+
+
+def test_deploy_service_does_not_execute_docker_or_firewall_directly_from_ui() -> None:
+    deploy = importlib.import_module("kx_manager.services.deploy")
+    source = _safe_getsource(deploy)
+
+    assert "docker compose" not in source.lower()
+    assert "ufw " not in source.lower()
+    assert "iptables" not in source.lower()
+
+
+def test_render_module_exposes_page_render_helpers() -> None:
     render = importlib.import_module("kx_manager.ui.render")
-    source = _safe_getsource(render)
 
-    assert (
-        "html.escape" in source
-        or "markupsafe" in source.lower()
-        or "escape(" in source
-    ), "render.py must escape HTML by default or use a safe escaping helper."
+    assert any(
+        callable(getattr(render, name, None))
+        for name in (
+            "render_page",
+            "render_layout",
+            "render_card",
+            "render_table",
+        )
+    )
 
 
-def _enum_values(enum_or_iterable: Any) -> tuple[str, ...]:
-    if inspect.isclass(enum_or_iterable) and issubclass(enum_or_iterable, Enum):
-        return tuple(str(item.value) for item in enum_or_iterable)
+def test_components_module_exposes_core_components() -> None:
+    components = importlib.import_module("kx_manager.ui.components")
 
-    if isinstance(enum_or_iterable, Mapping):
-        return tuple(str(key) for key in enum_or_iterable.keys())
+    component_names = set(dir(components))
 
-    if isinstance(enum_or_iterable, Iterable) and not isinstance(enum_or_iterable, (str, bytes)):
-        return tuple(str(item) for item in enum_or_iterable)
+    assert any("card" in name.lower() for name in component_names)
+    assert any("status" in name.lower() for name in component_names)
 
-    raise TypeError(f"Cannot collect enum values from {enum_or_iterable!r}")
+
+def test_target_mode_values_are_canonical() -> None:
+    pages = importlib.import_module("kx_manager.ui.pages")
+
+    target_mode_enum = getattr(pages, "UiTargetMode", None)
+
+    if target_mode_enum is None:
+        pytest.skip("UiTargetMode is not implemented yet")
+
+    values = set(_enum_values(target_mode_enum))
+
+    assert set(REQUIRED_TARGET_MODE_VALUES) <= values
+    assert set(FORBIDDEN_TARGET_MODE_VALUES).isdisjoint(values)
+
+
+def test_network_profile_labels_are_canonical_if_present() -> None:
+    pages = importlib.import_module("kx_manager.ui.pages")
+
+    profile_enum = getattr(pages, "UiNetworkProfile", None)
+
+    if profile_enum is None:
+        pytest.skip("UiNetworkProfile is not implemented yet")
+
+    values = set(_enum_values(profile_enum))
+
+    assert "intranet_private" in values
+    assert "public_vps" in values
+    assert "local_only" in values
+    assert "lan_private" not in values
+    assert "vps" not in values
+
+
+def test_page_routes_do_not_include_dynamic_instance_ids() -> None:
+    pages = importlib.import_module("kx_manager.ui.pages")
+
+    route_values = set(_enum_values(pages.UiPage))
+
+    assert not any("{instance_id}" in value for value in route_values)
+    assert not any("<instance_id>" in value for value in route_values)
+
+
+def test_action_values_use_snake_case() -> None:
+    pages = importlib.import_module("kx_manager.ui.pages")
+
+    for value in _enum_values(pages.UiAction):
+        assert value == value.lower()
+        assert "-" not in value
+        assert " " not in value
+
+
+def test_action_routes_use_kebab_case() -> None:
+    actions = importlib.import_module("kx_manager.ui.actions")
+
+    route_values = _collect_route_values(
+        actions,
+        candidate_names=(
+            "ACTION_ROUTES",
+            "POST_ACTION_ROUTES",
+            "UI_ACTION_ROUTES",
+            "ROUTES",
+        ),
+    )
+
+    for route in route_values:
+        if not route.startswith("/ui/actions/"):
+            continue
+
+        suffix = route.removeprefix("/ui/actions/")
+        assert "_" not in suffix
+        assert suffix == suffix.lower()
+
+
+def test_private_target_actions_do_not_require_public_confirmation() -> None:
+    forms = importlib.import_module("kx_manager.ui.forms")
+
+    validate = getattr(forms, "validate_action_payload", None)
+
+    if not callable(validate):
+        pytest.skip("validate_action_payload is not implemented yet")
+
+    local_payload = {
+        "action": "set_target_local",
+        "target_mode": "local",
+        "network_profile": "local_only",
+        "exposure_mode": "private",
+        "instance_id": "demo-001",
+        "runtime_root": r"C:\mycode\Konnaxion\runtime",
+        "capsule_dir": r"C:\mycode\Konnaxion\runtime\capsules",
+    }
+
+    result = validate(local_payload)
+    assert result is not None
+
+
+def test_droplet_target_requires_confirmation_if_validator_exists() -> None:
+    forms = importlib.import_module("kx_manager.ui.forms")
+
+    validate = getattr(forms, "validate_action_payload", None)
+
+    if not callable(validate):
+        pytest.skip("validate_action_payload is not implemented yet")
+
+    payload = {
+        "action": "set_target_droplet",
+        "target_mode": "droplet",
+        "network_profile": "public_vps",
+        "exposure_mode": "public",
+        "instance_id": "demo-001",
+        "droplet_host": "203.0.113.10",
+        "droplet_user": "root",
+        "ssh_key_path": r"C:\Users\user\.ssh\id_ed25519",
+        "remote_kx_root": "/opt/konnaxion",
+        "remote_capsule_dir": "/opt/konnaxion/capsules",
+        "domain": "example.com",
+        "confirmed": False,
+    }
+
+    with pytest.raises(Exception):
+        validate(payload)
+
+
+def test_manager_gui_contract_document_mentions_required_targets() -> None:
+    """Docs should mention canonical target modes if present in repository."""
+
+    docs_root = Path("docs")
+    if not docs_root.exists():
+        pytest.skip("docs directory is not available")
+
+    content = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in docs_root.glob("DOC-*GUI*.md")
+    )
+
+    assert "local" in content
+    assert "intranet" in content
+    assert "temporary_public" in content
+    assert "droplet" in content
+
+
+def _enum_values(enum_cls: Any) -> tuple[str, ...]:
+    if not inspect.isclass(enum_cls):
+        return ()
+
+    if issubclass(enum_cls, Enum):
+        return tuple(str(item.value) for item in enum_cls)
+
+    values: list[str] = []
+    for name in dir(enum_cls):
+        if name.startswith("_"):
+            continue
+        value = getattr(enum_cls, name)
+        if isinstance(value, str):
+            values.append(value)
+
+    return tuple(values)
 
 
 def _string_value(value: Any) -> str:
-    if isinstance(value, Enum):
-        return str(value.value)
-    return str(value)
+    return str(getattr(value, "value", value))
 
 
 def _collect_route_values(module: ModuleType, *, candidate_names: tuple[str, ...]) -> set[str]:

@@ -1,0 +1,1474 @@
+doc_id: DOC-21
+title: Konnaxion Portable Runtime, Data Pack, and Bundle Upgrade
+project: Konnaxion
+app_version: v14
+param_version: kx-param-2026.04.30
+status: draft
+owner: Konnaxion Architecture
+last_updated: 2026-05-02
+depends_on:
+  - DOC-00_Konnaxion_Canonical_Variables.md
+  - DOC-03_Konnaxion_Capsule_Format.md
+  - DOC-06_Konnaxion_Network_Profiles.md
+  - DOC-07_Konnaxion_Security_Gate.md
+  - DOC-08_Konnaxion_Runtime_Docker_Compose.md
+  - DOC-10_Konnaxion_Builder_CLI.md
+---
+
+# DOC-21 — Konnaxion Portable Runtime, Data Pack, and Bundle Upgrade
+
+## 1. Purpose
+
+This document defines the technical upgrade that separates Konnaxion into three portable package types:
+
+```text
+Konnaxion Runtime   = the reader/player
+Konnaxion Data Pack = the content/database/media
+Konnaxion Bundle    = runtime + data in one portable artifact
+````
+
+The goal is to make Konnaxion portable without forcing every data export to rebuild the full application runtime.
+
+The target model is:
+
+```text
+Konnaxion Reader
+  loads
+Konnaxion Data Pack
+```
+
+Equivalent product analogy:
+
+```text
+VLC / DVD player / console = Konnaxion Runtime
+movie / DVD / cartridge    = Konnaxion Data Pack
+all-in-one demo package    = Konnaxion Portable Bundle
+```
+
+---
+
+## 2. Problem Statement
+
+The current capsule model attempts to make a deployment portable through a `.kxcap` file.
+
+That is correct for the app/runtime layer, but it mixes multiple concerns:
+
+```text
+runtime application
+Docker images
+deployment profile
+database content
+media files
+secrets
+host-specific configuration
+target-machine state
+```
+
+The recent Droplet deployment revealed these problems:
+
+```text
+1. The capsule did not contain required runtime Docker images.
+2. The VPS required manual docker build/save/scp/load.
+3. Runtime environment values were host-specific and could not be static.
+4. Django ALLOWED_HOSTS, frontend public API URL, and Traefik Host() rules had to be generated on the target.
+5. Secrets must be generated on the target, not packaged.
+6. Database/content portability is a separate need from app/runtime portability.
+```
+
+Therefore, Konnaxion needs a clearer package model.
+
+---
+
+## 3. Design Decision
+
+Konnaxion will support three package classes.
+
+```text
+.kxruntime
+  Portable Konnaxion runtime.
+  Contains app images, runtime templates, policies, profiles, healthchecks.
+  Does not contain tenant/customer data.
+  Does not contain runtime secrets.
+
+.kxdata
+  Portable Konnaxion data/content pack.
+  Contains database dump, media archive, schema metadata, checksums, signature.
+  Does not contain runtime images.
+  Does not contain runtime secrets.
+
+.kxportable
+  Portable all-in-one bundle.
+  Contains one .kxruntime and one .kxdata.
+  Used for demos, client handoff, offline transfer, and one-file deployment.
+  Still does not contain runtime secrets.
+```
+
+Existing `.kxcap` may remain as a backward-compatible alias for `.kxruntime` during migration.
+
+---
+
+## 4. Product Model
+
+### 4.1 Konnaxion Runtime
+
+The runtime is the “reader”.
+
+It contains:
+
+```text
+Django backend image
+Next.js frontend image
+Traefik runtime configuration templates
+Docker Compose runtime templates
+Agent import/start logic
+migrations
+healthchecks
+network profiles
+Security Gate policies
+capsule manifest
+checksums
+signature
+```
+
+It does not contain:
+
+```text
+customer database
+uploaded media
+Django secret key
+Postgres password
+Redis password
+Agent token
+SSH keys
+TLS private keys
+OAuth secrets
+external API keys
+```
+
+### 4.2 Konnaxion Data Pack
+
+The data pack is the “film”.
+
+It contains:
+
+```text
+Postgres dump
+media archive
+schema version metadata
+required app version metadata
+required param version metadata
+source instance metadata
+checksums
+signature
+optional encryption metadata
+```
+
+It does not contain:
+
+```text
+runtime secrets
+target-machine env files
+Docker images
+Traefik runtime state
+Postgres password
+Agent token
+TLS private keys
+SSH keys
+```
+
+### 4.3 Konnaxion Portable Bundle
+
+The portable bundle is a one-file demo/deployment artifact.
+
+It contains:
+
+```text
+runtime package
+data pack
+bundle manifest
+checksums
+signature
+optional encryption metadata
+```
+
+It still does not contain generated runtime secrets.
+
+On import, the Agent must generate target-machine secrets before starting the instance.
+
+---
+
+## 5. File Extensions
+
+Canonical package extensions:
+
+```text
+.kxruntime   Konnaxion runtime package
+.kxdata      Konnaxion data/content package
+.kxportable  Konnaxion runtime + data bundle
+.kxbackup    encrypted backup/disaster recovery package
+```
+
+Backward compatibility:
+
+```text
+.kxcap       supported as legacy runtime capsule alias
+```
+
+---
+
+## 6. Package Responsibilities
+
+| Package       |       Responsibility | Contains runtime images | Contains DB | Contains media | Contains secrets |
+| ------------- | -------------------: | ----------------------: | ----------: | -------------: | ---------------: |
+| `.kxruntime`  |   App/runtime reader |                     yes |          no |             no |               no |
+| `.kxdata`     |     Content/database |                      no |         yes |            yes |               no |
+| `.kxportable` | One-file demo/deploy |                     yes |         yes |            yes |               no |
+| `.kxbackup`   |    Disaster recovery |                optional |         yes |            yes |   encrypted only |
+
+---
+
+## 7. Directory Layouts
+
+### 7.1 `.kxruntime`
+
+Internal archive layout:
+
+```text
+manifest.yaml
+runtime/
+  docker-compose.capsule.yml
+  traefik-dynamic.template.yml
+  healthchecks/
+  profiles/
+  policies/
+  migrations/
+images/
+  django-api.oci.tar
+  frontend-next.oci.tar
+  media-nginx.oci.tar
+metadata/
+  build.json
+  source-inventory.json
+checksums.txt
+signature.sig
+```
+
+Required app image archives:
+
+```text
+images/django-api.oci.tar
+images/frontend-next.oci.tar
+```
+
+Optional image archives:
+
+```text
+images/media-nginx.oci.tar
+images/traefik.oci.tar
+images/postgres.oci.tar
+images/redis.oci.tar
+```
+
+If external base images are not packaged, the manifest must explicitly declare that the target may pull them.
+
+### 7.2 `.kxdata`
+
+Internal archive layout:
+
+```text
+manifest.yaml
+db/
+  postgres.dump
+media/
+  media.tar.zst
+metadata/
+  source-instance.json
+  schema-version.json
+  app-version-required.json
+  export.json
+checksums.txt
+signature.sig
+```
+
+Optional encrypted layout:
+
+```text
+manifest.yaml
+payload.enc
+metadata/
+  encryption.json
+checksums.txt
+signature.sig
+```
+
+### 7.3 `.kxportable`
+
+Internal archive layout:
+
+```text
+manifest.yaml
+runtime/
+  konnaxion-reader-v14.kxruntime
+data/
+  demo-citoyen-2026.kxdata
+metadata/
+  bundle.json
+checksums.txt
+signature.sig
+```
+
+---
+
+## 8. Manifest Contracts
+
+### 8.1 Runtime Manifest
+
+```yaml
+kind: konnaxion-runtime
+format_version: 1
+runtime_id: konnaxion-reader-v14
+app_version: v14
+param_version: kx-param-2026.04.30
+
+images:
+  django-api:
+    archive: images/django-api.oci.tar
+    image: konnaxion/django-api:v14
+    required: true
+  frontend-next:
+    archive: images/frontend-next.oci.tar
+    image: konnaxion/frontend-next:v14
+    required: true
+
+runtime:
+  compose_template: runtime/docker-compose.capsule.yml
+  traefik_template: runtime/traefik-dynamic.template.yml
+  profiles_dir: runtime/profiles
+  policies_dir: runtime/policies
+  healthchecks_dir: runtime/healthchecks
+
+security:
+  signed: true
+  checksums: checksums.txt
+  contains_runtime_secrets: false
+```
+
+### 8.2 Data Pack Manifest
+
+```yaml
+kind: konnaxion-data-pack
+format_version: 1
+data_pack_id: demo-citoyen-2026
+title: Demo Citoyen 2026
+
+app_version_required: v14
+param_version_required: kx-param-2026.04.30
+schema_version: 2026.05.02
+
+database:
+  engine: postgres
+  dump: db/postgres.dump
+  format: pg_dump_custom
+
+media:
+  archive: media/media.tar.zst
+  format: tar.zst
+
+security:
+  signed: true
+  encrypted: false
+  checksums: checksums.txt
+  contains_runtime_secrets: false
+  contains_user_data: true
+
+export:
+  exported_at: 2026-05-02T00:00:00Z
+  source_instance_id: demo-001
+  anonymized: false
+```
+
+### 8.3 Portable Bundle Manifest
+
+```yaml
+kind: konnaxion-portable-bundle
+format_version: 1
+bundle_id: demo-citoyen-2026-v14
+
+runtime:
+  file: runtime/konnaxion-reader-v14.kxruntime
+  app_version: v14
+  param_version: kx-param-2026.04.30
+
+data:
+  file: data/demo-citoyen-2026.kxdata
+  schema_version: 2026.05.02
+
+security:
+  signed: true
+  encrypted: false
+  checksums: checksums.txt
+  contains_runtime_secrets: false
+  first_boot_generates_secrets: true
+```
+
+---
+
+## 9. Secrets Model
+
+### 9.1 Core Rule
+
+Runtime secrets are owned by the target environment.
+
+They must not be stored in:
+
+```text
+.kxruntime
+.kxdata
+.kxportable
+```
+
+The Agent generates them during import or first start.
+
+### 9.2 Forbidden Package Contents
+
+The following values must not appear in portable packages:
+
+```text
+DJANGO_SECRET_KEY
+POSTGRES_PASSWORD
+REDIS_PASSWORD
+DATABASE_URL with password
+AGENT_TOKEN
+SSH private key
+TLS private key
+OAuth client secret
+email SMTP password
+external API key
+Let’s Encrypt account private key
+.env files containing secrets
+```
+
+### 9.3 Generated Per Instance
+
+On import, the Agent generates:
+
+```text
+DJANGO_SECRET_KEY
+POSTGRES_PASSWORD
+REDIS_PASSWORD if enabled
+AGENT_INSTANCE_TOKEN if needed
+runtime env files
+```
+
+Canonical target path:
+
+```text
+/opt/konnaxion/instances/<INSTANCE_ID>/env/
+  kx.env
+  django.env
+  postgres.env
+  redis.env
+  frontend.env
+  runtime.env
+```
+
+Permissions:
+
+```text
+kx.env        0640
+frontend.env  0640
+django.env    0600
+postgres.env  0600
+redis.env     0600
+runtime.env   0600
+```
+
+### 9.4 Preserved vs Regenerated Values
+
+Preserve during profile changes:
+
+```text
+DJANGO_SECRET_KEY
+POSTGRES_PASSWORD
+REDIS_PASSWORD
+database encryption keys
+```
+
+Regenerate/update when host/profile changes:
+
+```text
+KX_HOST
+DJANGO_ALLOWED_HOSTS
+CSRF_TRUSTED_ORIGINS
+NEXT_PUBLIC_API_BASE
+NEXT_PUBLIC_BACKEND_BASE
+Traefik Host() rules
+```
+
+---
+
+## 10. Import/Export Workflows
+
+### 10.1 Export Data Pack
+
+Source instance flow:
+
+```text
+1. Validate instance state.
+2. Stop write-heavy workers or enter export-safe mode.
+3. Run pg_dump --format=custom.
+4. Archive media directory.
+5. Write data pack manifest.
+6. Write metadata.
+7. Write checksums.
+8. Sign package.
+9. Optionally encrypt package.
+10. Return .kxdata path.
+```
+
+Required command behavior:
+
+```text
+kx data-pack export <INSTANCE_ID> --output demo.kxdata
+```
+
+Optional modes:
+
+```text
+--anonymize
+--encrypt
+--encrypt-for <public-key>
+--include-media
+--exclude-media
+```
+
+### 10.2 Import Data Pack
+
+Target instance flow:
+
+```text
+1. Verify signature.
+2. Verify checksums.
+3. Decrypt if required.
+4. Check app_version_required.
+5. Check schema_version compatibility.
+6. Create target instance directory.
+7. Generate secrets/env.
+8. Start Postgres and Redis.
+9. Restore database dump.
+10. Restore media archive.
+11. Run migrations if needed.
+12. Render Docker Compose runtime.
+13. Render Traefik dynamic config.
+14. Start application services.
+15. Run Security Gate.
+16. Return public/local URL.
+```
+
+Required command behavior:
+
+```text
+kx data-pack import demo.kxdata --instance-id demo-001
+```
+
+### 10.3 Build Runtime
+
+Runtime build flow:
+
+```text
+1. Build backend image.
+2. Build frontend image.
+3. Export required images as OCI tar.
+4. Render runtime templates.
+5. Write runtime manifest.
+6. Write checksums.
+7. Sign runtime package.
+8. Return .kxruntime path.
+```
+
+Required command behavior:
+
+```text
+kx-builder runtime build --source-dir <repo> --output konnaxion-reader-v14.kxruntime
+```
+
+### 10.4 Build Portable Bundle
+
+Bundle build flow:
+
+```text
+1. Verify .kxruntime.
+2. Verify .kxdata.
+3. Check compatibility.
+4. Write bundle manifest.
+5. Write checksums.
+6. Sign bundle.
+7. Optionally encrypt bundle.
+8. Return .kxportable path.
+```
+
+Required command behavior:
+
+```text
+kx-builder portable build \
+  --runtime konnaxion-reader-v14.kxruntime \
+  --data demo-citoyen-2026.kxdata \
+  --output demo-citoyen-2026-v14.kxportable
+```
+
+### 10.5 Import Portable Bundle
+
+Target flow:
+
+```text
+1. Verify bundle.
+2. Extract runtime package.
+3. Extract data pack.
+4. Import runtime.
+5. Import data pack.
+6. Generate secrets.
+7. Render runtime for selected profile.
+8. Start instance.
+9. Run Security Gate.
+```
+
+Required command behavior:
+
+```text
+kx portable import demo-citoyen-2026-v14.kxportable --instance-id demo-001
+```
+
+---
+
+## 11. Runtime Compatibility Rules
+
+### 11.1 Version Fields
+
+Every `.kxdata` must declare:
+
+```text
+app_version_required
+param_version_required
+schema_version
+```
+
+Every `.kxruntime` must declare:
+
+```text
+app_version
+param_version
+supported_schema_versions
+```
+
+### 11.2 Compatibility Decision
+
+The Agent must allow import only when:
+
+```text
+runtime.app_version satisfies data.app_version_required
+runtime.param_version satisfies data.param_version_required
+runtime supports data.schema_version
+```
+
+If not compatible, Agent must return:
+
+```text
+status: blocked
+reason: incompatible_runtime
+required_app_version: <value>
+current_app_version: <value>
+```
+
+### 11.3 Migration
+
+If a migration path exists:
+
+```text
+data.schema_version < runtime.current_schema_version
+```
+
+Agent may offer:
+
+```text
+import and migrate
+```
+
+Migration must be explicit for production data.
+
+---
+
+## 12. Manager Module Design
+
+The Konnaxion Capsule Manager receives a new module:
+
+```text
+Packages
+```
+
+Tabs:
+
+```text
+Runtime
+Data Packs
+Portable Bundles
+```
+
+### 12.1 Runtime Tab
+
+Actions:
+
+```text
+Build Runtime
+Verify Runtime
+Sign Runtime
+Deploy Runtime
+Update Runtime on Target
+```
+
+### 12.2 Data Packs Tab
+
+Actions:
+
+```text
+Export Data Pack
+Verify Data Pack
+Import Data Pack
+Create Instance from Data Pack
+Anonymize Data Pack
+Encrypt Data Pack
+```
+
+### 12.3 Portable Bundles Tab
+
+Actions:
+
+```text
+Build Portable Bundle
+Verify Portable Bundle
+Import Portable Bundle
+Deploy Portable Bundle to Droplet/VPS
+Split Bundle into Runtime + Data
+```
+
+---
+
+## 13. Manager Service Files
+
+New service files:
+
+```text
+kx_manager/services/runtime_package.py
+kx_manager/services/data_pack.py
+kx_manager/services/portable_bundle.py
+```
+
+UI files:
+
+```text
+kx_manager/ui/page_parts/packages.py
+kx_manager/ui/page_parts/data_packs.py
+kx_manager/ui/page_parts/portable_bundles.py
+```
+
+Existing files to extend:
+
+```text
+kx_manager/ui/action_backends.py
+kx_manager/ui/action_constants.py
+kx_manager/ui/action_models.py
+kx_manager/ui/action_views.py
+kx_manager/ui/agent_execution_client.py
+```
+
+---
+
+## 14. Agent API Contract
+
+### 14.1 Data Pack Endpoints
+
+```text
+POST /v1/data-packs/verify
+POST /v1/data-packs/import
+POST /v1/data-packs/export
+POST /v1/data-packs/anonymize
+POST /v1/data-packs/encrypt
+```
+
+### 14.2 Runtime Endpoints
+
+```text
+POST /v1/runtime/import
+POST /v1/runtime/verify
+POST /v1/runtime/load-images
+```
+
+### 14.3 Portable Bundle Endpoints
+
+```text
+POST /v1/portable/verify
+POST /v1/portable/import
+POST /v1/portable/split
+```
+
+### 14.4 Instance Endpoint
+
+```text
+POST /v1/instances/create-from-data-pack
+```
+
+Example request:
+
+```json
+{
+  "instance_id": "demo-001",
+  "data_pack_path": "/opt/konnaxion/data-packs/demo-citoyen-2026.kxdata",
+  "runtime_id": "konnaxion-reader-v14",
+  "network_profile": "public_vps",
+  "exposure_mode": "public",
+  "host": "138.197.174.76.sslip.io"
+}
+```
+
+---
+
+## 15. Agent Module Design
+
+New modules:
+
+```text
+kx_agent/data_packs/__init__.py
+kx_agent/data_packs/importer.py
+kx_agent/data_packs/exporter.py
+kx_agent/data_packs/verifier.py
+kx_agent/data_packs/anonymizer.py
+kx_agent/data_packs/crypto.py
+
+kx_agent/runtime_packages/__init__.py
+kx_agent/runtime_packages/importer.py
+kx_agent/runtime_packages/verifier.py
+kx_agent/runtime_packages/images.py
+
+kx_agent/portable/__init__.py
+kx_agent/portable/importer.py
+kx_agent/portable/verifier.py
+kx_agent/portable/builder.py
+```
+
+Existing modules to extend:
+
+```text
+kx_agent/api.py
+kx_agent/instances/lifecycle.py
+kx_agent/instances/env_writer.py
+kx_agent/instances/secrets.py
+kx_agent/runtime/compose.py
+kx_agent/runtime/healthchecks.py
+kx_agent/security/gate.py
+```
+
+---
+
+## 16. Builder Module Design
+
+New builder modules:
+
+```text
+kx_builder/runtime_package.py
+kx_builder/data_pack.py
+kx_builder/portable_bundle.py
+kx_builder/package_manifest.py
+```
+
+Existing builder modules to extend:
+
+```text
+kx_builder/images.py
+kx_builder/package.py
+kx_builder/verify.py
+kx_builder/main.py
+kx_builder/signature.py
+kx_builder/checksums.py
+```
+
+---
+
+## 17. Security Gate Integration
+
+Security Gate must validate package and runtime behavior.
+
+### 17.1 Runtime Package Checks
+
+```text
+runtime_manifest_valid
+runtime_signature_valid
+runtime_checksums_valid
+required_images_present
+required_images_loadable
+no_runtime_secrets_in_package
+compose_template_valid
+traefik_file_provider_required
+docker_socket_not_required
+```
+
+### 17.2 Data Pack Checks
+
+```text
+data_pack_manifest_valid
+data_pack_signature_valid
+data_pack_checksums_valid
+db_dump_present
+db_dump_restoreable
+media_archive_valid
+schema_version_declared
+app_version_required_declared
+no_runtime_secrets_in_data_pack
+encryption_required_if_sensitive
+```
+
+### 17.3 Portable Bundle Checks
+
+```text
+bundle_manifest_valid
+bundle_signature_valid
+bundle_checksums_valid
+runtime_package_present
+data_pack_present
+runtime_and_data_compatible
+no_runtime_secrets_in_bundle
+```
+
+### 17.4 Runtime Instance Checks
+
+```text
+secrets_present
+secrets_not_default
+runtime_env_host_matches_profile
+traefik_dynamic_host_matches_profile
+frontend_public_env_matches_profile
+dangerous_ports_blocked
+postgres_not_public
+redis_not_public
+docker_socket_not_mounted
+no_privileged_containers
+no_host_network
+```
+
+---
+
+## 18. Secret Scanning
+
+All package builders and verifiers must scan archives for forbidden patterns.
+
+Forbidden filename patterns:
+
+```text
+.env
+*.env
+id_rsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
+agent.env
+django.env
+postgres.env
+redis.env
+runtime.env
+```
+
+Allowed exceptions:
+
+```text
+env-templates/*.template
+public keys
+certificate public chain files
+example env files with placeholders
+```
+
+Forbidden content markers:
+
+```text
+DJANGO_SECRET_KEY=
+POSTGRES_PASSWORD=
+REDIS_PASSWORD=
+DATABASE_URL=postgres://
+KX_AGENT_TOKEN=
+PRIVATE KEY
+BEGIN OPENSSH PRIVATE KEY
+BEGIN RSA PRIVATE KEY
+BEGIN EC PRIVATE KEY
+```
+
+A package containing runtime secrets must fail verification unless it is an explicitly encrypted `.kxbackup`.
+
+---
+
+## 19. Data Sensitivity Modes
+
+Data Pack export must support modes:
+
+```text
+demo
+portable
+backup
+```
+
+### 19.1 Demo Mode
+
+```text
+anonymization recommended
+external API tokens excluded
+user PII scrubbed if configured
+encryption optional
+```
+
+### 19.2 Portable Mode
+
+```text
+real content allowed
+runtime secrets excluded
+encryption recommended
+signature required
+```
+
+### 19.3 Backup Mode
+
+```text
+full data allowed
+encryption required
+signature required
+access-controlled restore
+may include sensitive application data
+still excludes machine/runtime secrets by default
+```
+
+---
+
+## 20. Encryption
+
+Encryption is optional for `.kxruntime`, recommended for `.kxdata`, and required for sensitive `.kxbackup`.
+
+Supported methods:
+
+```text
+password-derived key
+recipient public key
+age X25519
+```
+
+Manifest example:
+
+```yaml
+encryption:
+  enabled: true
+  method: age-x25519
+  recipients:
+    - age1example...
+```
+
+Import must fail if encrypted package cannot be decrypted.
+
+---
+
+## 21. Signing
+
+All package types must support signatures.
+
+Signature applies to:
+
+```text
+manifest
+checksums
+payload files
+metadata
+```
+
+Signature verifies:
+
+```text
+authenticity
+integrity
+publisher identity
+```
+
+Signature does not provide confidentiality.
+
+---
+
+## 22. Target Machine State
+
+On import, target state lives under:
+
+```text
+/opt/konnaxion/
+  runtimes/
+    konnaxion-reader-v14/
+  data-packs/
+    imported/
+  portable/
+    imported/
+  instances/
+    demo-001/
+      env/
+      state/
+      media/
+      postgres/
+      redis/
+      logs/
+```
+
+Runtime package import loads images into Docker:
+
+```text
+docker load -i images/django-api.oci.tar
+docker load -i images/frontend-next.oci.tar
+```
+
+Data pack import restores DB/media into the target instance.
+
+---
+
+## 23. Droplet/VPS Transport
+
+For Droplet or VPS deployment, the Agent remains private:
+
+```text
+127.0.0.1:8765
+```
+
+The Manager uses SSH-local curl:
+
+```text
+Manager
+  -> SSH root@host
+    -> curl http://127.0.0.1:8765/v1/...
+```
+
+This applies to:
+
+```text
+runtime import
+data pack import
+portable bundle import
+instance create
+network set-profile
+security check
+start instance
+logs/status
+```
+
+The upgrade must not require a temporary local tunnel.
+
+---
+
+## 24. CLI Commands
+
+### 24.1 Builder
+
+```bash
+kx-builder runtime build \
+  --source-dir C:\mycode\Konnaxion\Konnaxion \
+  --output konnaxion-reader-v14.kxruntime
+
+kx-builder data-pack build \
+  --instance-id demo-001 \
+  --output demo-citoyen-2026.kxdata
+
+kx-builder portable build \
+  --runtime konnaxion-reader-v14.kxruntime \
+  --data demo-citoyen-2026.kxdata \
+  --output demo-citoyen-2026-v14.kxportable
+```
+
+### 24.2 Agent/CLI
+
+```bash
+kx runtime import konnaxion-reader-v14.kxruntime
+
+kx data-pack import demo-citoyen-2026.kxdata \
+  --instance-id demo-001
+
+kx portable import demo-citoyen-2026-v14.kxportable \
+  --instance-id demo-001 \
+  --network-profile public_vps \
+  --host 138.197.174.76.sslip.io
+```
+
+---
+
+## 25. GUI Flows
+
+### 25.1 Create Portable Demo
+
+```text
+Build Runtime
+Export Data Pack
+Build Portable Bundle
+Verify Portable Bundle
+Deploy Portable Bundle
+```
+
+### 25.2 Load Customer Data
+
+```text
+Install Runtime
+Import Data Pack
+Create Instance
+Generate Secrets
+Start
+```
+
+### 25.3 Deploy to VPS
+
+```text
+Select .kxportable
+Enter VPS host
+Enter public host
+Confirm public_vps
+Upload bundle
+Agent imports runtime
+Agent imports data
+Agent generates secrets
+Agent renders runtime
+Agent starts services
+Security Gate validates
+Manager shows public URL
+```
+
+---
+
+## 26. Backward Compatibility
+
+Existing `.kxcap` behavior remains supported temporarily.
+
+Migration rules:
+
+```text
+.kxcap with images/*.oci.tar -> treat as .kxruntime
+.kxcap without images        -> verify warning or failure depending strict mode
+.kxcap with DB content       -> convert to .kxportable or split into .kxruntime + .kxdata
+```
+
+Builder should emit:
+
+```text
+deprecated: .kxcap is now runtime-only; use .kxruntime for new builds
+```
+
+---
+
+## 27. Acceptance Criteria
+
+### 27.1 Runtime Package
+
+```text
+.kxruntime builds successfully
+contains required app images
+verify fails if required images are missing
+no runtime secrets are present
+Agent can import runtime
+Agent can docker load images
+```
+
+### 27.2 Data Pack
+
+```text
+.kxdata exports from running instance
+contains db dump
+contains media archive or explicit no-media marker
+contains schema/app version metadata
+verify fails if manifest/checksum/signature invalid
+verify fails if runtime secrets are detected
+Agent can restore DB/media into new instance
+```
+
+### 27.3 Portable Bundle
+
+```text
+.kxportable contains runtime and data
+verify checks runtime/data compatibility
+import generates fresh secrets
+import starts Konnaxion without manual Docker build
+public_vps import generates public host env correctly
+frontend route returns 200
+django-api is healthy
+postgres and redis are healthy
+dangerous ports are not public
+```
+
+---
+
+## 28. Implementation Phases
+
+### Phase 1 — Stabilize Runtime Capsule
+
+```text
+Fix Builder image export.
+Fix capsule verify missing images.
+Fix Agent runtime env generation.
+Fix Traefik file-provider runtime config.
+Fix healthchecks.
+Fix Manager SSH-local Agent transport.
+```
+
+### Phase 2 — Add Data Pack
+
+```text
+Implement .kxdata export.
+Implement .kxdata verify.
+Implement .kxdata import.
+Restore DB/media into isolated instance.
+Generate secrets on import.
+```
+
+### Phase 3 — Add Portable Bundle
+
+```text
+Implement .kxportable build.
+Implement .kxportable verify.
+Implement .kxportable import.
+Add GUI flows.
+```
+
+### Phase 4 — Security Hardening
+
+```text
+Secret scanner.
+Encryption support.
+Anonymization mode.
+Backup mode.
+Compatibility migration checks.
+```
+
+---
+
+## 29. Files to Add
+
+```text
+kx_builder/runtime_package.py
+kx_builder/data_pack.py
+kx_builder/portable_bundle.py
+kx_builder/package_manifest.py
+
+kx_agent/data_packs/__init__.py
+kx_agent/data_packs/importer.py
+kx_agent/data_packs/exporter.py
+kx_agent/data_packs/verifier.py
+kx_agent/data_packs/anonymizer.py
+kx_agent/data_packs/crypto.py
+
+kx_agent/runtime_packages/__init__.py
+kx_agent/runtime_packages/importer.py
+kx_agent/runtime_packages/verifier.py
+kx_agent/runtime_packages/images.py
+
+kx_agent/portable/__init__.py
+kx_agent/portable/importer.py
+kx_agent/portable/verifier.py
+
+kx_manager/services/runtime_package.py
+kx_manager/services/data_pack.py
+kx_manager/services/portable_bundle.py
+kx_manager/ui/page_parts/packages.py
+kx_manager/ui/page_parts/data_packs.py
+kx_manager/ui/page_parts/portable_bundles.py
+
+kx_shared/package_types.py
+kx_shared/package_manifest.py
+kx_shared/secret_scan.py
+```
+
+---
+
+## 30. Files to Extend
+
+```text
+kx_builder/main.py
+kx_builder/images.py
+kx_builder/package.py
+kx_builder/verify.py
+kx_builder/checksums.py
+kx_builder/signature.py
+
+kx_agent/api.py
+kx_agent/instances/lifecycle.py
+kx_agent/instances/env_writer.py
+kx_agent/instances/secrets.py
+kx_agent/runtime/compose.py
+kx_agent/security/gate.py
+
+kx_manager/ui/action_backends.py
+kx_manager/ui/action_constants.py
+kx_manager/ui/action_models.py
+kx_manager/ui/action_views.py
+kx_manager/ui/agent_execution_client.py
+kx_manager/services/deploy.py
+```
+
+---
+
+## 31. Test Plan
+
+New tests:
+
+```text
+tests/test_runtime_package_build.py
+tests/test_runtime_package_verify.py
+tests/test_data_pack_export.py
+tests/test_data_pack_import.py
+tests/test_data_pack_verify.py
+tests/test_portable_bundle_build.py
+tests/test_portable_bundle_import.py
+tests/test_secret_scan.py
+tests/test_package_compatibility.py
+tests/test_manager_ui_packages.py
+tests/test_agent_data_pack_api.py
+```
+
+Extend existing tests:
+
+```text
+tests/test_capsule_verify.py
+tests/test_compose_generation.py
+tests/test_network_profiles.py
+tests/test_manager_ui_target_modes.py
+```
+
+Critical regression tests:
+
+```text
+capsule/runtime verify fails if images/*.oci.tar missing
+public_vps never generates KX_HOST=127.0.0.1
+public_vps includes host in DJANGO_ALLOWED_HOSTS
+frontend env uses https://<host>/api
+Traefik dynamic config uses Host(`<host>`)
+package verify fails if secrets are found
+portable import generates fresh secrets
+data pack import does not reuse source-machine secrets
+```
+
+---
+
+## 32. Final Rule
+
+The optimal Konnaxion portability model is:
+
+```text
+Runtime is portable.
+Data is portable.
+Secrets are local.
+Deployment config is generated on target.
+```
+
+Therefore:
+
+```text
+.kxruntime contains the reader.
+.kxdata contains the content.
+.kxportable contains reader + content.
+No portable package contains runtime secrets.
+The Agent generates secrets and host-specific runtime config at import time.
+```
+
+

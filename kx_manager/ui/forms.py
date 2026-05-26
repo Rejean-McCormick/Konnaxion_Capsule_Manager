@@ -57,7 +57,6 @@ from kx_manager.ui.form_helpers import (
     _creatable_dir,
     _docker_service,
     _enum_values,
-    _existing_dir,
     _exposure_mode,
     _host,
     _instance_id,
@@ -145,14 +144,21 @@ from kx_manager.ui.form_network import (
 # ---------------------------------------------------------------------
 
 from kx_manager.ui.form_targets import (
+    BootstrapDropletAgentForm,
+    CheckDropletAgentForm,
+    CopyCapsuleToDropletForm,
+    DROPLET_ACTIONS,
+    DROPLET_CAPSULE_REQUIRED_ACTIONS,
     DeployDropletForm,
     DeployIntranetForm,
     DeployLocalForm,
     DropletTargetForm,
     IntranetTargetForm,
     LocalTargetForm,
+    StartDropletInstanceForm,
     TargetModeForm,
     TemporaryPublicTargetForm,
+    parse_droplet_operation_form,
     parse_target_form,
 )
 
@@ -234,14 +240,21 @@ __all__ = [
     "parse_network_form",
 
     # Target/deploy forms
+    "BootstrapDropletAgentForm",
+    "CheckDropletAgentForm",
+    "CopyCapsuleToDropletForm",
+    "DROPLET_ACTIONS",
+    "DROPLET_CAPSULE_REQUIRED_ACTIONS",
     "DeployDropletForm",
     "DeployIntranetForm",
     "DeployLocalForm",
     "DropletTargetForm",
     "IntranetTargetForm",
     "LocalTargetForm",
+    "StartDropletInstanceForm",
     "TargetModeForm",
     "TemporaryPublicTargetForm",
+    "parse_droplet_operation_form",
     "parse_target_form",
 
     # Registry / public validation

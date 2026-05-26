@@ -8,7 +8,12 @@ Scope:
 - validate canonical capsule extension
 - inspect required capsule root layout
 - parse and validate manifest basics
+- parse and validate images.yaml
+- verify all required runtime OCI image archives are present
+- verify listed image archives are non-empty
+- verify image archive digests/sizes against images.yaml
 - verify ``checksums.txt`` entries
+- confirm required image archives are covered by checksums
 - confirm ``signature.sig`` is present
 - optionally call a caller-provided signature verifier
 - reject obvious real secrets in env templates
@@ -19,15 +24,16 @@ This verifier does not start services, load OCI images, or mutate host state.
 
 from __future__ import annotations
 
+import io
+import json
+import re
+import tarfile
+import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-import io
-import json
-import re
-import tarfile
 from typing import Any
 
 try:  # pragma: no cover - optional dependency
@@ -43,7 +49,6 @@ from kx_shared.konnaxion_constants import (
     NetworkProfile,
     PARAM_VERSION,
 )
-
 
 try:  # pragma: no cover - zstandard may not be installed in all dev envs
     import zstandard as zstd
@@ -98,7 +103,9 @@ class CapsuleVerifyReport:
 
         return {
             "ok": self.ok,
+            "valid": self.ok,
             "capsule_path": str(self.capsule_path),
+            "capsule_file": str(self.capsule_path),
             "capsule_id": self.capsule_id,
             "capsule_version": self.capsule_version,
             "app_version": self.app_version,
@@ -107,6 +114,7 @@ class CapsuleVerifyReport:
             "warnings": [issue_to_dict(issue) for issue in self.warnings],
             "checks": [issue_to_dict(issue) for issue in self.checks],
             "manifest": dict(self.manifest or {}),
+            "message": "Capsule verified." if self.ok else "Capsule verification failed.",
         }
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -156,6 +164,7 @@ REQUIRED_ROOT_FILES = frozenset(
     {
         "manifest.yaml",
         "docker-compose.capsule.yml",
+        "images.yaml",
         "checksums.txt",
         "signature.sig",
     }
@@ -195,6 +204,37 @@ REQUIRED_PROFILES = frozenset(
     }
 )
 
+REQUIRED_IMAGE_SERVICES = (
+    "frontend-next",
+    "django-api",
+    "traefik",
+    "postgres",
+    "redis",
+    "celeryworker",
+    "celerybeat",
+    "media-nginx",
+)
+
+OPTIONAL_IMAGE_SERVICES = (
+    "flower",
+)
+
+REQUIRED_IMAGE_ARCHIVES = frozenset(
+    {
+        "images/frontend-next.oci.tar",
+        "images/django-api.oci.tar",
+        "images/traefik.oci.tar",
+        "images/postgres.oci.tar",
+        "images/redis.oci.tar",
+        "images/celeryworker.oci.tar",
+        "images/celerybeat.oci.tar",
+        "images/media-nginx.oci.tar",
+    }
+)
+
+IMAGE_METADATA_FILENAME = "images.yaml"
+LEGACY_IMAGE_METADATA_FILENAME = "metadata/images.json"
+
 SECRET_KEY_PATTERNS = (
     re.compile(r"^DJANGO_SECRET_KEY\s*=\s*(?!<GENERATED_ON_INSTALL>|\$\{)", re.I),
     re.compile(r"^POSTGRES_PASSWORD\s*=\s*(?!<GENERATED_ON_INSTALL>|\$\{)", re.I),
@@ -205,7 +245,13 @@ SECRET_KEY_PATTERNS = (
     re.compile(r"PROVIDER_TOKEN\s*=\s*[^<\s]", re.I),
 )
 
-CHECKSUM_LINE_RE = re.compile(r"^(?P<digest>[a-fA-F0-9]{64})\s+\*?(?P<path>.+)$")
+CHECKSUM_DIGEST_FIRST_RE = re.compile(
+    r"^(?P<digest>[a-fA-F0-9]{64})\s+\*?(?P<path>.+)$"
+)
+CHECKSUM_ALGO_FIRST_RE = re.compile(
+    r"^sha256\s+(?P<path>.+?)\s+(?P<digest>[a-fA-F0-9]{64})$",
+    re.I,
+)
 
 
 def issue_to_dict(issue: VerifyIssue) -> dict[str, Any]:
@@ -217,6 +263,43 @@ def issue_to_dict(issue: VerifyIssue) -> dict[str, Any]:
         "status": issue.status.value,
         "path": issue.path,
     }
+
+
+def verify_capsule_file(
+    capsule_file: str | Path,
+    *,
+    strict: bool = False,
+    public_key: bytes | None = None,
+    signature_verifier: SignatureVerifier | None = None,
+    require_signature_verifier: bool = False,
+    raise_on_error: bool = False,
+) -> dict[str, Any]:
+    """Compatibility entrypoint expected by ``kx_builder.main``.
+
+    Returns a dictionary instead of a dataclass so CLI, UI, and service wrappers
+    can serialize it directly.
+    """
+
+    report = verify_capsule(
+        capsule_file,
+        public_key=public_key,
+        signature_verifier=signature_verifier,
+        require_signature_verifier=require_signature_verifier or strict,
+        raise_on_error=raise_on_error,
+    )
+
+    data = report.to_dict()
+
+    if strict and report.warnings:
+        data["ok"] = False
+        data["valid"] = False
+        data["strict"] = True
+        data["message"] = "Capsule verification failed in strict mode."
+        data["strict_warnings"] = [issue_to_dict(issue) for issue in report.warnings]
+    else:
+        data["strict"] = strict
+
+    return data
 
 
 def verify_capsule(
@@ -293,6 +376,13 @@ def verify_capsule(
         except Exception as exc:
             fail("invalid_manifest", f"Could not parse manifest.yaml: {exc}", "manifest.yaml")
 
+    _verify_image_archives(
+        archive,
+        manifest=manifest,
+        fail=fail,
+        warn=warn,
+    )
+
     if archive.has("checksums.txt"):
         try:
             _verify_checksums(archive, fail=fail, warn=warn)
@@ -316,100 +406,133 @@ def verify_capsule(
     return report
 
 
-def assert_capsule_valid(capsule_path: str | Path, **kwargs: Any) -> CapsuleVerifyReport:
-    """Verify a capsule and raise ``CapsuleVerifyError`` on failure."""
+def assert_capsule_valid(
+    capsule_path: str | Path,
+    *,
+    public_key: bytes | None = None,
+    signature_verifier: SignatureVerifier | None = None,
+    require_signature_verifier: bool = False,
+) -> CapsuleVerifyReport:
+    """Verify a capsule and raise ``CapsuleVerifyError`` if it is invalid."""
 
-    return verify_capsule(capsule_path, raise_on_error=True, **kwargs)
+    return verify_capsule(
+        capsule_path,
+        public_key=public_key,
+        signature_verifier=signature_verifier,
+        require_signature_verifier=require_signature_verifier,
+        raise_on_error=True,
+    )
 
 
 def read_capsule_archive(path: str | Path) -> CapsuleArchive:
-    """Read a ``.kxcap`` archive into memory.
+    """Read a .kxcap file into memory.
 
-    MVP capsules are expected to be tar archives with zstd compression. This
-    reader also accepts regular tar files for local tests.
+    The canonical package format is a zstd-compressed tar archive, but dev
+    workflows may hand a plain tar archive to the verifier. Try direct tar
+    first, then zstd decompression.
     """
 
     capsule_path = Path(path)
     raw = capsule_path.read_bytes()
 
-    tar_bytes = raw
-    if zstd is not None:
-        try:
-            tar_bytes = zstd.ZstdDecompressor().decompress(raw)
-        except Exception:
-            tar_bytes = raw
+    try:
+        return _archive_from_tar_bytes(capsule_path, raw)
+    except tarfile.TarError:
+        decompressed = _try_decompress_zstd(raw)
+        return _archive_from_tar_bytes(capsule_path, decompressed)
 
+
+def _try_decompress_zstd(raw: bytes) -> bytes:
+    if zstd is None:
+        raise CapsuleVerifyError(
+            CapsuleVerifyReport(
+                ok=False,
+                capsule_path=Path("<memory>"),
+                checks=(
+                    VerifyIssue(
+                        code="zstd_unavailable",
+                        message="zstandard is required to read compressed .kxcap files",
+                    ),
+                ),
+            )
+        )
+
+    decompressor = zstd.ZstdDecompressor()
+    with decompressor.stream_reader(io.BytesIO(raw)) as reader:
+        return reader.read()
+
+
+def _archive_from_tar_bytes(path: Path, raw: bytes) -> CapsuleArchive:
     members: dict[str, bytes] = {}
 
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as archive:
-        for member in archive.getmembers():
-            if not member.isfile():
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tar:
+        for member in tar.getmembers():
+            if member.isdir():
                 continue
 
             normalized = normalize_archive_path(member.name)
             if normalized is None:
-                raise CapsuleVerifyError(
-                    CapsuleVerifyReport(
-                        ok=False,
-                        capsule_path=capsule_path,
-                        checks=(
-                            VerifyIssue(
-                                code="unsafe_archive_path",
-                                message=f"Unsafe archive path: {member.name}",
-                                path=member.name,
-                            ),
-                        ),
-                    )
-                )
+                continue
 
-            extracted = archive.extractfile(member)
+            extracted = tar.extractfile(member)
             if extracted is None:
                 continue
+
             members[normalized] = extracted.read()
 
-    return CapsuleArchive(path=capsule_path, members=members)
+    return CapsuleArchive(path=path, members=members)
 
 
 def normalize_archive_path(path: str) -> str | None:
-    """Normalize and validate a capsule archive member path."""
+    """Normalize and validate a capsule member path."""
 
-    pure = PurePosixPath(path)
-
-    if pure.is_absolute():
+    raw = str(path).strip().replace("\\", "/")
+    if not raw:
         return None
 
-    if ".." in pure.parts:
+    while raw.startswith("./"):
+        raw = raw[2:]
+
+    posix = PurePosixPath(raw)
+    if posix.is_absolute():
         return None
 
-    normalized = str(pure)
-    if normalized in {"", "."}:
+    parts = posix.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
         return None
 
-    return normalized
+    return str(posix)
 
 
-def parse_manifest(content: bytes) -> Mapping[str, Any]:
-    """Parse ``manifest.yaml``."""
+def parse_manifest(raw: bytes) -> Mapping[str, Any]:
+    """Parse manifest.yaml."""
 
-    text = content.decode("utf-8")
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to parse manifest.yaml.")
 
-    if yaml is not None:
-        data = yaml.safe_load(text)
-    else:
-        # Minimal fallback for simple key: value manifests. This is not a full
-        # YAML parser, but it keeps early CI smoke tests independent of PyYAML.
-        data = {}
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            data[key.strip()] = value.strip().strip('"').strip("'")
-
-    if not isinstance(data, Mapping):
+    parsed = yaml.safe_load(raw.decode("utf-8")) or {}
+    if not isinstance(parsed, Mapping):
         raise ValueError("manifest.yaml must contain a mapping")
 
-    return data
+    return parsed
+
+
+def _parse_yaml_or_json(raw: bytes, *, path: str) -> Mapping[str, Any]:
+    """Parse YAML/JSON metadata file into a mapping."""
+
+    text = raw.decode("utf-8")
+
+    if path.endswith(".json"):
+        parsed = json.loads(text)
+    else:
+        if yaml is None:
+            raise RuntimeError(f"PyYAML is required to parse {path}.")
+        parsed = yaml.safe_load(text) or {}
+
+    if not isinstance(parsed, Mapping):
+        raise ValueError(f"{path} must contain a mapping")
+
+    return parsed
 
 
 def _verify_layout(
@@ -552,6 +675,453 @@ def _verify_manifest(
             )
 
 
+def _verify_image_archives(
+    archive: CapsuleArchive,
+    *,
+    manifest: Mapping[str, Any] | None,
+    fail: Callable[[str, str, str | None], None],
+    warn: Callable[[str, str, str | None], None],
+) -> None:
+    """Verify required capsule image archives and image metadata."""
+
+    paths = set(archive.list_paths())
+    image_archives = {
+        path
+        for path in paths
+        if path.startswith("images/") and path.endswith(".oci.tar")
+    }
+
+    if "images/README.json" in paths and not image_archives:
+        fail(
+            "images_readme_only",
+            "Capsule images/ contains README.json but no loadable images/*.oci.tar archives",
+            "images/README.json",
+        )
+
+    if not image_archives:
+        fail(
+            "missing_image_archives",
+            "Capsule images/ must contain required OCI archives; found no images/*.oci.tar",
+            "images",
+        )
+
+    metadata_by_service: dict[str, set[str]] = {}
+    metadata_paths: set[str] = set()
+    metadata_entries: tuple[Mapping[str, Any], ...] = ()
+
+    if archive.has(IMAGE_METADATA_FILENAME):
+        try:
+            metadata = _parse_yaml_or_json(
+                archive.read_bytes(IMAGE_METADATA_FILENAME),
+                path=IMAGE_METADATA_FILENAME,
+            )
+            metadata_entries = _image_metadata_entries(metadata)
+            metadata_by_service, metadata_paths = _metadata_image_archives(metadata_entries)
+        except Exception as exc:
+            fail(
+                "invalid_images_metadata",
+                f"Could not parse {IMAGE_METADATA_FILENAME}: {exc}",
+                IMAGE_METADATA_FILENAME,
+            )
+    else:
+        fail(
+            "missing_images_metadata",
+            f"Capsule is missing required {IMAGE_METADATA_FILENAME}",
+            IMAGE_METADATA_FILENAME,
+        )
+        if archive.has(LEGACY_IMAGE_METADATA_FILENAME):
+            warn(
+                "legacy_images_metadata_only",
+                f"Legacy {LEGACY_IMAGE_METADATA_FILENAME} is present, but "
+                f"{IMAGE_METADATA_FILENAME} is required",
+                LEGACY_IMAGE_METADATA_FILENAME,
+            )
+
+    manifest_by_service, manifest_paths = _manifest_image_archives(manifest or {})
+    declared_by_service = _merge_service_archives(manifest_by_service, metadata_by_service)
+    declared_paths = set(manifest_paths) | set(metadata_paths)
+
+    for declared_path in sorted(declared_paths):
+        normalized = _normalize_image_archive_path(declared_path)
+        if normalized is None:
+            fail(
+                "unsafe_declared_image_archive",
+                f"Image metadata declares unsafe image archive path {declared_path}",
+                IMAGE_METADATA_FILENAME,
+            )
+            continue
+
+        if not normalized.startswith("images/") or not normalized.endswith(".oci.tar"):
+            fail(
+                "invalid_declared_image_archive",
+                f"Image archive must be images/*.oci.tar: {normalized}",
+                normalized,
+            )
+            continue
+
+        if not archive.has(normalized):
+            fail(
+                "declared_image_archive_missing",
+                f"Image metadata references missing archive {normalized}",
+                normalized,
+            )
+
+    for required_archive in sorted(REQUIRED_IMAGE_ARCHIVES):
+        if required_archive not in paths:
+            fail(
+                "missing_required_image_archive",
+                "Capsule is missing required OCI image archive for service "
+                f"{Path(required_archive).name.removesuffix('.oci.tar')}",
+                required_archive,
+            )
+
+    for required_service in REQUIRED_IMAGE_SERVICES:
+        if not _service_has_image_archive(
+            required_service,
+            image_archives=image_archives,
+            declared_by_service=declared_by_service,
+        ):
+            fail(
+                "missing_required_image_service",
+                f"Capsule is missing required image metadata/archive for service {required_service}",
+                f"images/{required_service}.oci.tar",
+            )
+
+    for image_archive in sorted(image_archives):
+        if not archive.read_bytes(image_archive):
+            fail(
+                "empty_image_archive",
+                f"Image archive is empty: {image_archive}",
+                image_archive,
+            )
+
+    for entry in metadata_entries:
+        _verify_image_metadata_entry(
+            archive,
+            entry=entry,
+            fail=fail,
+            warn=warn,
+        )
+
+    if declared_paths:
+        normalized_declared = {
+            normalized
+            for declared_path in declared_paths
+            if (normalized := _normalize_image_archive_path(declared_path)) is not None
+        }
+
+        for image_archive in sorted(image_archives - normalized_declared):
+            warn(
+                "undeclared_image_archive",
+                f"Image archive is present but not declared in manifest/images.yaml: {image_archive}",
+                image_archive,
+            )
+
+
+def _image_metadata_entries(metadata: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Return image entries from images.yaml."""
+
+    images = metadata.get("images")
+    if not isinstance(images, list):
+        raise ValueError("images.yaml must contain an images list")
+
+    entries: list[Mapping[str, Any]] = []
+    for index, item in enumerate(images):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"images.yaml images[{index}] must be a mapping")
+        entries.append(item)
+
+    if not entries:
+        raise ValueError("images.yaml images list is empty")
+
+    return tuple(entries)
+
+
+def _metadata_image_archives(
+    entries: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, set[str]], set[str]]:
+    """Return images.yaml-declared archives by service and as a path set."""
+
+    by_service: dict[str, set[str]] = {}
+    all_paths: set[str] = set()
+
+    for item in entries:
+        service = str(item.get("service") or "").strip()
+        archive_path = item.get("archive") or item.get("path") or item.get("file")
+        if not archive_path:
+            continue
+
+        normalized = _normalize_image_archive_path(str(archive_path))
+        if normalized is None:
+            all_paths.add(str(archive_path))
+            continue
+
+        all_paths.add(normalized)
+        if service:
+            by_service.setdefault(service, set()).add(normalized)
+
+    return by_service, all_paths
+
+
+def _verify_image_metadata_entry(
+    archive: CapsuleArchive,
+    *,
+    entry: Mapping[str, Any],
+    fail: Callable[[str, str, str | None], None],
+    warn: Callable[[str, str, str | None], None],
+) -> None:
+    """Verify one images.yaml entry against the actual archive."""
+
+    service = str(entry.get("service") or "").strip()
+    image = str(entry.get("image") or "").strip()
+    archive_value = str(entry.get("archive") or "").strip()
+    sha_value = str(entry.get("sha256") or "").strip()
+    size_value = entry.get("size_bytes")
+
+    if not service:
+        fail(
+            "image_metadata_missing_service",
+            "images.yaml entry is missing service",
+            IMAGE_METADATA_FILENAME,
+        )
+    elif service not in set(REQUIRED_IMAGE_SERVICES) | set(OPTIONAL_IMAGE_SERVICES):
+        warn(
+            "image_metadata_unknown_service",
+            f"images.yaml contains non-required service {service}",
+            IMAGE_METADATA_FILENAME,
+        )
+
+    if not image:
+        fail(
+            "image_metadata_missing_image",
+            f"images.yaml entry for {service or '<unknown>'} is missing image",
+            IMAGE_METADATA_FILENAME,
+        )
+
+    normalized_archive = _normalize_image_archive_path(archive_value)
+    if normalized_archive is None:
+        fail(
+            "image_metadata_invalid_archive",
+            f"images.yaml entry for {service or '<unknown>'} has invalid archive path",
+            IMAGE_METADATA_FILENAME,
+        )
+        return
+
+    if not archive.has(normalized_archive):
+        fail(
+            "image_metadata_archive_missing",
+            f"images.yaml references missing archive {normalized_archive}",
+            normalized_archive,
+        )
+        return
+
+    data = archive.read_bytes(normalized_archive)
+    if not data:
+        fail(
+            "image_metadata_archive_empty",
+            f"images.yaml references empty archive {normalized_archive}",
+            normalized_archive,
+        )
+
+    if sha_value:
+        if not re.fullmatch(r"[a-fA-F0-9]{64}", sha_value):
+            fail(
+                "image_metadata_invalid_sha256",
+                f"images.yaml has invalid sha256 for {normalized_archive}",
+                IMAGE_METADATA_FILENAME,
+            )
+        else:
+            actual = sha256(data).hexdigest()
+            if actual != sha_value.lower():
+                fail(
+                    "image_metadata_sha256_mismatch",
+                    f"images.yaml sha256 mismatch for {normalized_archive}",
+                    normalized_archive,
+                )
+    else:
+        fail(
+            "image_metadata_missing_sha256",
+            f"images.yaml entry for {normalized_archive} is missing sha256",
+            IMAGE_METADATA_FILENAME,
+        )
+
+    if size_value in (None, ""):
+        fail(
+            "image_metadata_missing_size",
+            f"images.yaml entry for {normalized_archive} is missing size_bytes",
+            IMAGE_METADATA_FILENAME,
+        )
+        return
+
+    try:
+        expected_size = int(size_value)
+    except (TypeError, ValueError):
+        fail(
+            "image_metadata_invalid_size",
+            f"images.yaml entry for {normalized_archive} has invalid size_bytes",
+            IMAGE_METADATA_FILENAME,
+        )
+        return
+
+    actual_size = len(data)
+    if expected_size <= 0:
+        fail(
+            "image_metadata_nonpositive_size",
+            f"images.yaml entry for {normalized_archive} has non-positive size_bytes",
+            IMAGE_METADATA_FILENAME,
+        )
+    elif actual_size != expected_size:
+        fail(
+            "image_metadata_size_mismatch",
+            f"images.yaml size mismatch for {normalized_archive}: expected "
+            f"{expected_size}, got {actual_size}",
+            normalized_archive,
+        )
+
+
+def _manifest_image_archives(
+    manifest: Mapping[str, Any],
+) -> tuple[dict[str, set[str]], set[str]]:
+    """Return manifest-declared image archives.
+
+    Supports these common shapes:
+
+    images:
+      frontend-next:
+        archive: images/frontend-next.oci.tar
+
+    images:
+      - service: frontend-next
+        archive: images/frontend-next.oci.tar
+
+    runtime:
+      images:
+        frontend-next:
+          archive: images/frontend-next.oci.tar
+    """
+
+    by_service: dict[str, set[str]] = {}
+    all_paths: set[str] = set()
+
+    def add(service: Any, archive_path: Any) -> None:
+        archive_text = str(archive_path or "").strip()
+        if not archive_text:
+            return
+
+        normalized_archive = _normalize_image_archive_path(archive_text)
+        all_paths.add(normalized_archive or archive_text)
+
+        normalized_service = str(service or "").strip()
+        if normalized_service:
+            by_service.setdefault(normalized_service, set()).add(
+                normalized_archive or archive_text
+            )
+
+    def consume(images: Any) -> None:
+        if images is None:
+            return
+
+        if isinstance(images, Mapping):
+            for service, value in images.items():
+                if isinstance(value, Mapping):
+                    add(
+                        service,
+                        value.get("archive")
+                        or value.get("path")
+                        or value.get("file")
+                        or value.get("oci_archive"),
+                    )
+                else:
+                    add(service, value)
+            return
+
+        if isinstance(images, Iterable) and not isinstance(images, (str, bytes)):
+            for item in images:
+                if isinstance(item, Mapping):
+                    add(
+                        item.get("service") or item.get("name"),
+                        item.get("archive")
+                        or item.get("path")
+                        or item.get("file")
+                        or item.get("oci_archive"),
+                    )
+                else:
+                    add(None, item)
+
+    consume(manifest.get("images"))
+
+    runtime = manifest.get("runtime")
+    if isinstance(runtime, Mapping):
+        consume(runtime.get("images"))
+
+    services = manifest.get("services")
+    if isinstance(services, Mapping):
+        for service, value in services.items():
+            if isinstance(value, Mapping):
+                add(
+                    service,
+                    value.get("archive")
+                    or value.get("image_archive")
+                    or value.get("oci_archive"),
+                )
+
+    return by_service, all_paths
+
+
+def _service_has_image_archive(
+    service: str,
+    *,
+    image_archives: set[str],
+    declared_by_service: Mapping[str, set[str]],
+) -> bool:
+    """Return True when a required service has a present archive."""
+
+    canonical = f"images/{service}.oci.tar"
+    if canonical in image_archives:
+        return True
+
+    for declared_path in declared_by_service.get(service, set()):
+        normalized = _normalize_image_archive_path(declared_path)
+        if normalized in image_archives:
+            return True
+
+    service_token = service.lower().replace("_", "-")
+    for archive_path in image_archives:
+        filename = PurePosixPath(archive_path).name.lower().replace("_", "-")
+        if service_token in filename:
+            return True
+
+    return False
+
+
+def _merge_service_archives(
+    *items: Mapping[str, set[str]],
+) -> dict[str, set[str]]:
+    merged: dict[str, set[str]] = {}
+    for item in items:
+        for service, paths in item.items():
+            merged.setdefault(service, set()).update(paths)
+    return merged
+
+
+def _normalize_image_archive_path(path: str) -> str | None:
+    """Normalize an image archive path.
+
+    images.yaml stores archive paths relative to images/ in the image helper,
+    while manifest.yaml commonly stores full images/<name>.oci.tar paths.
+    Accept both.
+    """
+
+    normalized = normalize_archive_path(path)
+    if normalized is None:
+        return None
+
+    if "/" not in normalized:
+        normalized = f"images/{normalized}"
+
+    return normalized
+
+
 def _verify_checksums(
     archive: CapsuleArchive,
     *,
@@ -568,8 +1138,8 @@ def _verify_checksums(
         if not line or line.startswith("#"):
             continue
 
-        match = CHECKSUM_LINE_RE.match(line)
-        if not match:
+        parsed = _parse_checksum_line(line)
+        if parsed is None:
             fail(
                 "invalid_checksum_line",
                 f"Invalid checksums.txt line {line_number}",
@@ -577,8 +1147,8 @@ def _verify_checksums(
             )
             continue
 
-        digest = match.group("digest").lower()
-        member_path = normalize_archive_path(match.group("path").strip())
+        digest, checksum_path = parsed
+        member_path = normalize_archive_path(checksum_path.strip())
 
         if member_path is None:
             fail(
@@ -622,6 +1192,44 @@ def _verify_checksums(
                 required,
             )
 
+    for required_archive in sorted(REQUIRED_IMAGE_ARCHIVES):
+        if archive.has(required_archive) and required_archive not in seen:
+            fail(
+                "required_image_archive_not_checksummed",
+                f"Required image archive is not listed in checksums.txt: {required_archive}",
+                required_archive,
+            )
+
+    for image_archive in sorted(
+        path
+        for path in archive.list_paths()
+        if path.startswith("images/") and path.endswith(".oci.tar")
+    ):
+        if image_archive not in seen:
+            fail(
+                "image_archive_not_checksummed",
+                f"Image archive is not listed in checksums.txt: {image_archive}",
+                image_archive,
+            )
+
+
+def _parse_checksum_line(line: str) -> tuple[str, str] | None:
+    digest_first = CHECKSUM_DIGEST_FIRST_RE.match(line)
+    if digest_first:
+        return (
+            digest_first.group("digest").lower(),
+            digest_first.group("path").strip(),
+        )
+
+    algo_first = CHECKSUM_ALGO_FIRST_RE.match(line)
+    if algo_first:
+        return (
+            algo_first.group("digest").lower(),
+            algo_first.group("path").strip(),
+        )
+
+    return None
+
 
 def _verify_signature(
     archive: CapsuleArchive,
@@ -638,6 +1246,14 @@ def _verify_signature(
         fail(
             "missing_signature",
             "Capsule is missing mandatory signature.sig",
+            "signature.sig",
+        )
+        return
+
+    if not archive.read_bytes("signature.sig"):
+        fail(
+            "empty_signature",
+            "signature.sig is empty",
             "signature.sig",
         )
         return
@@ -760,17 +1376,24 @@ def _build_report(
 
 
 def _optional_str(value: Any) -> str | None:
-    """Return optional value as string."""
+    """Return stripped string value or None."""
 
-    if value in {None, ""}:
+    if value is None:
         return None
-    return str(value)
+
+    text = str(value).strip()
+    return text or None
 
 
 __all__ = [
     "CapsuleArchive",
     "CapsuleVerifyError",
     "CapsuleVerifyReport",
+    "IMAGE_METADATA_FILENAME",
+    "LEGACY_IMAGE_METADATA_FILENAME",
+    "OPTIONAL_IMAGE_SERVICES",
+    "REQUIRED_IMAGE_ARCHIVES",
+    "REQUIRED_IMAGE_SERVICES",
     "SignatureVerifier",
     "VerifyIssue",
     "VerifyStatus",
@@ -780,4 +1403,5 @@ __all__ = [
     "parse_manifest",
     "read_capsule_archive",
     "verify_capsule",
+    "verify_capsule_file",
 ]

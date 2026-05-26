@@ -20,6 +20,7 @@ import argparse
 import importlib
 import logging
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -89,12 +90,37 @@ def create_app():
             "Install runtime dependencies with: pip install fastapi uvicorn"
         ) from exc
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Attach Manager config and Agent client for route handlers."""
+
+        try:
+            from kx_manager.client import KonnaxionAgentClient
+            from kx_manager.config import get_manager_config
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise ManagerStartupError(
+                "Konnaxion Manager runtime dependencies are required to attach "
+                "the Agent client."
+            ) from exc
+
+        config = get_manager_config()
+        agent_client = KonnaxionAgentClient.from_env()
+
+        app.state.config = config
+        app.state.agent_client = agent_client
+
+        try:
+            yield
+        finally:
+            await agent_client.aclose()
+
     app = FastAPI(
         title=MANAGER_NAME,
         version=APP_VERSION,
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
+        lifespan=lifespan,
         description=(
             "Local user-facing control layer for importing, starting, stopping, "
             "updating, securing, backing up, and monitoring Konnaxion Instances."

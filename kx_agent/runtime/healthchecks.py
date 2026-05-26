@@ -8,6 +8,7 @@ Scope:
 - verify the canonical Compose file exists
 - verify canonical runtime services are present
 - verify core services are running/healthy
+- verify generated runtime contracts for public host/routing/healthchecks
 - verify Traefik routes answer through the configured host
 - provide structured reports for Manager/API/UI consumption
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import ssl
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -125,6 +127,7 @@ class RuntimeHealthcheckConfig:
     retries: int = 1
     require_flower: bool = False
     docker_bin: str = "docker"
+    verify_tls: bool = False
 
     @classmethod
     def for_instance(
@@ -138,6 +141,7 @@ class RuntimeHealthcheckConfig:
         retries: int = 1,
         require_flower: bool = False,
         docker_bin: str = "docker",
+        verify_tls: bool = False,
     ) -> "RuntimeHealthcheckConfig":
         return cls(
             instance_id=instance_id,
@@ -148,7 +152,17 @@ class RuntimeHealthcheckConfig:
             retries=retries,
             require_flower=require_flower,
             docker_bin=docker_bin,
+            verify_tls=verify_tls,
         )
+
+
+@dataclass(frozen=True)
+class HttpRouteCheckSpec:
+    """One HTTP route check specification."""
+
+    route_path: str
+    expected_service: str
+    allow_application_client_error: bool = False
 
 
 CORE_REQUIRED_SERVICES = (
@@ -166,11 +180,51 @@ OPTIONAL_SERVICES = (
     DockerService.FLOWER.value,
 )
 
+# Some stock images do not reliably expose an in-container healthcheck tool.
+# Route-level checks still verify reachability when the service matters.
+WARN_ONLY_UNHEALTHY_SERVICES = {
+    DockerService.MEDIA_NGINX.value,
+}
+
 HTTP_ROUTE_CHECKS = (
-    ("/", DockerService.FRONTEND_NEXT.value),
-    ("/api/", DockerService.DJANGO_API.value),
-    ("/admin/", DockerService.DJANGO_API.value),
-    ("/media/", DockerService.MEDIA_NGINX.value),
+    HttpRouteCheckSpec(
+        "/",
+        DockerService.FRONTEND_NEXT.value,
+        allow_application_client_error=False,
+    ),
+    HttpRouteCheckSpec(
+        "/api/",
+        DockerService.DJANGO_API.value,
+        allow_application_client_error=True,
+    ),
+    HttpRouteCheckSpec(
+        "/admin/",
+        DockerService.DJANGO_API.value,
+        allow_application_client_error=True,
+    ),
+    HttpRouteCheckSpec(
+        "/media/",
+        DockerService.MEDIA_NGINX.value,
+        allow_application_client_error=True,
+    ),
+)
+
+CANONICAL_DJANGO_SOCKET_HEALTHCHECK = (
+    'python -c "import socket; '
+    "sock=socket.create_connection(('127.0.0.1',5000),5); "
+    'sock.close()"'
+)
+
+MALFORMED_HEALTHCHECK_FRAGMENTS = (
+    '"api/health/',
+    "'api/health/",
+    "s.close()\"api/health",
+    "s.close()'api/health",
+)
+
+FRAGILE_HEALTHCHECK_FRAGMENTS = (
+    "wget -qO- http://127.0.0.1:5000",
+    "wget --spider -q http://127.0.0.1:5000",
 )
 
 
@@ -184,6 +238,7 @@ def run_healthchecks(
     retries: int = 1,
     require_flower: bool = False,
     docker_bin: str = "docker",
+    verify_tls: bool = False,
 ) -> HealthReport:
     """Run the standard runtime healthcheck suite."""
 
@@ -196,6 +251,7 @@ def run_healthchecks(
         retries=retries,
         require_flower=require_flower,
         docker_bin=docker_bin,
+        verify_tls=verify_tls,
     )
 
     checks: list[HealthcheckResult] = []
@@ -204,6 +260,8 @@ def run_healthchecks(
 
     if checks[-1].status == HealthStatus.FAIL:
         return build_report(config.instance_id, checks)
+
+    checks.append(check_compose_runtime_contract(config))
 
     services = list_compose_services(config)
     checks.append(check_required_services(services, require_flower=require_flower))
@@ -235,6 +293,7 @@ def wait_until_healthy(
     timeout_seconds: int = 120,
     interval_seconds: int = 5,
     docker_bin: str = "docker",
+    verify_tls: bool = False,
 ) -> HealthReport:
     """
     Poll runtime healthchecks until PASS or timeout.
@@ -254,6 +313,7 @@ def wait_until_healthy(
             timeout_seconds=min(interval_seconds, 10),
             retries=1,
             docker_bin=docker_bin,
+            verify_tls=verify_tls,
         )
 
         if latest_report.ok:
@@ -303,6 +363,87 @@ def check_compose_file(config: RuntimeHealthcheckConfig) -> HealthcheckResult:
         status=HealthStatus.PASS,
         message="Runtime Compose file exists.",
         details={"compose_file": str(config.compose_file)},
+    )
+
+
+def check_compose_runtime_contract(
+    config: RuntimeHealthcheckConfig,
+) -> HealthcheckResult:
+    """Verify generated runtime Compose content follows deployment contracts."""
+
+    started = time.monotonic()
+
+    try:
+        text = config.compose_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return timed_result(
+            started,
+            name="compose_runtime_contract",
+            status=HealthStatus.FAIL,
+            message="Could not read runtime Compose file.",
+            details={"compose_file": str(config.compose_file), "error": str(exc)},
+        )
+
+    issues: list[str] = []
+    warnings: list[str] = []
+    host = config.host.strip()
+
+    if host and not _is_loopback_host(host):
+        if "Host(`127.0.0.1`)" in text:
+            issues.append(
+                "Public runtime still contains Traefik Host(`127.0.0.1`) rules."
+            )
+
+        if "KX_HOST=127.0.0.1" in text:
+            issues.append("Public runtime still contains KX_HOST=127.0.0.1.")
+
+    for fragment in MALFORMED_HEALTHCHECK_FRAGMENTS:
+        if fragment in text:
+            issues.append(
+                "Runtime Compose contains a malformed healthcheck fragment: "
+                + fragment
+            )
+
+    for fragment in FRAGILE_HEALTHCHECK_FRAGMENTS:
+        if fragment in text:
+            warnings.append(
+                "Runtime Compose contains a fragile wget-based healthcheck: "
+                + fragment
+            )
+
+    if "providers.file.filename" in text and "traefik-dynamic.yml" not in text:
+        warnings.append(
+            "Traefik file provider appears enabled but traefik-dynamic.yml "
+            "is not referenced by name."
+        )
+
+    if issues:
+        return timed_result(
+            started,
+            name="compose_runtime_contract",
+            status=HealthStatus.FAIL,
+            message="Runtime Compose violates one or more required contracts.",
+            details={"issues": issues, "warnings": warnings},
+        )
+
+    if warnings:
+        return timed_result(
+            started,
+            name="compose_runtime_contract",
+            status=HealthStatus.WARN,
+            message="Runtime Compose has non-blocking contract warnings.",
+            details={"warnings": warnings},
+        )
+
+    return timed_result(
+        started,
+        name="compose_runtime_contract",
+        status=HealthStatus.PASS,
+        message="Runtime Compose contract checks passed.",
+        details={
+            "compose_file": str(config.compose_file),
+            "host": host,
+        },
     )
 
 
@@ -444,6 +585,19 @@ def check_service(
         )
 
     if unhealthy_records:
+        if service_name in WARN_ONLY_UNHEALTHY_SERVICES:
+            return timed_result(
+                started,
+                name=f"service:{service_name}",
+                status=HealthStatus.WARN,
+                message=(
+                    "Service has unhealthy containers, but this service is "
+                    "validated by route checks because its image may not expose "
+                    "a reliable in-container healthcheck tool."
+                ),
+                details={"service": service_name, "records": unhealthy_records},
+            )
+
         return timed_result(
             started,
             name=f"service:{service_name}",
@@ -483,8 +637,15 @@ def check_http_routes(
 
     results: list[HealthcheckResult] = []
 
-    for route_path, expected_service in HTTP_ROUTE_CHECKS:
-        results.append(check_http_route(config, route_path, expected_service))
+    for spec in HTTP_ROUTE_CHECKS:
+        results.append(
+            check_http_route(
+                config,
+                spec.route_path,
+                spec.expected_service,
+                allow_application_client_error=spec.allow_application_client_error,
+            )
+        )
 
     return tuple(results)
 
@@ -493,6 +654,8 @@ def check_http_route(
     config: RuntimeHealthcheckConfig,
     route_path: str,
     expected_service: str,
+    *,
+    allow_application_client_error: bool = False,
 ) -> HealthcheckResult:
     """Check one canonical HTTP route."""
 
@@ -501,6 +664,8 @@ def check_http_route(
 
     last_error = ""
     status_code: int | None = None
+    response_headers: dict[str, str] = {}
+    body_sample = ""
 
     for attempt in range(config.retries + 1):
         try:
@@ -513,40 +678,46 @@ def check_http_route(
                 method="GET",
             )
 
-            with urlopen(request, timeout=config.timeout_seconds) as response:
+            context = _ssl_context_for_config(config)
+
+            with urlopen(
+                request,
+                timeout=config.timeout_seconds,
+                context=context,
+            ) as response:
                 status_code = response.getcode()
+                response_headers = normalize_headers(response.headers)
 
-            if 200 <= status_code < 500:
-                status = HealthStatus.PASS if status_code < 400 else HealthStatus.WARN
-                return timed_result(
-                    started,
-                    name=f"http:{route_path}",
-                    status=status,
-                    message="HTTP route responded.",
-                    details={
-                        "url": url,
-                        "status_code": status_code,
-                        "expected_service": expected_service,
-                    },
-                )
-
-            last_error = f"unexpected HTTP status {status_code}"
+            return classify_http_route_response(
+                started,
+                route_path=route_path,
+                expected_service=expected_service,
+                url=url,
+                status_code=status_code,
+                headers=response_headers,
+                body_sample=body_sample,
+                allow_application_client_error=allow_application_client_error,
+            )
 
         except HTTPError as exc:
             status_code = exc.code
-            if 400 <= exc.code < 500:
-                return timed_result(
-                    started,
-                    name=f"http:{route_path}",
-                    status=HealthStatus.WARN,
-                    message="HTTP route responded with client error.",
-                    details={
-                        "url": url,
-                        "status_code": exc.code,
-                        "expected_service": expected_service,
-                    },
-                )
-            last_error = f"HTTP error {exc.code}"
+            response_headers = normalize_headers(exc.headers)
+
+            try:
+                body_sample = exc.read(512).decode("utf-8", errors="replace")
+            except Exception:
+                body_sample = ""
+
+            return classify_http_route_response(
+                started,
+                route_path=route_path,
+                expected_service=expected_service,
+                url=url,
+                status_code=status_code,
+                headers=response_headers,
+                body_sample=body_sample,
+                allow_application_client_error=allow_application_client_error,
+            )
 
         except URLError as exc:
             last_error = str(exc.reason)
@@ -567,7 +738,131 @@ def check_http_route(
             "status_code": status_code,
             "expected_service": expected_service,
             "error": last_error,
+            "headers": response_headers,
+            "body_sample": body_sample,
         },
+    )
+
+
+def classify_http_route_response(
+    started: float,
+    *,
+    route_path: str,
+    expected_service: str,
+    url: str,
+    status_code: int,
+    headers: Mapping[str, str],
+    body_sample: str,
+    allow_application_client_error: bool,
+) -> HealthcheckResult:
+    """Classify one HTTP route response."""
+
+    details = {
+        "url": url,
+        "status_code": status_code,
+        "expected_service": expected_service,
+        "headers": dict(headers),
+        "body_sample": body_sample[:256],
+    }
+
+    if 200 <= status_code < 400:
+        return timed_result(
+            started,
+            name=f"http:{route_path}",
+            status=HealthStatus.PASS,
+            message="HTTP route responded successfully.",
+            details=details,
+        )
+
+    if is_traefik_default_404(
+        status_code=status_code,
+        headers=headers,
+        body_sample=body_sample,
+    ):
+        return timed_result(
+            started,
+            name=f"http:{route_path}",
+            status=HealthStatus.FAIL,
+            message=(
+                "HTTP route returned Traefik's default 404; router host/path "
+                "did not match the configured runtime."
+            ),
+            details=details,
+        )
+
+    if 400 <= status_code < 500:
+        if allow_application_client_error:
+            return timed_result(
+                started,
+                name=f"http:{route_path}",
+                status=HealthStatus.PASS,
+                message=(
+                    "HTTP route reached an application service and returned a "
+                    "client response. This is acceptable for canonical API/admin/"
+                    "media route probes that may not map to a concrete resource."
+                ),
+                details=details,
+            )
+
+        return timed_result(
+            started,
+            name=f"http:{route_path}",
+            status=HealthStatus.FAIL,
+            message="HTTP route returned a client error for a route that must serve.",
+            details=details,
+        )
+
+    if 500 <= status_code:
+        return timed_result(
+            started,
+            name=f"http:{route_path}",
+            status=HealthStatus.FAIL,
+            message="HTTP route reached a server error.",
+            details=details,
+        )
+
+    return timed_result(
+        started,
+        name=f"http:{route_path}",
+        status=HealthStatus.WARN,
+        message="HTTP route returned an unusual status code.",
+        details=details,
+    )
+
+
+def is_traefik_default_404(
+    *,
+    status_code: int,
+    headers: Mapping[str, str],
+    body_sample: str,
+) -> bool:
+    """Return True for Traefik's own unmatched-route 404 response."""
+
+    if status_code != 404:
+        return False
+
+    normalized = normalize_headers(headers)
+    content_type = normalized.get("content-type", "").lower()
+    server = normalized.get("server", "").lower()
+    body = body_sample.strip().lower()
+
+    if "uvicorn" in server:
+        return False
+
+    if "next.js" in normalized.get("x-powered-by", "").lower():
+        return False
+
+    django_header_names = {
+        "content-language",
+        "cross-origin-opener-policy",
+        "referrer-policy",
+    }
+    if any(name in normalized for name in django_header_names):
+        return False
+
+    return (
+        "text/plain" in content_type
+        and body in {"404 page not found", "404 not found", ""}
     )
 
 
@@ -781,3 +1076,48 @@ def timed_result(
         details=details or {},
         duration_ms=int((time.monotonic() - started) * 1000),
     )
+
+
+def normalize_headers(headers: Mapping[str, Any]) -> dict[str, str]:
+    """Return case-normalized HTTP headers."""
+
+    normalized: dict[str, str] = {}
+
+    for key, value in headers.items():
+        normalized[str(key).lower()] = str(value)
+
+    return normalized
+
+
+def _ssl_context_for_config(config: RuntimeHealthcheckConfig) -> ssl.SSLContext | None:
+    """Return TLS context for HTTP probes."""
+
+    if config.scheme.strip().lower() != "https":
+        return None
+
+    if config.verify_tls:
+        return None
+
+    return ssl._create_unverified_context()
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True when host points to loopback/local-only access."""
+
+    value = host.strip().lower()
+
+    if not value:
+        return False
+
+    if value.startswith(("http://", "https://")):
+        value = value.split("://", 1)[1]
+
+    value = value.split("/", 1)[0].split(":", 1)[0]
+
+    return value in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "0.0.0.0",
+    }
+

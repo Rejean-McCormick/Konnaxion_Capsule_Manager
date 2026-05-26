@@ -5,16 +5,19 @@ or updating a Konnaxion Instance. This module does not invent profile names or
 exposure modes. It imports them from the shared canonical registry and enforces
 private-by-default behavior.
 
-The Agent must reject arbitrary public exposure, dangerous ports, and invalid
-profile/exposure combinations before runtime generation or firewall changes.
+The Agent must reject arbitrary public exposure, dangerous ports, invalid
+profile/exposure combinations, and unsafe public host selections before runtime
+generation or firewall changes.
 """
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Mapping, Sequence
+from urllib.parse import urlparse
 
 from kx_shared.konnaxion_constants import (
     ALLOWED_ENTRY_PORTS,
@@ -70,8 +73,11 @@ class NetworkProfileSpec:
     public_mode_enabled: bool = False
     requires_expiration: bool = False
     requires_hardened_host: bool = False
+    allowed_exposure_modes: tuple[ExposureMode, ...] = field(default_factory=tuple)
     allowed_entry_ports: tuple[int, ...] = field(default_factory=tuple)
-    forbidden_public_ports: tuple[int, ...] = field(default_factory=lambda: tuple(sorted(FORBIDDEN_PUBLIC_PORTS)))
+    forbidden_public_ports: tuple[int, ...] = field(
+        default_factory=lambda: tuple(sorted(FORBIDDEN_PUBLIC_PORTS))
+    )
     bind_hosts: tuple[str, ...] = field(default_factory=tuple)
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -79,19 +85,76 @@ class NetworkProfileSpec:
     def value(self) -> str:
         return self.profile.value
 
-    def validate(self, *, public_mode_expires_at: str | None = None) -> None:
+    @property
+    def effective_allowed_exposure_modes(self) -> tuple[ExposureMode, ...]:
+        if self.allowed_exposure_modes:
+            return self.allowed_exposure_modes
+        return (self.exposure_mode,)
+
+    def with_exposure_mode(self, exposure_mode: ExposureMode) -> "NetworkProfileSpec":
+        """Return this profile spec with a selected allowed exposure mode."""
+
+        return NetworkProfileSpec(
+            profile=self.profile,
+            exposure_mode=exposure_mode,
+            binding=self.binding,
+            public_mode_enabled=self.public_mode_enabled,
+            requires_expiration=self.requires_expiration,
+            requires_hardened_host=self.requires_hardened_host,
+            allowed_exposure_modes=self.effective_allowed_exposure_modes,
+            allowed_entry_ports=self.allowed_entry_ports,
+            forbidden_public_ports=self.forbidden_public_ports,
+            bind_hosts=self.bind_hosts,
+            notes=self.notes,
+        )
+
+    def validate(
+        self,
+        *,
+        exposure_mode: ExposureMode | str | None = None,
+        public_mode_enabled: bool | str | None = None,
+        public_mode_expires_at: str | None = None,
+        host: str | None = None,
+    ) -> None:
         """Validate the profile against canonical safety rules."""
 
-        if self.public_mode_enabled and self.exposure_mode not in {
+        resolved_exposure = (
+            self.exposure_mode
+            if exposure_mode is None
+            else normalize_exposure_mode(exposure_mode)
+        )
+
+        if resolved_exposure not in self.effective_allowed_exposure_modes:
+            allowed = ", ".join(
+                sorted(mode.value for mode in self.effective_allowed_exposure_modes)
+            )
+            raise NetworkProfileError(
+                f"profile {self.profile.value!r} does not allow exposure "
+                f"{resolved_exposure.value!r}; allowed values: {allowed}"
+            )
+
+        resolved_public = (
+            self.public_mode_enabled
+            if public_mode_enabled is None
+            else _parse_bool(public_mode_enabled)
+        )
+
+        if resolved_public != self.public_mode_enabled:
+            raise NetworkProfileError(
+                f"profile {self.profile.value!r} requires "
+                f"KX_PUBLIC_MODE_ENABLED={str(self.public_mode_enabled).lower()}"
+            )
+
+        if resolved_public and resolved_exposure not in {
             ExposureMode.TEMPORARY_TUNNEL,
             ExposureMode.PUBLIC,
         }:
             raise NetworkProfileError(
                 f"{self.profile.value} enables public mode with invalid exposure "
-                f"{self.exposure_mode.value}"
+                f"{resolved_exposure.value}"
             )
 
-        if not self.public_mode_enabled and self.exposure_mode == ExposureMode.PUBLIC:
+        if not resolved_public and resolved_exposure == ExposureMode.PUBLIC:
             raise NetworkProfileError(
                 f"{self.profile.value} cannot use public exposure unless public mode is enabled"
             )
@@ -104,10 +167,13 @@ class NetworkProfileSpec:
         if public_mode_expires_at:
             _parse_expiration(public_mode_expires_at)
 
+        if self.requires_hardened_host:
+            validate_public_host(host, profile=self.profile.value)
+
         for port in self.allowed_entry_ports:
             PortRule(
                 port=port,
-                public=self.public_mode_enabled or self.binding == NetworkBinding.PUBLIC,
+                public=resolved_public or self.binding == NetworkBinding.PUBLIC,
                 reason=f"{self.profile.value} entrypoint",
             ).validate()
 
@@ -124,6 +190,7 @@ NETWORK_PROFILE_REGISTRY: dict[NetworkProfile, NetworkProfileSpec] = {
         exposure_mode=ExposureMode.PRIVATE,
         binding=NetworkBinding.LOOPBACK,
         public_mode_enabled=False,
+        allowed_exposure_modes=(ExposureMode.PRIVATE,),
         allowed_entry_ports=(),
         bind_hosts=("127.0.0.1", "::1"),
         notes=("Accessible only from the local machine.",),
@@ -133,6 +200,10 @@ NETWORK_PROFILE_REGISTRY: dict[NetworkProfile, NetworkProfileSpec] = {
         exposure_mode=ExposureMode.PRIVATE,
         binding=NetworkBinding.LAN,
         public_mode_enabled=False,
+        allowed_exposure_modes=(
+            ExposureMode.PRIVATE,
+            ExposureMode.LAN,
+        ),
         allowed_entry_ports=(ALLOWED_ENTRY_PORTS["https"],),
         bind_hosts=("0.0.0.0",),
         notes=("Default LAN/intranet profile. Not Internet-facing.",),
@@ -142,6 +213,10 @@ NETWORK_PROFILE_REGISTRY: dict[NetworkProfile, NetworkProfileSpec] = {
         exposure_mode=ExposureMode.VPN,
         binding=NetworkBinding.VPN,
         public_mode_enabled=False,
+        allowed_exposure_modes=(
+            ExposureMode.PRIVATE,
+            ExposureMode.VPN,
+        ),
         allowed_entry_ports=(ALLOWED_ENTRY_PORTS["https"],),
         bind_hosts=("0.0.0.0",),
         notes=("Accessible through a private tunnel or VPN only.",),
@@ -152,6 +227,7 @@ NETWORK_PROFILE_REGISTRY: dict[NetworkProfile, NetworkProfileSpec] = {
         binding=NetworkBinding.TUNNEL,
         public_mode_enabled=True,
         requires_expiration=True,
+        allowed_exposure_modes=(ExposureMode.TEMPORARY_TUNNEL,),
         allowed_entry_ports=(ALLOWED_ENTRY_PORTS["https"],),
         bind_hosts=("0.0.0.0",),
         notes=("Temporary public demo profile. Expiration is mandatory.",),
@@ -162,6 +238,7 @@ NETWORK_PROFILE_REGISTRY: dict[NetworkProfile, NetworkProfileSpec] = {
         binding=NetworkBinding.PUBLIC,
         public_mode_enabled=True,
         requires_hardened_host=True,
+        allowed_exposure_modes=(ExposureMode.PUBLIC,),
         allowed_entry_ports=(
             ALLOWED_ENTRY_PORTS["https"],
             ALLOWED_ENTRY_PORTS["http_redirect"],
@@ -174,6 +251,7 @@ NETWORK_PROFILE_REGISTRY: dict[NetworkProfile, NetworkProfileSpec] = {
         exposure_mode=ExposureMode.PRIVATE,
         binding=NetworkBinding.NONE,
         public_mode_enabled=False,
+        allowed_exposure_modes=(ExposureMode.PRIVATE,),
         allowed_entry_ports=(),
         bind_hosts=(),
         notes=("No external network exposure.",),
@@ -237,37 +315,39 @@ def validate_profile_selection(
     exposure_mode: ExposureMode | str | None = None,
     public_mode_enabled: bool | str | None = None,
     public_mode_expires_at: str | None = None,
+    host: str | None = None,
 ) -> NetworkProfileSpec:
     """Validate a selected profile and optional runtime overrides.
 
     Runtime overrides are allowed only when they preserve the canonical profile's
     safety posture. This prevents the Manager/UI from turning an intranet or
     local profile into an accidental public deployment.
+
+    ``host`` is required for hardened public VPS deployments. It is intentionally
+    called host, not domain, because the Agent network API accepts host as the
+    canonical runtime routing name.
     """
 
     spec = get_network_profile(profile)
-    resolved_exposure = normalize_exposure_mode(exposure_mode)
-
-    if exposure_mode is not None and resolved_exposure != spec.exposure_mode:
-        raise NetworkProfileError(
-            f"profile {spec.profile.value!r} requires exposure "
-            f"{spec.exposure_mode.value!r}; got {resolved_exposure.value!r}"
-        )
-
+    resolved_exposure = (
+        spec.exposure_mode
+        if exposure_mode is None
+        else normalize_exposure_mode(exposure_mode)
+    )
     resolved_public = (
         spec.public_mode_enabled
         if public_mode_enabled is None
         else _parse_bool(public_mode_enabled)
     )
 
-    if resolved_public != spec.public_mode_enabled:
-        raise NetworkProfileError(
-            f"profile {spec.profile.value!r} requires "
-            f"KX_PUBLIC_MODE_ENABLED={str(spec.public_mode_enabled).lower()}"
-        )
+    spec.validate(
+        exposure_mode=resolved_exposure,
+        public_mode_enabled=resolved_public,
+        public_mode_expires_at=public_mode_expires_at,
+        host=host,
+    )
 
-    spec.validate(public_mode_expires_at=public_mode_expires_at)
-    return spec
+    return spec.with_exposure_mode(resolved_exposure)
 
 
 def validate_all_profiles() -> None:
@@ -279,22 +359,32 @@ def validate_all_profiles() -> None:
         raise NetworkProfileError(f"missing canonical network profiles: {missing_values}")
 
     for spec in NETWORK_PROFILE_REGISTRY.values():
-        spec.validate(public_mode_expires_at="2099-01-01T00:00:00Z" if spec.requires_expiration else None)
+        spec.validate(
+            public_mode_expires_at=(
+                "2099-01-01T00:00:00Z" if spec.requires_expiration else None
+            ),
+            host=("example.com" if spec.requires_hardened_host else None),
+        )
 
 
 def profile_to_kx_env(
     profile: NetworkProfile | str,
     *,
+    exposure_mode: ExposureMode | str | None = None,
+    public_mode_enabled: bool | str | None = None,
     public_mode_expires_at: str | None = None,
     host: str | None = None,
 ) -> dict[str, str]:
     """Render canonical KX_* environment values for a profile."""
 
+    normalized_host = normalize_host(host)
+
     spec = validate_profile_selection(
         profile,
-        exposure_mode=get_network_profile(profile).exposure_mode,
-        public_mode_enabled=get_network_profile(profile).public_mode_enabled,
+        exposure_mode=exposure_mode,
+        public_mode_enabled=public_mode_enabled,
         public_mode_expires_at=public_mode_expires_at,
+        host=normalized_host,
     )
 
     return {
@@ -302,7 +392,7 @@ def profile_to_kx_env(
         "KX_EXPOSURE_MODE": spec.exposure_mode.value,
         "KX_PUBLIC_MODE_ENABLED": str(spec.public_mode_enabled).lower(),
         "KX_PUBLIC_MODE_EXPIRES_AT": public_mode_expires_at or "",
-        "KX_HOST": host or "",
+        "KX_HOST": normalized_host or "",
     }
 
 
@@ -313,12 +403,14 @@ def profile_from_kx_env(env: Mapping[str, str]) -> NetworkProfileSpec:
     exposure = env.get("KX_EXPOSURE_MODE", DEFAULT_EXPOSURE_MODE.value)
     public_enabled = env.get("KX_PUBLIC_MODE_ENABLED")
     expires_at = env.get("KX_PUBLIC_MODE_EXPIRES_AT") or None
+    host = env.get("KX_HOST") or None
 
     return validate_profile_selection(
         profile,
         exposure_mode=exposure,
         public_mode_enabled=public_enabled,
         public_mode_expires_at=expires_at,
+        host=host,
     )
 
 
@@ -380,6 +472,91 @@ def assert_no_forbidden_public_ports(ports: Sequence[int]) -> None:
         )
 
 
+def normalize_host(host: str | None) -> str:
+    """Normalize a runtime host value.
+
+    Accepts plain hostnames, IP addresses, or URLs. URLs are normalized to their
+    hostname. Ports and paths are intentionally discarded because KX_HOST is the
+    routing host used by Traefik and Django host validation.
+    """
+
+    candidate = str(host or "").strip()
+    if not candidate:
+        return ""
+
+    if "://" in candidate:
+        parsed = urlparse(candidate)
+        candidate = parsed.hostname or ""
+    else:
+        candidate = candidate.split("/", 1)[0]
+        if candidate.count(":") == 1 and not candidate.startswith("["):
+            candidate = candidate.rsplit(":", 1)[0]
+        if candidate.startswith("[") and "]" in candidate:
+            candidate = candidate[1 : candidate.index("]")]
+
+    return candidate.strip().lower().rstrip(".")
+
+
+def validate_public_host(host: str | None, *, profile: str = "public profile") -> str:
+    """Validate a public runtime host for hardened public profiles."""
+
+    normalized = normalize_host(host)
+
+    if not normalized:
+        raise NetworkProfileError(f"{profile} requires a public host")
+
+    if normalized in {
+        "localhost",
+        "localhost.localdomain",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+    }:
+        raise NetworkProfileError(
+            f"{profile} cannot use loopback or wildcard host {normalized!r}"
+        )
+
+    try:
+        ip = ipaddress.ip_address(normalized)
+    except ValueError:
+        ip = None
+
+    if ip is not None:
+        if ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip.is_multicast:
+            raise NetworkProfileError(
+                f"{profile} cannot use non-routable public host {normalized!r}"
+            )
+
+        if ip.is_private:
+            raise NetworkProfileError(
+                f"{profile} cannot use private address {normalized!r} as public host"
+            )
+
+        return normalized
+
+    if "." not in normalized:
+        raise NetworkProfileError(
+            f"{profile} requires a fully qualified public host, got {normalized!r}"
+        )
+
+    if any(ch.isspace() for ch in normalized):
+        raise NetworkProfileError(f"{profile} host cannot contain whitespace")
+
+    if normalized.startswith("-") or normalized.endswith("-"):
+        raise NetworkProfileError(f"{profile} host has invalid label syntax")
+
+    labels = normalized.split(".")
+    for label in labels:
+        if not label:
+            raise NetworkProfileError(f"{profile} host has an empty DNS label")
+        if len(label) > 63:
+            raise NetworkProfileError(f"{profile} host label is too long")
+        if label.startswith("-") or label.endswith("-"):
+            raise NetworkProfileError(f"{profile} host has invalid DNS label {label!r}")
+
+    return normalized
+
+
 def _parse_bool(value: bool | str) -> bool:
     if isinstance(value, bool):
         return value
@@ -429,9 +606,12 @@ __all__ = [
     "is_private_by_default",
     "is_public_profile",
     "normalize_exposure_mode",
+    "normalize_host",
     "normalize_network_profile",
     "profile_from_kx_env",
     "profile_to_kx_env",
     "validate_all_profiles",
     "validate_profile_selection",
+    "validate_public_host",
 ]
+

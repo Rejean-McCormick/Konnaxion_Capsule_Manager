@@ -1,4 +1,3 @@
----
 doc_id: DOC-10
 title: Konnaxion Builder CLI
 project: Konnaxion
@@ -6,12 +5,14 @@ app_version: v14
 param_version: kx-param-2026.04.30
 status: canonical-draft
 owner: Konnaxion
-last_updated: 2026-04-30
+last_updated: 2026-05-02
 depends_on:
   - DOC-00_Konnaxion_Canonical_Variables.md
   - DOC-03_Konnaxion_Capsule_Format.md
   - DOC-07_Konnaxion_Security_Gate.md
   - DOC-08_Konnaxion_Runtime_Docker_Compose.md
+  - DOC-16_Konnaxion_Manager_GUI_Technical_Contract.md
+  - DOC-18_Konnaxion_GUI_Target_Modes.md
 ---
 
 # DOC-10 — Konnaxion Builder CLI
@@ -20,13 +21,31 @@ depends_on:
 
 This document defines the canonical command-line interface for building, verifying, exporting, and inspecting a `Konnaxion Capsule`.
 
-The canonical CLI command is:
+The canonical public CLI command is:
 
 ```bash
 kx
+````
+
+The current implementation may also expose this compatibility executable:
+
+```bash
+kx-builder
 ```
 
-The Builder CLI must produce portable, signed `.kxcap` files that can be imported by the `Konnaxion Capsule Manager` and executed through the `Konnaxion Agent`.
+Documentation should prefer:
+
+```bash
+kx capsule <command>
+```
+
+Implementation and development examples may use:
+
+```bash
+uv run kx-builder capsule <command>
+```
+
+The Builder CLI must produce portable, signed `.kxcap` files that can be imported by the `Konnaxion Capsule Manager` and executed through the `Konnaxion Agent` without manual image loading, manual runtime env edits, manual Traefik edits, or tunnel-only behavior.
 
 This document depends on:
 
@@ -35,9 +54,11 @@ DOC-00_Konnaxion_Canonical_Variables.md
 DOC-03_Konnaxion_Capsule_Format.md
 DOC-07_Konnaxion_Security_Gate.md
 DOC-08_Konnaxion_Runtime_Docker_Compose.md
+DOC-16_Konnaxion_Manager_GUI_Technical_Contract.md
+DOC-18_Konnaxion_GUI_Target_Modes.md
 ```
 
-All naming, paths, profiles, ports, services, instance states, security statuses, and variable names must remain aligned with `DOC-00`.
+All naming, paths, profiles, ports, services, instance states, security statuses, image archive names, and variable names must remain aligned with `DOC-00`.
 
 Scope boundary:
 
@@ -45,15 +66,23 @@ Scope boundary:
 DOC-10 owns build-time capsule commands only.
 DOC-10 does not own runtime instance commands.
 DOC-10 does not own backup, restore or rollback commands.
+DOC-10 does not own live network profile mutation.
 ```
 
-Runtime operations belong to the `Konnaxion Capsule Manager` and `Konnaxion Agent`.
+Runtime operations belong to:
 
-Backup, restore and rollback command contracts belong to:
+```text
+Konnaxion Capsule Manager
+Konnaxion Agent
+Docker Compose Runtime
+```
+
+Backup, restore, rollback, and live runtime operations belong to:
 
 ```text
 DOC-09_Konnaxion_Backup_Restore_Rollback.md
 DOC-14_Konnaxion_Operator_Guide.md
+DOC-16_Konnaxion_Manager_GUI_Technical_Contract.md
 ```
 
 ---
@@ -64,11 +93,13 @@ The Builder CLI is responsible for:
 
 ```text
 Building frontend and backend release artifacts
-Building canonical Docker images
-Exporting images as OCI tar files
+Building canonical app Docker images
+Exporting all required runtime images as loadable .oci.tar archives
 Generating manifest.yaml
 Generating docker-compose.capsule.yml
 Injecting canonical profiles
+Generating env templates
+Generating healthcheck templates
 Validating capsule structure
 Running build-time security checks
 Generating checksums
@@ -109,7 +140,7 @@ Docker Compose Runtime
 
 ## 2. Canonical CLI Name
 
-The canonical CLI executable is:
+The canonical public CLI executable is:
 
 ```bash
 kx
@@ -129,6 +160,22 @@ kx capsule
 ```
 
 The `kx build` group may exist as a convenience alias, but documentation should primarily use `kx capsule`.
+
+The development executable may be:
+
+```bash
+kx-builder
+```
+
+The compatibility mapping is:
+
+| Public command               | Implementation-compatible command    |
+| ---------------------------- | ------------------------------------ |
+| `kx capsule build`           | `kx-builder capsule build`           |
+| `kx capsule verify`          | `kx-builder capsule verify`          |
+| `kx capsule inspect`         | `kx-builder capsule inspect`         |
+| `kx capsule list-profiles`   | `kx-builder capsule list-profiles`   |
+| `kx capsule export-manifest` | `kx-builder capsule export-manifest` |
 
 ---
 
@@ -158,7 +205,7 @@ kx capsule checksum
 
 The Builder CLI may reference runtime commands only to explain the handoff between a built capsule and a running instance.
 
-These commands are **not owned by DOC-10**:
+These commands are not owned by DOC-10:
 
 ```bash
 kx capsule import
@@ -185,18 +232,18 @@ kx network set-profile
 
 Ownership:
 
-| Command group | Owning document |
-|---|---|
-| `kx capsule build` | `DOC-10_Konnaxion_Builder_CLI.md` |
-| `kx capsule verify` | `DOC-10_Konnaxion_Builder_CLI.md` |
-| `kx capsule inspect` | `DOC-10_Konnaxion_Builder_CLI.md` |
-| `kx capsule list-profiles` | `DOC-10_Konnaxion_Builder_CLI.md` |
-| `kx capsule export-manifest` | `DOC-10_Konnaxion_Builder_CLI.md` |
-| `kx capsule import` | `DOC-04_Konnaxion_Manager_Architecture.md` / `DOC-05_Konnaxion_Agent_Security_Model.md` |
-| `kx instance *` | `DOC-04_Konnaxion_Manager_Architecture.md` / `DOC-05_Konnaxion_Agent_Security_Model.md` |
-| `kx backup *` | `DOC-09_Konnaxion_Backup_Restore_Rollback.md` |
-| `kx security check` | `DOC-07_Konnaxion_Security_Gate.md` |
-| `kx network set-profile` | `DOC-06_Konnaxion_Network_Profiles.md` |
+| Command group                | Owning document                                                                         |
+| ---------------------------- | --------------------------------------------------------------------------------------- |
+| `kx capsule build`           | `DOC-10_Konnaxion_Builder_CLI.md`                                                       |
+| `kx capsule verify`          | `DOC-10_Konnaxion_Builder_CLI.md`                                                       |
+| `kx capsule inspect`         | `DOC-10_Konnaxion_Builder_CLI.md`                                                       |
+| `kx capsule list-profiles`   | `DOC-10_Konnaxion_Builder_CLI.md`                                                       |
+| `kx capsule export-manifest` | `DOC-10_Konnaxion_Builder_CLI.md`                                                       |
+| `kx capsule import`          | `DOC-04_Konnaxion_Manager_Architecture.md` / `DOC-05_Konnaxion_Agent_Security_Model.md` |
+| `kx instance *`              | `DOC-04_Konnaxion_Manager_Architecture.md` / `DOC-05_Konnaxion_Agent_Security_Model.md` |
+| `kx backup *`                | `DOC-09_Konnaxion_Backup_Restore_Rollback.md`                                           |
+| `kx security check`          | `DOC-07_Konnaxion_Security_Gate.md`                                                     |
+| `kx network set-profile`     | `DOC-06_Konnaxion_Network_Profiles.md`                                                  |
 
 DOC-10 must not become the canonical reference for runtime operations.
 
@@ -269,6 +316,18 @@ Example:
 ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
 ```
 
+Development or GUI integration may write capsules to:
+
+```text
+./runtime/capsules/
+```
+
+Example:
+
+```text
+./runtime/capsules/konnaxion-v14-demo-2026.05.02.kxcap
+```
+
 ---
 
 ## 5. Canonical Capsule Structure
@@ -279,10 +338,15 @@ The Builder CLI must produce a `.kxcap` archive using this structure:
 .kxcap
 ├── manifest.yaml
 ├── docker-compose.capsule.yml
+├── images.yaml
 ├── images/
 │   ├── frontend-next.oci.tar
 │   ├── django-api.oci.tar
 │   ├── traefik.oci.tar
+│   ├── postgres.oci.tar
+│   ├── redis.oci.tar
+│   ├── celeryworker.oci.tar
+│   ├── celerybeat.oci.tar
 │   └── media-nginx.oci.tar
 ├── profiles/
 │   ├── local_only.yaml
@@ -299,36 +363,231 @@ The Builder CLI must produce a `.kxcap` archive using this structure:
 ├── migrations/
 ├── seed-data/
 ├── healthchecks/
+│   └── capsule-healthcheck.json
+├── policies/
+│   └── capsule-policy.json
+├── metadata/
+│   ├── build.json
+│   └── source-inventory.json
 ├── checksums.txt
 └── signature.sig
 ```
 
+Optional private-only service archive:
+
+```text
+images/flower.oci.tar
+```
+
 The Builder must fail if the generated capsule structure does not match the canonical format.
+
+The Builder must never produce a deployable-looking capsule whose `images/` directory contains only:
+
+```text
+images/README.json
+```
+
+That state is invalid because the Droplet runtime cannot start private app images without offline-loadable image archives.
 
 ---
 
-## 6. Canonical Services Built by the CLI
+## 6. Canonical Services Built or Exported by the CLI
 
-The Builder must use the canonical service names defined by `DOC-00`.
+The Builder must use canonical service names defined by `DOC-00`.
 
-| Service | Builder Responsibility |
-|---|---|
-| `frontend-next` | Build Next.js production frontend image |
-| `django-api` | Build Django/Gunicorn backend image |
-| `traefik` | Include approved Traefik image/config |
-| `media-nginx` | Include approved media/static service image |
-| `postgres` | Reference approved upstream image, no custom secret baked in |
-| `redis` | Reference approved upstream image, no custom secret baked in |
-| `celeryworker` | Use the `django-api` image with worker command |
-| `celerybeat` | Use the `django-api` image with beat command |
-| `flower` | Private-only optional service |
-| `kx-agent` | Not bundled as an application service unless explicitly approved |
+| Service         | Builder Responsibility                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------------ |
+| `frontend-next` | Build Next.js production frontend image and export as `frontend-next.oci.tar`                    |
+| `django-api`    | Build Django/Gunicorn backend image and export as `django-api.oci.tar`                           |
+| `traefik`       | Pull/include approved Traefik image and export as `traefik.oci.tar`                              |
+| `media-nginx`   | Pull/include approved media/static image and export as `media-nginx.oci.tar`                     |
+| `postgres`      | Pull/include approved upstream image and export as `postgres.oci.tar`; no custom secret baked in |
+| `redis`         | Pull/include approved upstream image and export as `redis.oci.tar`; no custom secret baked in    |
+| `celeryworker`  | Reuse the `django-api` image and export a canonical `celeryworker.oci.tar` service archive       |
+| `celerybeat`    | Reuse the `django-api` image and export a canonical `celerybeat.oci.tar` service archive         |
+| `flower`        | Private-only optional service; may reuse the `django-api` image                                  |
+| `kx-agent`      | Not bundled as an application service unless explicitly approved                                 |
 
 The capsule must not include images with non-canonical service names unless the manifest maps them explicitly.
 
 ---
 
-## 7. Build Pipeline
+## 7. Canonical Image Tags and Archives
+
+## 7.1 App Image Tags
+
+The Builder should tag app-built images with capsule-scoped tags:
+
+```text
+konnaxion/frontend-next:<APP_VERSION>-<CAPSULE_ID>
+konnaxion/django-api:<APP_VERSION>-<CAPSULE_ID>
+```
+
+Example:
+
+```text
+konnaxion/frontend-next:v14-konnaxion-v14-demo-2026.05.02
+konnaxion/django-api:v14-konnaxion-v14-demo-2026.05.02
+```
+
+For runtime compose compatibility, the Agent may retag loaded images to:
+
+```text
+konnaxion/frontend-next:v14
+konnaxion/django-api:v14
+```
+
+## 7.2 External Runtime Images
+
+Approved default external images:
+
+```text
+traefik:v3.1
+postgres:16
+redis:7
+nginx:stable
+```
+
+These must be exported into the capsule so a Droplet or offline runtime does not need registry access.
+
+## 7.3 Archive Names
+
+Archive names are canonical by service:
+
+```text
+images/frontend-next.oci.tar
+images/django-api.oci.tar
+images/traefik.oci.tar
+images/postgres.oci.tar
+images/redis.oci.tar
+images/celeryworker.oci.tar
+images/celerybeat.oci.tar
+images/media-nginx.oci.tar
+```
+
+Even when multiple services share the same image tag, each canonical service should have a manifest-visible archive entry.
+
+---
+
+## 8. Frontend Image Contract
+
+The Builder must build `frontend-next` as a production runtime image.
+
+The runtime image must not require:
+
+```text
+pnpm download at runtime
+Corepack download at runtime
+network access during container start
+development server command
+```
+
+The runtime image must include:
+
+```text
+package.json
+node_modules/
+.next/
+public/
+next.config.*
+env.mjs
+```
+
+The runtime command must be equivalent to:
+
+```bash
+node node_modules/next/dist/bin/next start -H 0.0.0.0 -p 3000
+```
+
+The build stage must set:
+
+```text
+NODE_OPTIONS=--max-old-space-size=4096
+NODE_ENV=production
+```
+
+A canonical frontend Dockerfile template is:
+
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml* ./
+RUN pnpm install --no-frozen-lockfile
+
+COPY . .
+
+ENV NODE_ENV=production
+ENV NODE_OPTIONS=--max-old-space-size=4096
+
+RUN pnpm build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+ENV NEXT_TELEMETRY_DISABLED=1
+
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/next.config.* ./
+COPY --from=builder /app/env.mjs ./env.mjs
+
+EXPOSE 3000
+
+CMD ["node", "node_modules/next/dist/bin/next", "start", "-H", "0.0.0.0", "-p", "3000"]
+```
+
+---
+
+## 9. Backend Image Contract
+
+The Builder must build `django-api` as a production runtime image.
+
+The Builder must not allow local virtualenvs, caches, stale generated files, or development artifacts to pollute the Docker build context.
+
+The Builder must create or enforce a clean backend build context that excludes:
+
+```text
+.venv
+venv
+env
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+media
+staticfiles
+logs
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.log
+```
+
+The Builder must verify the backend context before build.
+
+Required sanity checks:
+
+```text
+backend/konnaxion/ethikos/models.py exists
+backend/konnaxion/ethikos/models.py must not contain migration-file content
+backend/konnaxion/ethikos/models.py must contain expected app models
+production Django Dockerfile exists
+```
+
+The Builder must fail if a source file is unexpectedly replaced by migration content, generated content, or an empty placeholder.
+
+---
+
+## 10. Build Pipeline
 
 A canonical `kx capsule build` must execute these stages in order:
 
@@ -337,102 +596,159 @@ A canonical `kx capsule build` must execute these stages in order:
 2. Validate repository layout
 3. Validate canonical variables
 4. Validate network profiles
-5. Build frontend
-6. Build backend
-7. Build Docker images
-8. Run tests and static checks
-9. Generate docker-compose.capsule.yml
-10. Generate manifest.yaml
-11. Export Docker images as OCI tar files
-12. Generate env templates
-13. Add profiles
-14. Add migrations and optional seed data
-15. Generate healthchecks
-16. Generate checksums.txt
-17. Sign capsule
-18. Verify finished capsule
-19. Write .kxcap to output path
+5. Prepare clean backend Docker context
+6. Build frontend production image
+7. Build backend production image
+8. Pull or verify approved external runtime images
+9. Export all required runtime images as images/*.oci.tar
+10. Generate images.yaml
+11. Generate docker-compose.capsule.yml
+12. Generate manifest.yaml
+13. Generate env templates
+14. Add profiles
+15. Add migrations and optional seed data
+16. Generate healthcheck templates
+17. Run build-time tests and static checks
+18. Run build-time security checks
+19. Generate checksums.txt
+20. Sign capsule
+21. Verify finished capsule
+22. Write .kxcap to output path
 ```
 
 If any critical stage fails, the Builder must stop and return a non-zero exit code.
 
+The Builder must not sign a capsule until image archives and checksums are complete.
+
 ---
 
-## 8. Command: `kx capsule build`
+## 11. Command: `kx capsule build`
 
-## 8.1 Purpose
+## 11.1 Purpose
 
 Build a new signed `Konnaxion Capsule`.
 
-## 8.2 Canonical Syntax
+## 11.2 Canonical Syntax
 
 ```bash
 kx capsule build \
+  --source-dir ./Konnaxion \
+  --output ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap \
+  --channel demo \
+  --capsule-id konnaxion-v14-demo-2026.05.02 \
+  --version 2026.05.02-demo.1 \
   --app-version v14 \
-  --capsule-version 2026.04.30-demo.1 \
-  --profile demo \
-  --output ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
+  --signing-key-file ./runtime/signing/kx-demo-ed25519-private.pem \
+  --public-key-file ./runtime/signing/kx-demo-ed25519-public.pem \
+  --force
 ```
 
-## 8.3 Common Options
+Compatibility form:
 
-| Option | Required | Description |
-|---|---:|---|
-| `--app-version` | Yes | Application version, e.g. `v14` |
-| `--capsule-version` | Yes | Capsule version, e.g. `2026.04.30-demo.1` |
-| `--profile` | Yes | Build profile, e.g. `demo`, `release`, `dev` |
-| `--output` | Yes | Output `.kxcap` path |
-| `--source-root` | No | Source repo root, default current directory |
-| `--frontend-root` | No | Frontend path, default `frontend` |
-| `--backend-root` | No | Backend path, default `backend` |
-| `--include-seed-data` | No | Include approved seed data |
-| `--skip-tests` | No | Skip tests; forbidden for release builds |
-| `--unsigned` | No | Produce unsigned dev capsule; forbidden for release builds |
-| `--verbose` | No | Detailed logs |
-| `--json` | No | Machine-readable output |
+```bash
+uv run kx-builder capsule build \
+  --source-dir C:\mycode\Konnaxion\Konnaxion \
+  --output C:\mycode\Konnaxion\runtime\capsules\konnaxion-v14-demo-2026.05.02.kxcap \
+  --channel demo \
+  --capsule-id konnaxion-v14-demo-2026.05.02 \
+  --version 2026.05.02-demo.1 \
+  --app-version v14 \
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
+  --signing-key-file C:\mycode\Konnaxion\runtime\signing\kx-demo-ed25519-private.pem \
+  --public-key-file C:\mycode\Konnaxion\runtime\signing\kx-demo-ed25519-public.pem \
+  --force
+```
 
-## 8.4 Example: Demo Capsule
+## 11.3 Common Options
+
+| Option                |                     Required | Description                                              |
+| --------------------- | ---------------------------: | -------------------------------------------------------- |
+| `--source-dir`        |                          Yes | Source repo root containing `backend/` and `frontend/`   |
+| `--output`            |                          Yes | Output `.kxcap` path                                     |
+| `--channel`           |                          Yes | Build channel, e.g. `dev`, `demo`, `release`, `ci`       |
+| `--capsule-id`        |                          Yes | Capsule ID, e.g. `konnaxion-v14-demo-2026.05.02`         |
+| `--version`           |                          Yes | Capsule version, e.g. `2026.05.02-demo.1`                |
+| `--app-version`       |                          Yes | Application version, e.g. `v14`                          |
+| `--param-version`     |                          Yes | Parameter version, e.g. `kx-param-2026.04.30`            |
+| `--profile`           |                          Yes | Default network profile to embed, e.g. `public_vps`      |
+| `--signing-key-file`  | Required except unsigned dev | Private signing key                                      |
+| `--public-key-file`   |                  Recommended | Public key used for verification metadata                |
+| `--include-seed-data` |                           No | Include approved seed data                               |
+| `--skip-tests`        |                           No | Skip tests; forbidden for release builds                 |
+| `--unsigned`          |                           No | Produce unsigned dev capsule; forbidden for demo/release |
+| `--force`             |                           No | Overwrite existing output                                |
+| `--verbose`           |                           No | Detailed logs                                            |
+| `--json`              |                           No | Machine-readable output                                  |
+
+## 11.4 Example: Demo Capsule
 
 ```bash
 kx capsule build \
+  --source-dir ./Konnaxion \
+  --output ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap \
+  --channel demo \
+  --capsule-id konnaxion-v14-demo-2026.05.02 \
+  --version 2026.05.02-demo.1 \
   --app-version v14 \
-  --capsule-version 2026.04.30-demo.1 \
-  --profile demo \
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
   --include-seed-data \
-  --output ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+  --signing-key-file ./runtime/signing/kx-demo-ed25519-private.pem \
+  --public-key-file ./runtime/signing/kx-demo-ed25519-public.pem \
+  --force
 ```
 
-## 8.5 Example: Release Capsule
+## 11.5 Example: Release Capsule
 
 ```bash
 kx capsule build \
+  --source-dir ./Konnaxion \
+  --output ./dist/capsules/konnaxion-v14-release-2026.05.02.kxcap \
+  --channel release \
+  --capsule-id konnaxion-v14-release-2026.05.02 \
+  --version 2026.05.02-release.1 \
   --app-version v14 \
-  --capsule-version 2026.04.30-release.1 \
-  --profile release \
-  --output ./dist/capsules/konnaxion-v14-release-2026.04.30.kxcap
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
+  --signing-key-file ./secrets/release-ed25519-private.pem \
+  --public-key-file ./secrets/release-ed25519-public.pem
 ```
 
 Release builds must be signed.
 
-Release builds must not use `--skip-tests`.
+Release builds must not use:
 
-Release builds must not use `--unsigned`.
+```text
+--skip-tests
+--unsigned
+```
+
+Demo builds must be signed unless explicitly configured as development-only.
 
 ---
 
-## 9. Command: `kx capsule verify`
+## 12. Command: `kx capsule verify`
 
-## 9.1 Purpose
+## 12.1 Purpose
 
 Verify a `.kxcap` file before import, distribution, or installation.
 
-## 9.2 Syntax
+## 12.2 Syntax
 
 ```bash
-kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
 ```
 
-## 9.3 Required Checks
+Compatibility form:
+
+```bash
+uv run kx-builder capsule verify C:\mycode\Konnaxion\runtime\capsules\konnaxion-v14-demo-2026.05.02.kxcap
+```
+
+## 12.3 Required Checks
 
 The verify command must check:
 
@@ -442,13 +758,18 @@ capsule extension is .kxcap
 manifest.yaml exists
 manifest schema is valid
 docker-compose.capsule.yml exists
+images.yaml exists
 all required directories exist
 all required profiles exist
-all listed OCI images exist
+all required image archives exist
+all listed image archives exist
+all listed image archives use .oci.tar suffix
+all listed image archives are non-empty
+all listed image archive checksums match images.yaml
 checksums.txt exists
 all checksums match
 signature.sig exists
-signature is valid
+signature is valid when verifier provided
 no forbidden secrets are present
 no forbidden public ports are declared
 no Docker socket mount is declared
@@ -457,17 +778,48 @@ no host network mode is declared
 all service names are canonical or explicitly mapped
 ```
 
-## 9.4 Output
+## 12.4 Mandatory Image Verification Failure Cases
+
+Verification must fail if any of these are true:
+
+```text
+images/ contains only README.json
+images.yaml is missing
+images.yaml has no images
+manifest declares service images but archive files are absent
+frontend-next.oci.tar is missing
+django-api.oci.tar is missing
+traefik.oci.tar is missing
+postgres.oci.tar is missing
+redis.oci.tar is missing
+celeryworker.oci.tar is missing
+celerybeat.oci.tar is missing
+media-nginx.oci.tar is missing
+any archive checksum does not match
+any archive is zero bytes
+```
+
+A capsule with this structure is invalid:
+
+```text
+images/
+└── README.json
+```
+
+The verify command must not report `OK` for that capsule.
+
+## 12.5 Output
 
 Human-readable output:
 
 ```text
 Konnaxion Capsule Verification
 
-Capsule: konnaxion-v14-demo-2026.04.30.kxcap
+Capsule: konnaxion-v14-demo-2026.05.02.kxcap
 Status: PASS
 
 [PASS] manifest_schema
+[PASS] image_archives_present
 [PASS] image_checksums
 [PASS] capsule_signature
 [PASS] dangerous_ports_blocked
@@ -479,15 +831,15 @@ Status: PASS
 Machine-readable output:
 
 ```bash
-kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap --json
+kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap --json
 ```
 
 Example JSON:
 
 ```json
 {
-  "capsule_id": "konnaxion-v14-demo-2026.04.30",
-  "capsule_version": "2026.04.30-demo.1",
+  "capsule_id": "konnaxion-v14-demo-2026.05.02",
+  "capsule_version": "2026.05.02-demo.1",
   "status": "PASS",
   "checks": [
     {
@@ -495,35 +847,42 @@ Example JSON:
       "status": "PASS"
     },
     {
+      "name": "image_archives_present",
+      "status": "PASS"
+    },
+    {
       "name": "capsule_signature",
       "status": "PASS"
     }
-  ]
+  ],
+  "warnings": [],
+  "errors": []
 }
 ```
 
 ---
 
-## 10. Command: `kx capsule inspect`
+## 13. Command: `kx capsule inspect`
 
-## 10.1 Purpose
+## 13.1 Purpose
 
 Print metadata from a `.kxcap` file without importing it.
 
-## 10.2 Syntax
+## 13.2 Syntax
 
 ```bash
-kx capsule inspect konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule inspect konnaxion-v14-demo-2026.05.02.kxcap
 ```
 
-## 10.3 Expected Output
+## 13.3 Expected Output
 
 ```text
-Capsule ID: konnaxion-v14-demo-2026.04.30
-Capsule Version: 2026.04.30-demo.1
+Capsule ID: konnaxion-v14-demo-2026.05.02
+Capsule Version: 2026.05.02-demo.1
 Application Version: v14
-Default Network Profile: intranet_private
-Default Exposure Mode: private
+Parameter Version: kx-param-2026.04.30
+Default Network Profile: public_vps
+Default Exposure Mode: public
 Services:
   - traefik
   - frontend-next
@@ -533,6 +892,15 @@ Services:
   - celeryworker
   - celerybeat
   - media-nginx
+Images:
+  - images/traefik.oci.tar
+  - images/frontend-next.oci.tar
+  - images/django-api.oci.tar
+  - images/postgres.oci.tar
+  - images/redis.oci.tar
+  - images/celeryworker.oci.tar
+  - images/celerybeat.oci.tar
+  - images/media-nginx.oci.tar
 Profiles:
   - local_only
   - intranet_private
@@ -545,19 +913,19 @@ Signed: yes
 
 ---
 
-## 11. Command: `kx capsule list-profiles`
+## 14. Command: `kx capsule list-profiles`
 
-## 11.1 Purpose
+## 14.1 Purpose
 
 List network profiles embedded in a capsule.
 
-## 11.2 Syntax
+## 14.2 Syntax
 
 ```bash
-kx capsule list-profiles konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule list-profiles konnaxion-v14-demo-2026.05.02.kxcap
 ```
 
-## 11.3 Output
+## 14.3 Output
 
 ```text
 local_only
@@ -572,47 +940,52 @@ The command must fail if any canonical profile is missing.
 
 ---
 
-## 12. Command: `kx capsule export-manifest`
+## 15. Command: `kx capsule export-manifest`
 
-## 12.1 Purpose
+## 15.1 Purpose
 
 Extract `manifest.yaml` from a capsule for inspection, auditing, or CI checks.
 
-## 12.2 Syntax
+## 15.2 Syntax
 
 ```bash
-kx capsule export-manifest konnaxion-v14-demo-2026.04.30.kxcap \
-  --output ./dist/manifests/konnaxion-v14-demo-2026.04.30.manifest.yaml
+kx capsule export-manifest konnaxion-v14-demo-2026.05.02.kxcap \
+  --output ./dist/manifests/konnaxion-v14-demo-2026.05.02.manifest.yaml
 ```
 
 ---
 
-## 13. Command: `kx capsule doctor`
+## 16. Command: `kx capsule doctor`
 
-## 13.1 Purpose
+## 16.1 Purpose
 
 Check the local build environment.
 
-## 13.2 Syntax
+## 16.2 Syntax
 
 ```bash
 kx capsule doctor
 ```
 
-## 13.3 Required Checks
+## 16.3 Required Checks
 
 ```text
 Docker available
+Docker daemon running
 Docker Compose available
 Node.js available
 pnpm available
 Python available
 backend source exists
 frontend source exists
+backend production Dockerfile exists
+frontend package.json exists
+frontend env.mjs exists
 Git worktree status available
 sufficient disk space
 sufficient memory
-signing key configured for release builds
+signing key configured for demo/release builds
+external images pullable or already available
 ```
 
 Example:
@@ -621,12 +994,15 @@ Example:
 Konnaxion Builder Doctor
 
 [PASS] docker_available
+[PASS] docker_daemon_running
 [PASS] docker_compose_available
 [PASS] node_available
 [PASS] pnpm_available
 [PASS] python_available
 [PASS] backend_root_exists
 [PASS] frontend_root_exists
+[PASS] backend_production_dockerfile_exists
+[PASS] frontend_env_mjs_exists
 [WARN] git_worktree_dirty
 [PASS] signing_key_available
 ```
@@ -635,7 +1011,7 @@ A dirty Git worktree may be allowed for development builds but should block rele
 
 ---
 
-## 14. Build Configuration File
+## 17. Build Configuration File
 
 The Builder may accept a canonical config file:
 
@@ -656,14 +1032,14 @@ source:
   backend_root: backend
 
 capsule:
-  id: konnaxion-v14-demo-2026.04.30
-  version: 2026.04.30-demo.1
-  output: ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+  id: konnaxion-v14-demo-2026.05.02
+  version: 2026.05.02-demo.1
+  output: ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
   include_seed_data: true
 
 profiles:
-  default_network_profile: intranet_private
-  default_exposure_mode: private
+  default_network_profile: public_vps
+  default_exposure_mode: public
   include:
     - local_only
     - intranet_private
@@ -683,8 +1059,10 @@ security:
 build:
   run_tests: true
   export_oci_images: true
+  include_external_runtime_images: true
   generate_checksums: true
   sign_capsule: true
+  clean_backend_context: true
 ```
 
 Command using config:
@@ -697,7 +1075,7 @@ Command-line flags override config values unless explicitly forbidden by the sel
 
 ---
 
-## 15. Canonical `manifest.yaml`
+## 18. Canonical `manifest.yaml`
 
 The Builder must generate `manifest.yaml`.
 
@@ -706,12 +1084,12 @@ Minimum required fields:
 ```yaml
 project: Konnaxion
 app_version: v14
-capsule_id: konnaxion-v14-demo-2026.04.30
-capsule_version: 2026.04.30-demo.1
+capsule_id: konnaxion-v14-demo-2026.05.02
+capsule_version: 2026.05.02-demo.1
 param_version: kx-param-2026.04.30
 
-default_network_profile: intranet_private
-default_exposure_mode: private
+default_network_profile: public_vps
+default_exposure_mode: public
 
 required_ram_mb: 4096
 recommended_ram_mb: 8192
@@ -720,34 +1098,50 @@ services:
   traefik:
     role: reverse_proxy
     public_entrypoint: true
+    image: traefik:v3.1
+    archive: images/traefik.oci.tar
 
   frontend-next:
     role: frontend
     internal_port: 3000
+    image: konnaxion/frontend-next:v14
+    archive: images/frontend-next.oci.tar
 
   django-api:
     role: backend_api
     internal_port: 5000
+    image: konnaxion/django-api:v14
+    archive: images/django-api.oci.tar
 
   postgres:
     role: database
     internal_only: true
+    image: postgres:16
+    archive: images/postgres.oci.tar
 
   redis:
     role: broker
     internal_only: true
+    image: redis:7
+    archive: images/redis.oci.tar
 
   celeryworker:
     role: background_worker
     internal_only: true
+    image: konnaxion/django-api:v14
+    archive: images/celeryworker.oci.tar
 
   celerybeat:
     role: scheduler
     internal_only: true
+    image: konnaxion/django-api:v14
+    archive: images/celerybeat.oci.tar
 
   media-nginx:
     role: media_static
     internal_only: true
+    image: nginx:stable
+    archive: images/media-nginx.oci.tar
 
 routes:
   "/": frontend-next
@@ -776,7 +1170,48 @@ The Builder must fail if required manifest fields are missing.
 
 ---
 
-## 16. Canonical `docker-compose.capsule.yml`
+## 19. Canonical `images.yaml`
+
+The Builder must generate `images.yaml`.
+
+Example:
+
+```yaml
+generated_at: "2026-05-02T21:24:27Z"
+images:
+  - service: frontend-next
+    image: konnaxion/frontend-next:v14-konnaxion-v14-demo-2026.05.02
+    archive: frontend-next.oci.tar
+    sha256: "<sha256>"
+    size_bytes: 524288000
+    exported_at: "2026-05-02T21:24:27Z"
+
+  - service: django-api
+    image: konnaxion/django-api:v14-konnaxion-v14-demo-2026.05.02
+    archive: django-api.oci.tar
+    sha256: "<sha256>"
+    size_bytes: 156237824
+    exported_at: "2026-05-02T21:24:27Z"
+
+  - service: traefik
+    image: traefik:v3.1
+    archive: traefik.oci.tar
+    sha256: "<sha256>"
+    size_bytes: 0
+    exported_at: "2026-05-02T21:24:27Z"
+```
+
+The `archive` field is relative to:
+
+```text
+images/
+```
+
+The Builder must keep `images.yaml`, `manifest.yaml`, and `checksums.txt` consistent.
+
+---
+
+## 20. Canonical `docker-compose.capsule.yml`
 
 The Builder must generate or include `docker-compose.capsule.yml`.
 
@@ -795,6 +1230,8 @@ Do not mount Docker socket
 Do not use privileged containers
 Do not use host network
 Use named volumes or instance paths provided by the Agent
+Use image names that match manifest/image metadata
+Use commands compatible with offline-loaded images
 ```
 
 Forbidden examples:
@@ -826,9 +1263,51 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
+The Builder does not need to embed live public hostnames in `docker-compose.capsule.yml`.
+
+The Agent owns final runtime rendering for:
+
+```text
+KX_HOST
+DJANGO_ALLOWED_HOSTS
+NEXT_PUBLIC_API_BASE
+NEXT_PUBLIC_BACKEND_BASE
+Traefik Host() rules
+```
+
+However, Builder output must contain enough route metadata for the Agent to render those values correctly.
+
 ---
 
-## 17. Build-Time Secret Policy
+## 21. Runtime Handoff Requirements for `public_vps`
+
+A capsule built by DOC-10 must be usable by the Manager and Agent for `public_vps` deployment without manual editing.
+
+For `public_vps`, the Agent must be able to generate:
+
+```text
+KX_HOST=<public host>
+DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost,<public host>,django-api,kx-<instance>-django-api
+NEXT_PUBLIC_API_BASE=https://<public host>/api
+NEXT_PUBLIC_BACKEND_BASE=https://<public host>
+Traefik file-provider rule Host(`<public host>`)
+```
+
+The Builder must not bake a specific Droplet host into the capsule.
+
+The Builder must provide canonical placeholders:
+
+```text
+<GENERATED_FROM_PROFILE>
+<SET_BY_MANAGER>
+<GENERATED_ON_INSTALL>
+```
+
+The Manager and Agent must resolve those placeholders at import/create/start time.
+
+---
+
+## 22. Build-Time Secret Policy
 
 The Builder must not bake secrets into images or capsule files.
 
@@ -844,6 +1323,8 @@ provider tokens
 API keys
 production .env files
 private certificates
+cookies
+authorization headers
 ```
 
 Allowed:
@@ -871,13 +1352,15 @@ Example:
 DJANGO_SECRET_KEY=<GENERATED_ON_INSTALL>
 POSTGRES_PASSWORD=<GENERATED_ON_INSTALL>
 DJANGO_ALLOWED_HOSTS=<GENERATED_FROM_PROFILE>
+NEXT_PUBLIC_API_BASE=<GENERATED_FROM_PROFILE>
+NEXT_PUBLIC_BACKEND_BASE=<GENERATED_FROM_PROFILE>
 ```
 
 ---
 
-## 18. Signing and Checksums
+## 23. Signing and Checksums
 
-## 18.1 Checksums
+## 23.1 Checksums
 
 The Builder must generate:
 
@@ -892,13 +1375,18 @@ Recommended format:
 ```text
 sha256  manifest.yaml
 sha256  docker-compose.capsule.yml
+sha256  images.yaml
 sha256  images/frontend-next.oci.tar
 sha256  images/django-api.oci.tar
 sha256  images/traefik.oci.tar
+sha256  images/postgres.oci.tar
+sha256  images/redis.oci.tar
+sha256  images/celeryworker.oci.tar
+sha256  images/celerybeat.oci.tar
 sha256  images/media-nginx.oci.tar
 ```
 
-## 18.2 Signature
+## 23.2 Signature
 
 The Builder must generate:
 
@@ -912,13 +1400,16 @@ The signature must cover:
 checksums.txt
 manifest.yaml
 docker-compose.capsule.yml
+images.yaml
 profiles/
 env-templates/
 images/
 healthchecks/
+policies/
+metadata/
 ```
 
-Release capsules must be signed.
+Release and demo capsules must be signed.
 
 Unsigned capsules are allowed only for local development and must be clearly marked:
 
@@ -930,16 +1421,16 @@ The Manager and Agent must reject unsigned capsules unless explicitly running in
 
 ---
 
-## 19. Build Profiles
+## 24. Build Profiles
 
 The Builder supports these build profiles:
 
-| Build Profile | Purpose | Signed | Tests Required | Seed Data |
-|---|---|---:|---:|---:|
-| `dev` | Local developer testing | Optional | Optional | Optional |
-| `demo` | Demo-ready capsule | Required | Required | Optional |
-| `release` | Production-grade capsule | Required | Required | No by default |
-| `ci` | Automated CI validation | Required for release artifacts | Required | No |
+| Build Profile |                  Purpose |                         Signed | Tests Required |     Seed Data |
+| ------------- | -----------------------: | -----------------------------: | -------------: | ------------: |
+| `dev`         |  Local developer testing |                       Optional |       Optional |      Optional |
+| `demo`        |       Demo-ready capsule |                       Required |       Required |      Optional |
+| `release`     | Production-grade capsule |                       Required |       Required | No by default |
+| `ci`          |  Automated CI validation | Required for release artifacts |       Required |            No |
 
 These are build profiles, not network profiles.
 
@@ -958,13 +1449,20 @@ offline
 
 ---
 
-## 20. Required Build Checks
+## 25. Required Build Checks
 
 The Builder must perform these checks before producing a capsule:
 
 ```text
 canonical_service_names
 canonical_network_profiles
+repository_layout_valid
+clean_backend_context_valid
+frontend_runtime_image_valid
+backend_runtime_image_valid
+external_images_available
+image_export_complete
+image_metadata_generated
 no_real_secrets
 no_public_internal_ports
 no_docker_socket_mount
@@ -972,7 +1470,6 @@ no_privileged_containers
 no_host_network
 manifest_schema
 compose_schema
-image_export_complete
 checksums_generated
 signature_generated
 capsule_verify_passes
@@ -986,7 +1483,7 @@ For dev builds, warnings may be allowed, but the capsule must be marked as devel
 
 ---
 
-## 21. Output Status Values
+## 26. Output Status Values
 
 The Builder uses the canonical Security Gate statuses from `DOC-00`:
 
@@ -1009,37 +1506,37 @@ BUILD_SECURITY_BLOCKED
 
 Mapping:
 
-| Build Result | Meaning |
-|---|---|
-| `BUILD_PASS` | Capsule produced and verified |
+| Build Result               | Meaning                                       |
+| -------------------------- | --------------------------------------------- |
+| `BUILD_PASS`               | Capsule produced and verified                 |
 | `BUILD_PASS_WITH_WARNINGS` | Capsule produced, non-blocking warnings exist |
-| `BUILD_FAIL` | Build failed |
-| `BUILD_SECURITY_BLOCKED` | Build blocked by security policy |
+| `BUILD_FAIL`               | Build failed                                  |
+| `BUILD_SECURITY_BLOCKED`   | Build blocked by security policy              |
 
 ---
 
-## 22. Exit Codes
+## 27. Exit Codes
 
 Canonical exit codes:
 
-| Code | Meaning |
-|---:|---|
-| `0` | Success |
-| `1` | General error |
-| `2` | Invalid CLI usage |
-| `3` | Build failed |
-| `4` | Verification failed |
-| `5` | Security policy failure |
-| `6` | Missing dependency |
-| `7` | Signing failure |
-| `8` | Manifest/schema failure |
-| `9` | File or path error |
+| Code | Meaning                 |
+| ---: | ----------------------- |
+|  `0` | Success                 |
+|  `1` | General error           |
+|  `2` | Invalid CLI usage       |
+|  `3` | Build failed            |
+|  `4` | Verification failed     |
+|  `5` | Security policy failure |
+|  `6` | Missing dependency      |
+|  `7` | Signing failure         |
+|  `8` | Manifest/schema failure |
+|  `9` | File or path error      |
 
 Scripts and CI systems should rely on these exit codes.
 
 ---
 
-## 23. Logs
+## 28. Logs
 
 Default log directory:
 
@@ -1067,6 +1564,7 @@ The Builder must redact:
 DJANGO_SECRET_KEY
 POSTGRES_PASSWORD
 DATABASE_URL password segment
+REDIS_URL password segment
 API keys
 tokens
 private keys
@@ -1082,7 +1580,7 @@ Canonical redaction marker:
 
 ---
 
-## 24. JSON Output Contract
+## 29. JSON Output Contract
 
 All major commands should support:
 
@@ -1102,9 +1600,13 @@ Minimum JSON fields:
 {
   "command": "kx capsule build",
   "status": "BUILD_PASS",
-  "capsule_id": "konnaxion-v14-demo-2026.04.30",
-  "capsule_version": "2026.04.30-demo.1",
-  "output": "./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap",
+  "capsule_id": "konnaxion-v14-demo-2026.05.02",
+  "capsule_version": "2026.05.02-demo.1",
+  "output": "./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap",
+  "images": [
+    "images/frontend-next.oci.tar",
+    "images/django-api.oci.tar"
+  ],
   "checks": [],
   "warnings": [],
   "errors": []
@@ -1123,21 +1625,21 @@ UNKNOWN
 
 ---
 
-## 25. CI Usage
+## 30. CI Usage
 
 A release pipeline should run:
 
 ```bash
 kx capsule doctor
 kx capsule build --config kxbuild.yaml
-kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
-kx capsule inspect ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
+kx capsule inspect ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
 ```
 
 Example CI release gate:
 
 ```bash
-kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap --json > capsule-verify.json
+kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap --json > capsule-verify.json
 ```
 
 The CI job must fail if:
@@ -1149,52 +1651,73 @@ signature is missing
 release build is unsigned
 forbidden secret is detected
 forbidden port is exposed
+required image archive is missing
+image checksum mismatch exists
 ```
 
 ---
 
-## 26. Developer Workflow
+## 31. Developer Workflow
 
-## 26.1 Local Dev Capsule
+## 31.1 Local Dev Capsule
 
 ```bash
 kx capsule doctor
 
 kx capsule build \
+  --source-dir ./Konnaxion \
+  --output ./dist/capsules/konnaxion-v14-dev-2026.05.02.kxcap \
+  --channel dev \
+  --capsule-id konnaxion-v14-dev-2026.05.02 \
+  --version 2026.05.02-dev.1 \
   --app-version v14 \
-  --capsule-version 2026.04.30-dev.1 \
-  --profile dev \
-  --output ./dist/capsules/konnaxion-v14-dev-2026.04.30.kxcap
+  --param-version kx-param-2026.04.30 \
+  --profile local_only \
+  --unsigned \
+  --force
 ```
 
-## 26.2 Demo Capsule
+## 31.2 Demo Capsule
 
 ```bash
 kx capsule build \
+  --source-dir ./Konnaxion \
+  --output ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap \
+  --channel demo \
+  --capsule-id konnaxion-v14-demo-2026.05.02 \
+  --version 2026.05.02-demo.1 \
   --app-version v14 \
-  --capsule-version 2026.04.30-demo.1 \
-  --profile demo \
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
   --include-seed-data \
-  --output ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+  --signing-key-file ./runtime/signing/kx-demo-ed25519-private.pem \
+  --public-key-file ./runtime/signing/kx-demo-ed25519-public.pem \
+  --force
 
-kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
 ```
 
-## 26.3 Release Capsule
+## 31.3 Release Capsule
 
 ```bash
 kx capsule build \
+  --source-dir ./Konnaxion \
+  --output ./dist/capsules/konnaxion-v14-release-2026.05.02.kxcap \
+  --channel release \
+  --capsule-id konnaxion-v14-release-2026.05.02 \
+  --version 2026.05.02-release.1 \
   --app-version v14 \
-  --capsule-version 2026.04.30-release.1 \
-  --profile release \
-  --output ./dist/capsules/konnaxion-v14-release-2026.04.30.kxcap
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
+  --signing-key-file ./secrets/release-ed25519-private.pem \
+  --public-key-file ./secrets/release-ed25519-public.pem
 
-kx capsule verify ./dist/capsules/konnaxion-v14-release-2026.04.30.kxcap
+kx capsule verify ./dist/capsules/konnaxion-v14-release-2026.05.02.kxcap
 ```
 
 ---
 
-## 27. Interaction With Manager and Agent
+## 32. Interaction With Manager and Agent
 
 The Builder produces the capsule.
 
@@ -1246,7 +1769,7 @@ rollback state
 
 ---
 
-## 28. Import Contract
+## 33. Import Contract
 
 A capsule built by the Builder must be importable by the Manager without manual edits.
 
@@ -1271,10 +1794,12 @@ from:
 
 ```text
 manifest.yaml
+images.yaml
 docker-compose.capsule.yml
 profiles/
 env-templates/
 healthchecks/
+policies/
 ```
 
 No manual editing should be required after build.
@@ -1291,12 +1816,50 @@ DOC-09_Konnaxion_Backup_Restore_Rollback.md
 
 ---
 
-## 29. Security Requirements
+## 34. Droplet/Public VPS Compatibility Requirements
+
+A capsule built for `public_vps` must support the Manager/Agent Droplet flow:
+
+```text
+Manager on Windows
+  -> SSH to Droplet
+  -> private Agent at 127.0.0.1:8765
+  -> import capsule
+  -> load image archives
+  -> create runtime env
+  -> render Traefik file-provider config
+  -> start instance
+```
+
+The Builder must ensure:
+
+```text
+all required images are offline-loadable
+runtime compose never requires public registry pull for app images
+frontend container starts without network access
+backend container starts without local source bind mounts
+metadata lets Agent set public host correctly
+```
+
+The Builder must not require:
+
+```text
+temporary SSH tunnel
+public Agent listener
+manual docker save/load
+manual Traefik patch
+manual DJANGO_ALLOWED_HOSTS patch
+manual frontend Dockerfile patch
+```
+
+---
+
+## 35. Security Requirements
 
 The Builder must enforce these requirements:
 
 ```text
-Private-by-default
+Private-by-default where applicable
 Signed capsules by default
 No real secrets in capsule
 No exposed internal ports
@@ -1307,9 +1870,11 @@ Canonical service names only
 Canonical network profiles only
 Checksums for all payloads
 Manifest schema validation
+Images archived and checksummed
 Logs redacted
 Release builds cannot skip tests
 Release builds cannot be unsigned
+Demo builds cannot be unsigned unless explicitly development-only
 ```
 
 If a security requirement fails, the build must return:
@@ -1326,7 +1891,7 @@ and exit code:
 
 ---
 
-## 30. Forbidden Build Outputs
+## 36. Forbidden Build Outputs
 
 The Builder must never produce a capsule that:
 
@@ -1343,13 +1908,16 @@ contains real production secrets
 contains SSH private keys
 contains provider tokens
 contains a production DB dump in cleartext
+contains only images/README.json instead of images/*.oci.tar
+requires runtime registry access for Konnaxion app images
+requires runtime pnpm/corepack download for frontend start
 ```
 
 ---
 
-## 31. Minimal Implementation Plan
+## 37. Minimal Implementation Plan
 
-## 31.1 MVP Builder
+## 37.1 MVP Builder
 
 Minimum viable implementation:
 
@@ -1363,20 +1931,21 @@ kx capsule doctor
 MVP build features:
 
 ```text
-build frontend image
-build backend image
-include Traefik/media images
+build frontend production image
+build backend production image from clean context
+include Traefik/Postgres/Redis/media images
 generate manifest.yaml
+generate images.yaml
 generate docker-compose.capsule.yml
 include canonical profiles
 include env templates
-export OCI image tar files
+export image tar files
 generate checksums
 sign capsule
 verify capsule
 ```
 
-## 31.2 Phase 2
+## 37.2 Phase 2
 
 ```text
 JSON output
@@ -1387,9 +1956,10 @@ SBOM generation
 image provenance metadata
 release channels
 delta capsules
+image deduplication
 ```
 
-## 31.3 Phase 3
+## 37.3 Phase 3
 
 ```text
 GUI integration
@@ -1397,11 +1967,12 @@ remote signing support
 hardware appliance factory build
 offline update packages
 multi-instance build variants
+registry-backed release promotion
 ```
 
 ---
 
-## 32. Open Design Questions
+## 38. Open Design Questions
 
 The following are intentionally left open for later documents:
 
@@ -1414,19 +1985,21 @@ exact image registry strategy
 whether capsules can support deltas
 whether capsules can include encrypted demo datasets
 whether release signing uses local keys or remote signer
+whether duplicate image archives should be deduplicated by digest
 ```
 
 These questions must not block the DOC-10 CLI contract.
 
 ---
 
-## 33. Fixed Decisions
+## 39. Fixed Decisions
 
 This document fixes the following decisions:
 
 ```text
 Canonical CLI executable: kx
 Canonical Builder group: kx capsule
+Implementation compatibility executable: kx-builder
 Canonical output: .kxcap
 Canonical default capsule output path: ./dist/capsules/
 Release capsules must be signed
@@ -1439,9 +2012,13 @@ The Builder must reject privileged containers
 The Builder must reject host networking
 The Builder must generate and verify checksums
 The Builder must generate manifest.yaml
+The Builder must generate images.yaml
 The Builder must generate docker-compose.capsule.yml
+The Builder must export all required image archives
 The Builder must use canonical service names
 The Builder must include canonical network profiles
+Frontend runtime must not require Corepack/pnpm download
+Backend image must be built from a clean context
 DOC-10 owns build-time capsule commands only
 DOC-10 does not own runtime backup, restore or rollback commands
 DOC-10 may reference runtime commands only for handoff/alignment
@@ -1449,7 +2026,7 @@ DOC-10 may reference runtime commands only for handoff/alignment
 
 ---
 
-## 34. Reference Command Summary
+## 40. Reference Command Summary
 
 ```bash
 # Check local build environment
@@ -1457,22 +2034,50 @@ kx capsule doctor
 
 # Build demo capsule
 kx capsule build \
+  --source-dir ./Konnaxion \
+  --output ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap \
+  --channel demo \
+  --capsule-id konnaxion-v14-demo-2026.05.02 \
+  --version 2026.05.02-demo.1 \
   --app-version v14 \
-  --capsule-version 2026.04.30-demo.1 \
-  --profile demo \
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
   --include-seed-data \
-  --output ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+  --signing-key-file ./runtime/signing/kx-demo-ed25519-private.pem \
+  --public-key-file ./runtime/signing/kx-demo-ed25519-public.pem \
+  --force
 
 # Verify capsule
-kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule verify ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
 
 # Inspect capsule
-kx capsule inspect ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule inspect ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
 
 # List embedded network profiles
-kx capsule list-profiles ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap
+kx capsule list-profiles ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap
 
 # Export manifest
-kx capsule export-manifest ./dist/capsules/konnaxion-v14-demo-2026.04.30.kxcap \
-  --output ./dist/manifests/konnaxion-v14-demo-2026.04.30.manifest.yaml
+kx capsule export-manifest ./dist/capsules/konnaxion-v14-demo-2026.05.02.kxcap \
+  --output ./dist/manifests/konnaxion-v14-demo-2026.05.02.manifest.yaml
 ```
+
+Compatibility command summary:
+
+```bash
+uv run kx-builder capsule build \
+  --source-dir C:\mycode\Konnaxion\Konnaxion \
+  --output C:\mycode\Konnaxion\runtime\capsules\konnaxion-v14-demo-2026.05.02.kxcap \
+  --channel demo \
+  --capsule-id konnaxion-v14-demo-2026.05.02 \
+  --version 2026.05.02-demo.1 \
+  --app-version v14 \
+  --param-version kx-param-2026.04.30 \
+  --profile public_vps \
+  --signing-key-file C:\mycode\Konnaxion\runtime\signing\kx-demo-ed25519-private.pem \
+  --public-key-file C:\mycode\Konnaxion\runtime\signing\kx-demo-ed25519-public.pem \
+  --force
+
+uv run kx-builder capsule verify C:\mycode\Konnaxion\runtime\capsules\konnaxion-v14-demo-2026.05.02.kxcap
+```
+
+

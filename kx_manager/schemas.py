@@ -144,8 +144,17 @@ class KxRuntimeVariables(KxSchema):
 
     @model_validator(mode="after")
     def validate_public_expiration(self) -> "KxRuntimeVariables":
-        if self.kx_public_mode_enabled and self.kx_public_mode_expires_at is None:
-            raise ValueError("KX_PUBLIC_MODE_EXPIRES_AT is required when KX_PUBLIC_MODE_ENABLED=true")
+        validate_profile_exposure(self.kx_network_profile, self.kx_exposure_mode)
+
+        if self.kx_network_profile == NetworkProfile.PUBLIC_TEMPORARY and self.kx_public_mode_expires_at is None:
+            raise ValueError("KX_PUBLIC_MODE_EXPIRES_AT is required for public_temporary")
+
+        if self.kx_exposure_mode == ExposureMode.TEMPORARY_TUNNEL and self.kx_public_mode_expires_at is None:
+            raise ValueError("KX_PUBLIC_MODE_EXPIRES_AT is required for temporary_tunnel exposure")
+
+        if self.kx_exposure_mode == ExposureMode.PUBLIC and not self.kx_host:
+            raise ValueError("KX_HOST is required for public exposure")
+
         return self
 
 
@@ -251,11 +260,23 @@ class InstanceCreateRequest(KxSchema):
     network_profile: NetworkProfile = DEFAULT_NETWORK_PROFILE
     exposure_mode: ExposureMode = DEFAULT_EXPOSURE_MODE
     host: str | None = None
+    public_mode_enabled: bool = False
+    public_mode_expires_at: datetime | None = None
     generate_secrets: bool = True
 
     @model_validator(mode="after")
     def validate_exposure_matches_profile(self) -> "InstanceCreateRequest":
         validate_profile_exposure(self.network_profile, self.exposure_mode)
+
+        if self.network_profile == NetworkProfile.PUBLIC_TEMPORARY and self.public_mode_expires_at is None:
+            raise ValueError("public_temporary requires public_mode_expires_at")
+
+        if self.exposure_mode == ExposureMode.TEMPORARY_TUNNEL and self.public_mode_expires_at is None:
+            raise ValueError("temporary_tunnel exposure requires public_mode_expires_at")
+
+        if self.exposure_mode == ExposureMode.PUBLIC and not self.host:
+            raise ValueError("public exposure requires host")
+
         return self
 
 
@@ -410,11 +431,14 @@ class NetworkSetProfileRequest(KxSchema):
     def validate_network(self) -> "NetworkSetProfileRequest":
         validate_profile_exposure(self.network_profile, self.exposure_mode)
 
-        if self.public_mode_enabled and self.public_mode_expires_at is None:
-            raise ValueError("public_mode_expires_at is required when public_mode_enabled=true")
+        if self.network_profile == NetworkProfile.PUBLIC_TEMPORARY and self.public_mode_expires_at is None:
+            raise ValueError("public_temporary requires public_mode_expires_at")
 
         if self.exposure_mode == ExposureMode.TEMPORARY_TUNNEL and self.public_mode_expires_at is None:
             raise ValueError("temporary_tunnel exposure requires public_mode_expires_at")
+
+        if self.exposure_mode == ExposureMode.PUBLIC and not self.host:
+            raise ValueError("public exposure requires host")
 
         return self
 

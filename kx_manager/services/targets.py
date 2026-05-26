@@ -221,7 +221,11 @@ def build_target_config(
             ssh_key_path=extra.get("ssh_key_path"),
             remote_kx_root=_optional_str(extra.get("remote_kx_root") or runtime_root),
             remote_capsule_dir=_optional_str(extra.get("remote_capsule_dir") or capsule_dir),
-            domain=_optional_str(extra.get("domain")),
+            domain=_optional_str(
+                extra.get("domain")
+                or extra.get("droplet_domain")
+                or extra.get("public_host")
+            ),
             remote_agent_url=_optional_str(extra.get("remote_agent_url")),
             ssh_port=int(extra.get("ssh_port") or 22),
         )
@@ -419,6 +423,7 @@ def _validate_droplet(config: TargetConfig) -> None:
     ssh_key_path = _target_field(config, "ssh_key_path")
     remote_kx_root = str(_target_field(config, "remote_kx_root") or "").strip()
     remote_capsule_dir = str(_target_field(config, "remote_capsule_dir") or "").strip()
+    domain = str(_target_field(config, "domain") or "").strip()
 
     if not droplet_host:
         raise TargetConfigError("droplet target requires droplet_host or host.")
@@ -438,6 +443,9 @@ def _validate_droplet(config: TargetConfig) -> None:
 
     if not remote_capsule_dir:
         raise TargetConfigError("droplet target requires remote_capsule_dir.")
+
+    if not domain:
+        raise TargetConfigError("droplet target requires domain.")
 
     if not _is_posix_path_under(remote_capsule_dir, remote_kx_root):
         raise TargetConfigError("remote_capsule_dir must be inside remote_kx_root.")

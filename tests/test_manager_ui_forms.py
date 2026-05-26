@@ -97,6 +97,15 @@ def _valid_instance_payload() -> dict[str, Any]:
     }
 
 
+def _valid_capsule_file(tmp_path: Path) -> Path:
+    capsule_dir = tmp_path / "runtime" / "capsules"
+    capsule_dir.mkdir(parents=True)
+
+    capsule_file = capsule_dir / "konnaxion-v14-demo-2026.04.30.kxcap"
+    capsule_file.write_bytes(b"fake capsule for manager ui form tests")
+    return capsule_file
+
+
 def _valid_droplet_payload(tmp_path: Path) -> dict[str, Any]:
     ssh_key = tmp_path / "id_ed25519"
     ssh_key.write_text("not-a-real-key-for-tests\n", encoding="utf-8")
@@ -126,16 +135,22 @@ def test_forms_module_exposes_required_contract_surface() -> None:
     expected_functions = {
         "normalize_form_data",
         "parse_build_form",
+        "parse_verify_capsule_form",
         "parse_instance_form",
         "parse_network_form",
         "parse_backup_form",
         "parse_restore_form",
         "parse_rollback_form",
         "parse_target_form",
+        "parse_droplet_operation_form",
         "validate_action_payload",
     }
 
-    missing = [name for name in sorted(expected_functions) if not callable(getattr(forms, name, None))]
+    missing = [
+        name
+        for name in sorted(expected_functions)
+        if not callable(getattr(forms, name, None))
+    ]
     assert not missing, f"Missing required forms.py functions: {missing}"
 
 
@@ -156,7 +171,7 @@ def test_normalize_form_data_strips_strings_and_preserves_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Build/source/output folder forms
+# Build/source/output/capsule forms
 # ---------------------------------------------------------------------------
 
 def test_build_form_accepts_text_folder_inputs(tmp_path: Path) -> None:
@@ -205,6 +220,21 @@ def test_build_form_allows_creatable_output_dir(tmp_path: Path) -> None:
     )
 
     assert Path(_text_field(result, "capsule_output_dir")) == output_dir
+
+
+def test_verify_capsule_form_requires_existing_capsule_file(tmp_path: Path) -> None:
+    parse_verify_capsule_form = _require_function("parse_verify_capsule_form")
+    capsule_file = _valid_capsule_file(tmp_path)
+
+    result = parse_verify_capsule_form({"capsule_file": f"  {capsule_file}  "})
+
+    assert Path(_text_field(result, "capsule_file")) == capsule_file
+
+    _assert_invalid(parse_verify_capsule_form, {"capsule_file": ""})
+    _assert_invalid(
+        parse_verify_capsule_form,
+        {"capsule_file": str(tmp_path / "runtime" / "capsules" / "missing.kxcap")},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +628,101 @@ def test_droplet_target_accepts_valid_public_vps_configuration(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
+# Droplet operation forms
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "bootstrap_droplet_agent",
+        "check_droplet_agent",
+    ],
+)
+def test_droplet_non_capsule_operation_actions_allow_missing_capsule_file(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    parse_droplet_operation_form = _require_function("parse_droplet_operation_form")
+
+    payload = _valid_droplet_payload(tmp_path)
+    payload["action"] = action
+    payload.pop("capsule_file", None)
+    payload.pop("capsule_path", None)
+
+    form = parse_droplet_operation_form(payload)
+
+    assert _text_field(form, "action") == action
+    assert _field(form, "capsule_file") is None
+    assert _text_field(form, "target_mode") == "droplet"
+    assert _text_field(form, "network_profile") == "public_vps"
+    assert _text_field(form, "exposure_mode") == "public"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "deploy_droplet",
+        "copy_capsule_to_droplet",
+        "start_droplet_instance",
+    ],
+)
+def test_droplet_capsule_required_operation_actions_reject_missing_capsule_file(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    parse_droplet_operation_form = _require_function("parse_droplet_operation_form")
+
+    payload = _valid_droplet_payload(tmp_path)
+    payload["action"] = action
+    payload.pop("capsule_file", None)
+    payload.pop("capsule_path", None)
+
+    _assert_invalid(parse_droplet_operation_form, payload)
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "bootstrap_droplet_agent",
+        "deploy_droplet",
+        "check_droplet_agent",
+        "copy_capsule_to_droplet",
+        "start_droplet_instance",
+    ],
+)
+def test_droplet_operation_actions_force_canonical_public_vps_values(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    parse_droplet_operation_form = _require_function("parse_droplet_operation_form")
+
+    payload = _valid_droplet_payload(tmp_path)
+    payload.update(
+        {
+            "action": action,
+            "target_mode": "intranet",
+            "network_profile": "intranet_private",
+            "exposure_mode": "private",
+            "confirmed": "false",
+        }
+    )
+
+    if action in {"bootstrap_droplet_agent", "check_droplet_agent"}:
+        payload.pop("capsule_file", None)
+        payload.pop("capsule_path", None)
+
+    form = parse_droplet_operation_form(payload)
+
+    assert _text_field(form, "target_mode") == "droplet"
+    assert _text_field(form, "network_profile") == "public_vps"
+    assert _text_field(form, "exposure_mode") == "public"
+    assert _bool_field(form, "confirmed") is True
+    assert _text_field(form, "droplet_host") == "203.0.113.10"
+    assert _text_field(form, "host") == "203.0.113.10"
+    assert _text_field(form, "domain") == "app.example.com"
+
+
+# ---------------------------------------------------------------------------
 # Action payload validation
 # ---------------------------------------------------------------------------
 
@@ -623,6 +748,58 @@ def test_validate_action_payload_accepts_known_action_with_valid_payload() -> No
     assert _text_field(result, "instance_id") == "demo-001"
     assert _text_field(result, "network_profile") == "intranet_private"
     assert _text_field(result, "exposure_mode") == "private"
+
+
+def test_validate_action_payload_accepts_verify_capsule_with_existing_file(
+    tmp_path: Path,
+) -> None:
+    validate_action_payload = _require_function("validate_action_payload")
+    capsule_file = _valid_capsule_file(tmp_path)
+
+    result = validate_action_payload(
+        {
+            "action": "verify_capsule",
+            "capsule_file": str(capsule_file),
+        }
+    )
+
+    assert _text_field(result, "action") == "verify_capsule"
+    assert Path(_text_field(result, "capsule_file")) == capsule_file
+
+
+def test_validate_action_payload_rejects_verify_capsule_with_missing_file(
+    tmp_path: Path,
+) -> None:
+    validate_action_payload = _require_function("validate_action_payload")
+
+    _assert_invalid(
+        validate_action_payload,
+        {
+            "action": "verify_capsule",
+            "capsule_file": str(tmp_path / "missing.kxcap"),
+        },
+    )
+
+
+def test_validate_action_payload_accepts_bootstrap_droplet_agent_without_capsule_file(
+    tmp_path: Path,
+) -> None:
+    validate_action_payload = _require_function("validate_action_payload")
+
+    payload = _valid_droplet_payload(tmp_path)
+    payload["action"] = "bootstrap_droplet_agent"
+    payload.pop("capsule_file", None)
+    payload.pop("capsule_path", None)
+
+    result = validate_action_payload(payload)
+
+    assert _text_field(result, "action") == "bootstrap_droplet_agent"
+    assert "capsule_file" not in result
+    assert "capsule_path" not in result
+    assert _text_field(result, "target_mode") == "droplet"
+    assert _text_field(result, "network_profile") == "public_vps"
+    assert _text_field(result, "exposure_mode") == "public"
+    assert _bool_field(result, "confirmed") is True
 
 
 def test_validate_action_payload_rejects_invalid_canonical_network_values() -> None:

@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 APP_TITLE = "Konnaxion Capsule Manager"
 APP_ICON = "◈"
+APP_LOGO_SRC = "/ui/assets/LogoK.svg"
+APP_LOGO_ALT = "Konnaxion"
 DEFAULT_REFRESH_SECONDS = 5
 
 UI_BASE_PATH = "/ui"
@@ -25,6 +27,7 @@ UI_PAGE_ROUTES: tuple[str, ...] = (
     "/ui/health",
     "/ui/settings",
     "/ui/targets",
+    "/ui/deploy",
     "/ui/about",
 )
 
@@ -41,6 +44,7 @@ PAGE_TITLES: dict[str, str] = {
     "/ui/health": "Health",
     "/ui/settings": "Settings",
     "/ui/targets": "Targets",
+    "/ui/deploy": "Deploy",
     "/ui/about": "About",
 }
 
@@ -82,6 +86,7 @@ CONTRACT_ACTIONS: tuple[str, ...] = (
     "deploy_local",
     "deploy_intranet",
     "deploy_droplet",
+    "bootstrap_droplet_agent",
     "check_droplet_agent",
     "copy_capsule_to_droplet",
     "start_droplet_instance",
@@ -95,7 +100,9 @@ ACTION_ALIASES: dict[str, str] = {
 }
 
 
-KNOWN_ACTIONS: frozenset[str] = frozenset(CONTRACT_ACTIONS) | frozenset(ACTION_ALIASES)
+KNOWN_ACTIONS: frozenset[str] = frozenset(CONTRACT_ACTIONS) | frozenset(
+    ACTION_ALIASES
+)
 
 
 ACTION_LABELS: dict[str, str] = {
@@ -135,6 +142,7 @@ ACTION_LABELS: dict[str, str] = {
     "deploy_local": "Deploy Local",
     "deploy_intranet": "Deploy Intranet",
     "deploy_droplet": "Deploy Droplet",
+    "bootstrap_droplet_agent": "Bootstrap Droplet Agent",
     "check_droplet_agent": "Check Droplet Agent",
     "copy_capsule_to_droplet": "Copy Capsule to Droplet",
     "start_droplet_instance": "Start Droplet Instance",
@@ -165,6 +173,7 @@ NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("Capsules", "/ui/capsules"),
     ("Instances", "/ui/instances"),
     ("Targets", "/ui/targets"),
+    ("Deploy", "/ui/deploy"),
     ("Security", "/ui/security"),
     ("Network", "/ui/network"),
     ("Backups", "/ui/backups"),
@@ -177,11 +186,15 @@ NAV_ITEMS: tuple[tuple[str, str], ...] = (
 
 
 def canonical_action(action: Any) -> str:
+    """Return the canonical action value for an enum/string/action alias."""
+
     value = str(getattr(action, "value", action)).strip()
     return ACTION_ALIASES.get(value, value)
 
 
 def route_for_action(action: Any) -> str:
+    """Return the canonical POST route for a non-browser GUI action."""
+
     action_value = canonical_action(action)
 
     if action_value in BROWSER_ONLY_ACTIONS:
@@ -191,15 +204,38 @@ def route_for_action(action: Any) -> str:
 
 
 def browser_link_for_action(action: Any) -> str:
+    """Return the configured browser-link target for a browser-only action."""
+
     action_value = canonical_action(action)
     return BROWSER_LINK_ACTIONS[action_value]
 
 
 def title_for_route(route: str) -> str:
+    """Return the display title for a /ui route."""
+
     return PAGE_TITLES.get(route, "Dashboard")
 
 
+def _target_mode(data: Mapping[str, Any]) -> str:
+    return str(data.get("target_mode") or "").strip()
+
+
+def _is_droplet_payload(data: Mapping[str, Any]) -> bool:
+    return _target_mode(data) == "droplet"
+
+
+def _is_temporary_public_payload(data: Mapping[str, Any]) -> bool:
+    return _target_mode(data) == "temporary_public"
+
+
 def normalize_payload_aliases(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize supported GUI form payload aliases.
+
+    This intentionally does not invent Droplet domain values from host,
+    droplet_host, public_host, or target_host. Droplet domain must be supplied
+    explicitly as domain or droplet_domain and then validated downstream.
+    """
+
     data = dict(payload or {})
 
     # Capsule path aliases.
@@ -219,24 +255,86 @@ def normalize_payload_aliases(payload: Mapping[str, Any] | None) -> dict[str, An
         data["host"] = data["public_host"]
     if data.get("private_host") and not data.get("host"):
         data["host"] = data["private_host"]
+    if data.get("droplet_host") and not data.get("host"):
+        data["host"] = data["droplet_host"]
+    if data.get("host") and not data.get("droplet_host") and _is_droplet_payload(data):
+        data["droplet_host"] = data["host"]
 
-    # Droplet aliases.
+    # Droplet SSH/user aliases.
     if data.get("droplet_ssh_key") and not data.get("ssh_key_path"):
         data["ssh_key_path"] = data["droplet_ssh_key"]
     if data.get("ssh_key") and not data.get("ssh_key_path"):
         data["ssh_key_path"] = data["ssh_key"]
+
     if data.get("ssh_user") and not data.get("droplet_user"):
         data["droplet_user"] = data["ssh_user"]
     if data.get("user") and not data.get("droplet_user"):
         data["droplet_user"] = data["user"]
+
+    # Droplet runtime root aliases.
     if data.get("droplet_kx_root") and not data.get("remote_kx_root"):
         data["remote_kx_root"] = data["droplet_kx_root"]
     if data.get("remote_root") and not data.get("remote_kx_root"):
         data["remote_kx_root"] = data["remote_root"]
+
+    if data.get("remote_kx_root") and not data.get("runtime_root"):
+        data["runtime_root"] = data["remote_kx_root"]
+    if (
+        data.get("runtime_root")
+        and not data.get("remote_kx_root")
+        and _is_droplet_payload(data)
+    ):
+        data["remote_kx_root"] = data["runtime_root"]
+    if data.get("remote_root") and not data.get("runtime_root"):
+        data["runtime_root"] = data["remote_root"]
+    if data.get("droplet_kx_root") and not data.get("runtime_root"):
+        data["runtime_root"] = data["droplet_kx_root"]
+    if data.get("target_runtime_root") and not data.get("runtime_root"):
+        data["runtime_root"] = data["target_runtime_root"]
+
+    # Droplet capsule directory aliases.
     if data.get("droplet_capsule_dir") and not data.get("remote_capsule_dir"):
         data["remote_capsule_dir"] = data["droplet_capsule_dir"]
+
+    if data.get("remote_capsule_dir") and not data.get("capsule_dir"):
+        data["capsule_dir"] = data["remote_capsule_dir"]
+    if (
+        data.get("capsule_dir")
+        and not data.get("remote_capsule_dir")
+        and _is_droplet_payload(data)
+    ):
+        data["remote_capsule_dir"] = data["capsule_dir"]
+    if data.get("droplet_capsule_dir") and not data.get("capsule_dir"):
+        data["capsule_dir"] = data["droplet_capsule_dir"]
+    if data.get("target_capsule_dir") and not data.get("capsule_dir"):
+        data["capsule_dir"] = data["target_capsule_dir"]
+
+    # Domain aliases.
+    #
+    # Allowed:
+    # - domain <-> droplet_domain
+    #
+    # Not allowed:
+    # - droplet_host -> domain
+    # - host -> domain
+    # - target_host -> domain
+    # - public_host -> domain for Droplet
     if data.get("droplet_domain") and not data.get("domain"):
         data["domain"] = data["droplet_domain"]
+    if data.get("domain") and not data.get("droplet_domain"):
+        data["droplet_domain"] = data["domain"]
+
+    # Temporary-public forms may mirror public_host into domain for display or
+    # service compatibility. Droplet payloads still require explicit domain or
+    # droplet_domain and must not use public_host as a hidden shortcut.
+    if (
+        _is_temporary_public_payload(data)
+        and data.get("public_host")
+        and not data.get("domain")
+    ):
+        data["domain"] = data["public_host"]
+
+    # Remote Agent aliases.
     if data.get("droplet_agent_url") and not data.get("remote_agent_url"):
         data["remote_agent_url"] = data["droplet_agent_url"]
 
@@ -264,6 +362,8 @@ __all__ = [
     "ACTION_LABELS",
     "ACTION_ROUTES",
     "APP_ICON",
+    "APP_LOGO_ALT",
+    "APP_LOGO_SRC",
     "APP_TITLE",
     "BROWSER_LINK_ACTIONS",
     "BROWSER_ONLY_ACTIONS",

@@ -1,5 +1,3 @@
-# kx_manager/ui/form_targets.py
-
 """Target-mode and deployment form parsing for the Konnaxion Manager GUI."""
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ from kx_manager.services.targets import (
     network_profile_for_target,
     validate_target_config,
 )
-
 from kx_manager.ui.form_constants import (
     DEFAULT_CAPSULE_ID,
     DEFAULT_CAPSULE_OUTPUT_DIR,
@@ -49,6 +46,47 @@ from kx_manager.ui.form_helpers import (
     _text,
     normalize_form_data,
 )
+
+
+DROPLET_TARGET_ACTION: str = "set_target_droplet"
+
+DROPLET_OPERATION_ACTIONS: frozenset[str] = frozenset(
+    {
+        "deploy_droplet",
+        "bootstrap_droplet_agent",
+        "check_droplet_agent",
+        "copy_capsule_to_droplet",
+        "start_droplet_instance",
+    }
+)
+
+DROPLET_ACTIONS: frozenset[str] = frozenset(
+    {
+        DROPLET_TARGET_ACTION,
+        *DROPLET_OPERATION_ACTIONS,
+    }
+)
+
+DROPLET_CAPSULE_REQUIRED_ACTIONS: frozenset[str] = frozenset(
+    {
+        "deploy_droplet",
+        "copy_capsule_to_droplet",
+        "start_droplet_instance",
+    }
+)
+
+DROPLET_NON_CAPSULE_ACTIONS: frozenset[str] = frozenset(
+    {
+        "bootstrap_droplet_agent",
+        "check_droplet_agent",
+    }
+)
+
+DEFAULT_DROPLET_NAME = "konnaxion-droplet"
+DEFAULT_DROPLET_USER = "konnaxion"
+DEFAULT_REMOTE_KX_ROOT = "/opt/konnaxion"
+DEFAULT_REMOTE_CAPSULE_DIR = "/opt/konnaxion/capsules"
+DEFAULT_SSH_PORT = 22
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,7 +274,6 @@ class IntranetTargetForm(TargetModeForm):
             merged["exposure_mode"] = "private"
 
         base = TargetModeForm.from_mapping(merged)
-
         return cls(**asdict(base))
 
 
@@ -267,7 +304,13 @@ class TemporaryPublicTargetForm(TargetModeForm):
         )
 
     def to_payload(self) -> dict[str, Any]:
-        return _payload(self)
+        payload = _payload(self)
+
+        if self.public_host:
+            payload.setdefault("host", self.public_host)
+            payload.setdefault("public_host", self.public_host)
+
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,9 +332,19 @@ class DropletTargetForm:
     remote_agent_url: str | None = None
     confirmed: bool = False
 
+    # Operation/test-visible aliases.
+    action: str = DROPLET_TARGET_ACTION
+    host: str | None = None
+    runtime_root: str | None = None
+    capsule_dir: str | None = None
+    public_mode_enabled: bool = True
+    public_mode_expires_at: str | None = None
+
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "DropletTargetForm":
-        normalized = normalize_form_data(data)
+        normalized = _normalize_droplet_mapping(data)
+        action = _canonical_action(normalized) or DROPLET_TARGET_ACTION
+        is_operation = action in DROPLET_OPERATION_ACTIONS
 
         target_mode = _target_mode(
             normalized,
@@ -343,13 +396,14 @@ class DropletTargetForm:
         droplet_name = _text(
             normalized,
             "droplet_name",
-            default="konnaxion-droplet",
+            default=DEFAULT_DROPLET_NAME,
             required=True,
             field="droplet_name",
         )
         droplet_host = _host(
             normalized,
             "droplet_host",
+            "target_host",
             "host",
             required=True,
             field="droplet_host",
@@ -358,7 +412,8 @@ class DropletTargetForm:
             normalized,
             "droplet_user",
             "ssh_user",
-            default="root",
+            "user",
+            default=DEFAULT_DROPLET_USER,
             required=True,
             field="droplet_user",
         )
@@ -370,10 +425,11 @@ class DropletTargetForm:
         ssh_key_path = _path(
             normalized,
             "ssh_key_path",
+            "ssh_key",
             "droplet_ssh_key",
             required=True,
-            must_exist=True,
-            must_be_file=True,
+            must_exist=not is_operation,
+            must_be_file=not is_operation,
             field="ssh_key_path",
         )
         assert ssh_key_path is not None
@@ -381,16 +437,20 @@ class DropletTargetForm:
         remote_kx_root_raw = _text(
             normalized,
             "remote_kx_root",
+            "runtime_root",
+            "remote_root",
             "droplet_kx_root",
-            default="/opt/konnaxion",
+            default=DEFAULT_REMOTE_KX_ROOT,
             required=True,
             field="remote_kx_root",
         )
         remote_capsule_dir_raw = _text(
             normalized,
             "remote_capsule_dir",
+            "capsule_dir",
+            "target_capsule_dir",
             "droplet_capsule_dir",
-            default="/opt/konnaxion/capsules",
+            default=DEFAULT_REMOTE_CAPSULE_DIR,
             required=True,
             field="remote_capsule_dir",
         )
@@ -412,10 +472,18 @@ class DropletTargetForm:
             normalized,
             "domain",
             "droplet_domain",
+            "public_host",
             required=True,
             field="domain",
         )
         assert domain is not None
+
+        remote_agent_url = _text(
+            normalized,
+            "remote_agent_url",
+            "droplet_agent_url",
+            required=False,
+        )
 
         form = cls(
             target_mode=target_mode,
@@ -446,23 +514,29 @@ class DropletTargetForm:
             ssh_port=_int(
                 normalized,
                 "ssh_port",
-                default=22,
+                default=DEFAULT_SSH_PORT,
                 minimum=1,
                 maximum=65535,
             ),
             remote_kx_root=remote_kx_root,
             remote_capsule_dir=remote_capsule_dir,
             domain=domain,
-            remote_agent_url=_text(
-                normalized,
-                "remote_agent_url",
-                "droplet_agent_url",
-                required=False,
-            ),
+            remote_agent_url=remote_agent_url,
             confirmed=confirmed,
+            action=action,
+            host=droplet_host,
+            runtime_root=remote_kx_root,
+            capsule_dir=remote_capsule_dir,
+            public_mode_enabled=True,
+            public_mode_expires_at=None,
         )
 
-        validate_target_config(form.to_target_config())
+        # Target configuration requires an existing local SSH key at target-set
+        # time. Operation forms validate payload shape only; execution later
+        # reports SSH/runtime failures from the backend.
+        if not is_operation:
+            validate_target_config(form.to_target_config())
+
         return form
 
     def to_target_config(self) -> DropletTargetConfig:
@@ -488,7 +562,46 @@ class DropletTargetForm:
         )
 
     def to_payload(self) -> dict[str, Any]:
-        return _payload(self)
+        payload = _payload(self)
+
+        payload["action"] = self.action
+        payload["target_mode"] = TargetMode.DROPLET.value
+        payload["network_profile"] = "public_vps"
+        payload["exposure_mode"] = "public"
+        payload["public_mode_enabled"] = True
+        payload["public_mode_expires_at"] = None
+
+        payload["host"] = self.droplet_host
+        payload["target_host"] = self.droplet_host
+        payload["runtime_root"] = self.remote_kx_root
+        payload["capsule_dir"] = self.remote_capsule_dir
+        payload["remote_root"] = self.remote_kx_root
+        payload["droplet_kx_root"] = self.remote_kx_root
+        payload["droplet_capsule_dir"] = self.remote_capsule_dir
+        payload["droplet_domain"] = self.domain
+
+        if self.capsule_file is not None:
+            capsule_file = str(self.capsule_file)
+            payload["capsule_file"] = capsule_file
+            payload["capsule_path"] = capsule_file
+        else:
+            payload.pop("capsule_file", None)
+            payload.pop("capsule_path", None)
+
+        if self.source_dir is not None:
+            payload["source_dir"] = str(self.source_dir)
+
+        payload["ssh_key_path"] = str(self.ssh_key_path)
+        payload["ssh_user"] = self.droplet_user
+        payload["user"] = self.droplet_user
+        payload["ssh_port"] = self.ssh_port
+        payload["confirmed"] = self.confirmed
+
+        return {
+            key: value
+            for key, value in payload.items()
+            if value is not None
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,7 +642,8 @@ class DeployIntranetForm(IntranetTargetForm):
 class DeployDropletForm(DropletTargetForm):
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "DeployDropletForm":
-        normalized = normalize_form_data(data)
+        normalized = _normalize_droplet_mapping(data)
+        normalized["action"] = "deploy_droplet"
         base = DropletTargetForm.from_mapping(normalized)
 
         if base.capsule_file is None:
@@ -541,8 +655,71 @@ class DeployDropletForm(DropletTargetForm):
         return cls(**asdict(base))
 
 
+@dataclass(frozen=True, slots=True)
+class BootstrapDropletAgentForm(DropletTargetForm):
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "BootstrapDropletAgentForm":
+        normalized = _normalize_droplet_mapping(data)
+        normalized["action"] = "bootstrap_droplet_agent"
+        normalized.pop("capsule_file", None)
+        normalized.pop("capsule_path", None)
+        base = DropletTargetForm.from_mapping(normalized)
+        return cls(**asdict(base))
+
+
+@dataclass(frozen=True, slots=True)
+class CheckDropletAgentForm(DropletTargetForm):
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "CheckDropletAgentForm":
+        normalized = _normalize_droplet_mapping(data)
+        normalized["action"] = "check_droplet_agent"
+        normalized.pop("capsule_file", None)
+        normalized.pop("capsule_path", None)
+        base = DropletTargetForm.from_mapping(normalized)
+        return cls(**asdict(base))
+
+
+@dataclass(frozen=True, slots=True)
+class CopyCapsuleToDropletForm(DropletTargetForm):
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "CopyCapsuleToDropletForm":
+        normalized = _normalize_droplet_mapping(data)
+        normalized["action"] = "copy_capsule_to_droplet"
+        base = DropletTargetForm.from_mapping(normalized)
+
+        if base.capsule_file is None:
+            raise FormValidationError(
+                "copy_capsule_to_droplet requires capsule_file.",
+                field="capsule_file",
+            )
+
+        return cls(**asdict(base))
+
+
+@dataclass(frozen=True, slots=True)
+class StartDropletInstanceForm(DropletTargetForm):
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "StartDropletInstanceForm":
+        normalized = _normalize_droplet_mapping(data)
+        normalized["action"] = "start_droplet_instance"
+        base = DropletTargetForm.from_mapping(normalized)
+
+        if base.capsule_file is None:
+            raise FormValidationError(
+                "start_droplet_instance requires capsule_file.",
+                field="capsule_file",
+            )
+
+        return cls(**asdict(base))
+
+
 def parse_target_form(data: Mapping[str, Any]) -> Any:
     normalized = normalize_form_data(data)
+    action = _form_action(normalized)
+
+    if action in DROPLET_OPERATION_ACTIONS:
+        return parse_droplet_operation_form(normalized)
+
     target_mode = _target_mode(normalized)
 
     if target_mode == TargetMode.LOCAL:
@@ -563,14 +740,132 @@ def parse_target_form(data: Mapping[str, Any]) -> Any:
     )
 
 
+def parse_droplet_operation_form(data: Mapping[str, Any]) -> DropletTargetForm:
+    normalized = _normalize_droplet_mapping(data)
+    action = _form_action(normalized)
+
+    if action == "deploy_droplet":
+        return DeployDropletForm.from_mapping(normalized)
+
+    if action == "bootstrap_droplet_agent":
+        return BootstrapDropletAgentForm.from_mapping(normalized)
+
+    if action == "check_droplet_agent":
+        return CheckDropletAgentForm.from_mapping(normalized)
+
+    if action == "copy_capsule_to_droplet":
+        return CopyCapsuleToDropletForm.from_mapping(normalized)
+
+    if action == "start_droplet_instance":
+        return StartDropletInstanceForm.from_mapping(normalized)
+
+    return DropletTargetForm.from_mapping(normalized)
+
+
+def _form_action(data: Mapping[str, Any]) -> str:
+    return _canonical_action(data)
+
+
+def _canonical_action(data: Mapping[str, Any]) -> str:
+    return str(data.get("action") or "").strip().replace("-", "_")
+
+
+def _force_droplet_operation_values(data: dict[str, Any]) -> None:
+    data["target_mode"] = TargetMode.DROPLET.value
+    data["network_profile"] = "public_vps"
+    data["exposure_mode"] = "public"
+    data["confirmed"] = True
+
+
+def _normalize_droplet_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = normalize_form_data(data)
+    action = _canonical_action(normalized)
+
+    if action:
+        normalized["action"] = action
+
+    force_droplet_values = action in DROPLET_OPERATION_ACTIONS
+
+    if normalized.get("droplet_host") and not normalized.get("host"):
+        normalized["host"] = normalized["droplet_host"]
+    if normalized.get("host") and not normalized.get("droplet_host"):
+        normalized["droplet_host"] = normalized["host"]
+    if normalized.get("target_host") and not normalized.get("droplet_host"):
+        normalized["droplet_host"] = normalized["target_host"]
+
+    if normalized.get("ssh_user") and not normalized.get("droplet_user"):
+        normalized["droplet_user"] = normalized["ssh_user"]
+    if normalized.get("user") and not normalized.get("droplet_user"):
+        normalized["droplet_user"] = normalized["user"]
+
+    if normalized.get("ssh_key") and not normalized.get("ssh_key_path"):
+        normalized["ssh_key_path"] = normalized["ssh_key"]
+    if normalized.get("droplet_ssh_key") and not normalized.get("ssh_key_path"):
+        normalized["ssh_key_path"] = normalized["droplet_ssh_key"]
+
+    if normalized.get("runtime_root") and not normalized.get("remote_kx_root"):
+        normalized["remote_kx_root"] = normalized["runtime_root"]
+    if normalized.get("remote_root") and not normalized.get("remote_kx_root"):
+        normalized["remote_kx_root"] = normalized["remote_root"]
+    if normalized.get("droplet_kx_root") and not normalized.get("remote_kx_root"):
+        normalized["remote_kx_root"] = normalized["droplet_kx_root"]
+
+    if normalized.get("capsule_dir") and not normalized.get("remote_capsule_dir"):
+        normalized["remote_capsule_dir"] = normalized["capsule_dir"]
+    if normalized.get("target_capsule_dir") and not normalized.get("remote_capsule_dir"):
+        normalized["remote_capsule_dir"] = normalized["target_capsule_dir"]
+    if normalized.get("droplet_capsule_dir") and not normalized.get("remote_capsule_dir"):
+        normalized["remote_capsule_dir"] = normalized["droplet_capsule_dir"]
+
+    if normalized.get("domain") and not normalized.get("droplet_domain"):
+        normalized["droplet_domain"] = normalized["domain"]
+    if normalized.get("droplet_domain") and not normalized.get("domain"):
+        normalized["domain"] = normalized["droplet_domain"]
+    if normalized.get("public_host") and not normalized.get("domain"):
+        normalized["domain"] = normalized["public_host"]
+
+    if normalized.get("droplet_agent_url") and not normalized.get("remote_agent_url"):
+        normalized["remote_agent_url"] = normalized["droplet_agent_url"]
+
+    if action not in DROPLET_NON_CAPSULE_ACTIONS:
+        if normalized.get("capsule_path") and not normalized.get("capsule_file"):
+            normalized["capsule_file"] = normalized["capsule_path"]
+        if normalized.get("capsule_file") and not normalized.get("capsule_path"):
+            normalized["capsule_path"] = normalized["capsule_file"]
+    else:
+        normalized.pop("capsule_file", None)
+        normalized.pop("capsule_path", None)
+
+    normalized.setdefault("droplet_name", DEFAULT_DROPLET_NAME)
+    normalized.setdefault("droplet_user", DEFAULT_DROPLET_USER)
+    normalized.setdefault("remote_kx_root", DEFAULT_REMOTE_KX_ROOT)
+    normalized.setdefault("remote_capsule_dir", DEFAULT_REMOTE_CAPSULE_DIR)
+    normalized.setdefault("ssh_port", DEFAULT_SSH_PORT)
+
+    if force_droplet_values:
+        _force_droplet_operation_values(normalized)
+
+    return normalized
+
+
 __all__ = [
+    "BootstrapDropletAgentForm",
+    "CheckDropletAgentForm",
+    "CopyCapsuleToDropletForm",
     "DeployDropletForm",
     "DeployIntranetForm",
     "DeployLocalForm",
     "DropletTargetForm",
+    "DROPLET_ACTIONS",
+    "DROPLET_CAPSULE_REQUIRED_ACTIONS",
+    "DROPLET_NON_CAPSULE_ACTIONS",
+    "DROPLET_OPERATION_ACTIONS",
+    "DROPLET_TARGET_ACTION",
     "IntranetTargetForm",
     "LocalTargetForm",
+    "StartDropletInstanceForm",
     "TargetModeForm",
     "TemporaryPublicTargetForm",
+    "parse_droplet_operation_form",
     "parse_target_form",
 ]

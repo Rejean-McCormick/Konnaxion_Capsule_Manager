@@ -35,11 +35,36 @@ class PageId(StrEnum):
     HEALTH = "health"
     SETTINGS = "settings"
     ABOUT = "about"
+    TARGETS = "targets"
+    DEPLOY = "deploy"
+
+
+class UiPage(StrEnum):
+    """Public FastAPI Manager UI routes.
+
+    These values are the browser-facing `/ui/...` routes used by the FastAPI UI
+    contract tests. `PageId` remains the framework-neutral page identity enum.
+    """
+
+    DASHBOARD = "/ui"
+    CAPSULES = "/ui/capsules"
+    INSTANCES = "/ui/instances"
+    SECURITY = "/ui/security"
+    NETWORK = "/ui/network"
+    BACKUPS = "/ui/backups"
+    RESTORE = "/ui/restore"
+    LOGS = "/ui/logs"
+    HEALTH = "/ui/health"
+    SETTINGS = "/ui/settings"
+    ABOUT = "/ui/about"
+    TARGETS = "/ui/targets"
+    DEPLOY = "/ui/deploy"
 
 
 class PageGroup(StrEnum):
     OVERVIEW = "overview"
     OPERATIONS = "operations"
+    DEPLOYMENT = "deployment"
     SAFETY = "safety"
     SYSTEM = "system"
 
@@ -95,12 +120,14 @@ class UiAction(StrEnum):
     DEPLOY_INTRANET = "deploy_intranet"
     DEPLOY_DROPLET = "deploy_droplet"
 
+    BOOTSTRAP_DROPLET_AGENT = "bootstrap_droplet_agent"
     CHECK_DROPLET_AGENT = "check_droplet_agent"
     COPY_CAPSULE_TO_DROPLET = "copy_capsule_to_droplet"
     START_DROPLET_INSTANCE = "start_droplet_instance"
 
     OPEN_MANAGER_DOCS = "open_manager_docs"
     OPEN_AGENT_DOCS = "open_agent_docs"
+
 
 class ActionIntent(StrEnum):
     PRIMARY = "primary"
@@ -273,4 +300,5 @@ __all__ = [
     "PageId",
     "PageRenderModel",
     "UiAction",
+    "UiPage",
 ]

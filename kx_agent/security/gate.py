@@ -9,10 +9,25 @@ and backup readiness.
 This module is intentionally deterministic and side-effect-light. It consumes a
 SecurityGateContext prepared by higher-level Agent components and returns a
 SecurityGateResult that the lifecycle layer can use to allow or block startup.
+
+Compatibility note:
+Older Agent call paths sometimes pass manifest={} and env={} to
+context_from_compose(). To keep the gate strict while avoiding false negatives,
+this module hydrates missing manifest/env values from canonical runtime files
+when available:
+
+- /opt/konnaxion/shared/capsules/<capsule_id>/manifest.yaml
+- /opt/konnaxion/shared/capsules/<capsule_id>/manifest.json
+- /opt/konnaxion/instances/<instance_id>/env/*.env
+- /opt/konnaxion/instances/<instance_id>/state/*.env
+
+If those files are not present, checks still fail normally.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -137,7 +152,7 @@ DEFAULT_ALLOWED_IMAGES = frozenset(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Generic helpers
 # ---------------------------------------------------------------------------
 
 def _utc_now() -> datetime:
@@ -146,6 +161,381 @@ def _utc_now() -> datetime:
 
 def _enum_value(value: object) -> str:
     return str(getattr(value, "value", value))
+
+
+def _runtime_root() -> Path:
+    env_root = os.getenv("KX_ROOT", "").strip()
+    if env_root:
+        return Path(env_root)
+
+    backup_root = Path(KX_BACKUPS_ROOT)
+    if backup_root.name == "backups":
+        return backup_root.parent
+
+    return Path("/opt/konnaxion")
+
+
+def _instances_root() -> Path:
+    return _runtime_root() / "instances"
+
+
+def _shared_capsules_root() -> Path:
+    return _runtime_root() / "shared" / "capsules"
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        if path.exists() and path.is_file():
+            return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return None
+
+
+def _clean_scalar(value: str) -> str:
+    cleaned = value.strip()
+
+    if cleaned in {"", "null", "Null", "NULL", "~"}:
+        return ""
+
+    if (
+        len(cleaned) >= 2
+        and cleaned[0] == cleaned[-1]
+        and cleaned[0] in {"'", '"'}
+    ):
+        return cleaned[1:-1]
+
+    return cleaned
+
+
+def _parse_simple_top_level_yaml(text: str) -> dict[str, Any]:
+    """
+    Minimal fallback YAML parser.
+
+    It intentionally extracts only simple top-level `key: value` scalars.
+    That is enough for required manifest fields and avoids depending on PyYAML.
+    """
+
+    result: dict[str, Any] = {}
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+
+        if raw_line.lstrip().startswith("#"):
+            continue
+
+        # Only top-level scalars.
+        if raw_line[:1].isspace():
+            continue
+
+        if ":" not in raw_line:
+            continue
+
+        key, value = raw_line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            continue
+
+        # Ignore nested map/list starts in this fallback.
+        if value == "":
+            continue
+
+        result[key] = _clean_scalar(value)
+
+    return result
+
+
+def _parse_mapping_text(text: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, Mapping):
+        return dict(parsed)
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None
+
+    if yaml is not None:
+        try:
+            parsed_yaml = yaml.safe_load(text)
+        except Exception:
+            parsed_yaml = None
+
+        if isinstance(parsed_yaml, Mapping):
+            return dict(parsed_yaml)
+
+    return _parse_simple_top_level_yaml(text)
+
+
+def _parse_env_text(text: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("export "):
+            line = line.removeprefix("export ").strip()
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = _clean_scalar(value)
+
+        if key:
+            env[key] = value
+
+    return env
+
+
+def _load_env_file(path: Path) -> dict[str, str]:
+    text = _read_text(path)
+    if text is None:
+        return {}
+    return _parse_env_text(text)
+
+
+def _load_instance_env_files(instance_id: str) -> dict[str, str]:
+    root = _instances_root() / instance_id
+    candidates: list[Path] = []
+
+    for directory_name in ("env", "state"):
+        directory = root / directory_name
+        try:
+            if directory.exists() and directory.is_dir():
+                candidates.extend(sorted(directory.glob("*.env")))
+        except OSError:
+            continue
+
+    preferred = root / "env" / "runtime.env"
+    if preferred in candidates:
+        candidates.remove(preferred)
+        candidates.insert(0, preferred)
+
+    env: dict[str, str] = {}
+
+    for path in candidates:
+        env.update(_load_env_file(path))
+
+    return env
+
+
+def _compose_environment(compose: Mapping[str, Any]) -> dict[str, str]:
+    raw_services = compose.get("services", {})
+    if not isinstance(raw_services, Mapping):
+        return {}
+
+    env: dict[str, str] = {}
+
+    for raw_spec in raw_services.values():
+        if not isinstance(raw_spec, Mapping):
+            continue
+
+        raw_env = raw_spec.get("environment", {})
+
+        if isinstance(raw_env, Mapping):
+            for key, value in raw_env.items():
+                if value is not None:
+                    env[str(key)] = str(value)
+
+        elif isinstance(raw_env, Sequence) and not isinstance(raw_env, (str, bytes)):
+            for item in raw_env:
+                text = str(item)
+                if "=" not in text:
+                    continue
+                key, value = text.split("=", 1)
+                if key.strip():
+                    env[key.strip()] = value.strip()
+
+    return env
+
+
+def _candidate_capsule_ids_from_manifest(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = str(manifest.get("capsule_id") or "").strip()
+    return (raw,) if raw else ()
+
+
+def _candidate_capsule_ids_from_env(env: Mapping[str, str]) -> tuple[str, ...]:
+    raw = str(env.get("KX_CAPSULE_ID") or env.get("CAPSULE_ID") or "").strip()
+    return (raw,) if raw else ()
+
+
+def _candidate_capsule_ids_from_compose(compose: Mapping[str, Any]) -> tuple[str, ...]:
+    candidates: list[str] = []
+
+    def visit(value: Any, key_hint: str = "") -> None:
+        key_lower = key_hint.lower()
+
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                visit(item, str(key))
+            return
+
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            for item in value:
+                visit(item, key_hint)
+            return
+
+        text = str(value).strip()
+        if not text:
+            return
+
+        if key_lower in {"capsule_id", "kx_capsule_id"}:
+            candidates.append(text)
+            return
+
+        if text.startswith("KX_CAPSULE_ID="):
+            candidates.append(text.split("=", 1)[1].strip())
+            return
+
+        if text.startswith("CAPSULE_ID="):
+            candidates.append(text.split("=", 1)[1].strip())
+
+    visit(compose)
+
+    deduped: list[str] = []
+    for item in candidates:
+        if item and item not in deduped:
+            deduped.append(item)
+
+    return tuple(deduped)
+
+
+def _manifest_paths_for_capsule_id(capsule_id: str) -> tuple[Path, ...]:
+    root = _shared_capsules_root() / capsule_id
+    return (
+        root / "manifest.yaml",
+        root / "manifest.yml",
+        root / "manifest.json",
+    )
+
+
+def _all_runtime_manifest_paths() -> tuple[Path, ...]:
+    root = _shared_capsules_root()
+
+    try:
+        if not root.exists() or not root.is_dir():
+            return ()
+    except OSError:
+        return ()
+
+    paths: list[Path] = []
+    for pattern in ("*/manifest.yaml", "*/manifest.yml", "*/manifest.json"):
+        try:
+            paths.extend(root.glob(pattern))
+        except OSError:
+            continue
+
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return tuple(sorted(paths, key=mtime, reverse=True))
+
+
+def _load_manifest_path(path: Path) -> dict[str, Any]:
+    text = _read_text(path)
+    if text is None:
+        return {}
+
+    parsed = _parse_mapping_text(text)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _manifest_missing_fields(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(sorted(field for field in REQUIRED_MANIFEST_FIELDS if not manifest.get(field)))
+
+
+def _hydrate_manifest(
+    *,
+    instance_id: str,
+    compose: Mapping[str, Any] | None,
+    manifest: Mapping[str, Any],
+    env: Mapping[str, str],
+) -> dict[str, Any]:
+    """
+    Fill missing manifest fields from canonical extracted capsule manifests.
+
+    Explicit caller-provided manifest values take precedence over file values.
+    """
+
+    current = dict(manifest or {})
+    if not _manifest_missing_fields(current):
+        return current
+
+    capsule_ids: list[str] = []
+    for source in (
+        _candidate_capsule_ids_from_manifest(current),
+        _candidate_capsule_ids_from_env(env),
+        _candidate_capsule_ids_from_compose(compose or {}),
+    ):
+        for item in source:
+            if item and item not in capsule_ids:
+                capsule_ids.append(item)
+
+    candidate_paths: list[Path] = []
+    for capsule_id in capsule_ids:
+        candidate_paths.extend(_manifest_paths_for_capsule_id(capsule_id))
+
+    candidate_paths.extend(path for path in _all_runtime_manifest_paths() if path not in candidate_paths)
+
+    for path in candidate_paths:
+        loaded = _load_manifest_path(path)
+        if not loaded:
+            continue
+
+        merged = {**loaded, **current}
+        merged.setdefault("_manifest_path", str(path))
+        merged.setdefault("_manifest_hydrated_for_instance_id", instance_id)
+
+        if not _manifest_missing_fields(merged):
+            return merged
+
+        # Even a partial manifest is better than an empty one if no complete
+        # candidate exists.
+        if len(merged) > len(current):
+            current = merged
+
+    return current
+
+
+def _hydrate_env(
+    *,
+    instance_id: str,
+    compose: Mapping[str, Any] | None,
+    env: Mapping[str, str],
+) -> dict[str, str]:
+    """
+    Fill missing env/secrets from canonical instance env files.
+
+    Precedence, lowest to highest:
+    - instance env files
+    - Compose service environment
+    - caller-provided env
+    """
+
+    file_env = _load_instance_env_files(instance_id)
+    compose_env = _compose_environment(compose or {})
+
+    merged: dict[str, str] = {}
+    merged.update(file_env)
+    merged.update(compose_env)
+    merged.update({str(key): str(value) for key, value in dict(env or {}).items()})
+
+    return merged
 
 
 def normalize_security_check(value: SecurityGateCheck | str) -> SecurityGateCheck:
@@ -238,12 +628,14 @@ def _has_forbidden_mount(mounts: Iterable[str]) -> bool:
     return False
 
 
-def _as_status_value(value: object) -> str:
-    return _enum_value(value)
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
 
-
-def _as_check_value(value: object) -> str:
-    return _enum_value(value)
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +817,7 @@ def _coerce_check_result(value: Any) -> SecurityCheckResult:
             message=str(value.get("message") or ""),
             blocking=value.get("blocking"),
             details=dict(value.get("details") or {}),
+            checked_at=value.get("checked_at") if isinstance(value.get("checked_at"), datetime) else None,
         )
 
     check = getattr(value, "check", None)
@@ -622,10 +1015,28 @@ class SecurityGateContext:
         if not instance_id:
             raise ValueError("instance_id is required.")
 
+        env = {str(key): str(value) for key, value in dict(self.env or {}).items()}
+        manifest = dict(self.manifest or {})
+
+        # Backstop hydration for direct SecurityGateContext(...) callers.
+        if _manifest_missing_fields(manifest):
+            manifest = _hydrate_manifest(
+                instance_id=instance_id,
+                compose={},
+                manifest=manifest,
+                env=env,
+            )
+
+        if any(not env.get(key) for key in REQUIRED_SECRET_KEYS):
+            env = _hydrate_env(instance_id=instance_id, compose={}, env=env)
+
         object.__setattr__(self, "instance_id", instance_id)
+        object.__setattr__(self, "manifest", manifest)
+        object.__setattr__(self, "env", env)
         object.__setattr__(self, "services", tuple(self.services))
         object.__setattr__(self, "published_ports", tuple(self.published_ports))
         object.__setattr__(self, "allowed_images", frozenset(self.allowed_images))
+        object.__setattr__(self, "backup_root", Path(self.backup_root))
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
 
@@ -716,16 +1127,28 @@ def check_manifest_schema(context: SecurityGateContext) -> SecurityCheckResult:
     missing = sorted(field for field in REQUIRED_MANIFEST_FIELDS if not context.manifest.get(field))
 
     if not missing:
+        details: dict[str, Any] = {
+            "required_fields": sorted(REQUIRED_MANIFEST_FIELDS),
+        }
+
+        manifest_path = context.manifest.get("_manifest_path")
+        if manifest_path:
+            details["manifest_path"] = str(manifest_path)
+
         return _pass(
             check,
             "Capsule manifest contains required fields.",
-            details={"required_fields": sorted(REQUIRED_MANIFEST_FIELDS)},
+            details=details,
         )
 
     return _fail(
         check,
         "Capsule manifest is missing required fields.",
-        details={"missing_fields": missing},
+        details={
+            "missing_fields": missing,
+            "manifest_keys": sorted(str(key) for key in context.manifest.keys()),
+            "manifest_path": context.manifest.get("_manifest_path"),
+        },
     )
 
 
@@ -743,7 +1166,10 @@ def check_secrets_present(context: SecurityGateContext) -> SecurityCheckResult:
     return _fail(
         check,
         "Required instance secrets are missing.",
-        details={"missing": missing},
+        details={
+            "missing": missing,
+            "available_secret_keys": sorted(key for key in REQUIRED_SECRET_KEYS if context.env.get(key)),
+        },
     )
 
 
@@ -751,7 +1177,7 @@ def check_secrets_not_default(context: SecurityGateContext) -> SecurityCheckResu
     check = SecurityGateCheck.SECRETS_NOT_DEFAULT
     bad: list[str] = []
 
-    for key in REQUIRED_SECRET_KEYS:
+    for key in sorted(REQUIRED_SECRET_KEYS):
         value = context.env.get(key)
 
         if key == "DATABASE_URL":
@@ -999,9 +1425,9 @@ def parse_port_mapping(service: str, value: Any) -> PublishedPort:
 
         return PublishedPort(
             service=service,
-            host_ip=value.get("host_ip"),
-            host_port=int(published) if published is not None else None,
-            container_port=int(target) if target is not None else None,
+            host_ip=str(value.get("host_ip")) if value.get("host_ip") is not None else None,
+            host_port=_int_or_none(published),
+            container_port=_int_or_none(target),
             protocol=str(protocol),
             raw=dict(value),
         )
@@ -1104,15 +1530,42 @@ def context_from_compose(
     redis_public: bool = False,
     policy: SecurityGatePolicy | None = None,
 ) -> SecurityGateContext:
-    """Build SecurityGateContext from a Compose-like mapping."""
+    """
+    Build SecurityGateContext from a Compose-like mapping.
+
+    This function accepts explicit manifest/env data, but if either is empty or
+    incomplete it attempts read-only hydration from canonical runtime files.
+    """
 
     services = services_from_compose(compose)
     published_ports = tuple(port for service in services for port in service.published_ports)
 
+    hydrated_env = _hydrate_env(
+        instance_id=instance_id,
+        compose=compose,
+        env=env,
+    )
+
+    hydrated_manifest = _hydrate_manifest(
+        instance_id=instance_id,
+        compose=compose,
+        manifest=manifest,
+        env=hydrated_env,
+    )
+
+    metadata = {
+        "runtime_root": str(_runtime_root()),
+        "manifest_hydrated": bool(hydrated_manifest and hydrated_manifest != dict(manifest or {})),
+        "env_hydrated": bool(hydrated_env and hydrated_env != dict(env or {})),
+    }
+
+    if hydrated_manifest.get("_manifest_path"):
+        metadata["manifest_path"] = str(hydrated_manifest.get("_manifest_path"))
+
     return SecurityGateContext(
         instance_id=instance_id,
-        manifest=manifest,
-        env=env,
+        manifest=hydrated_manifest,
+        env=hydrated_env,
         services=services,
         published_ports=published_ports,
         capsule_signature_verified=capsule_signature_verified,
@@ -1122,7 +1575,8 @@ def context_from_compose(
         admin_surface_private=admin_surface_private,
         postgres_public=postgres_public,
         redis_public=redis_public,
-        policy=policy or SecurityGatePolicy.from_env(env),
+        policy=policy or SecurityGatePolicy.from_env(hydrated_env),
+        metadata=metadata,
     )
 
 
@@ -1153,17 +1607,21 @@ class SecurityGate:
 
     def run(self, context: SecurityGateContext) -> SecurityGateResult:
         results = tuple(check(context) for check in self.CHECKS)
+
+        metadata = {
+            **dict(context.metadata or {}),
+            "routes": dict(ROUTES),
+            "canonical_services": tuple(CANONICAL_DOCKER_SERVICES),
+            "internal_only_ports": {
+                _enum_value(service): port
+                for service, port in INTERNAL_ONLY_PORTS.items()
+            },
+        }
+
         return SecurityGateResult(
             results=results,
             instance_id=context.instance_id,
-            metadata={
-                "routes": dict(ROUTES),
-                "canonical_services": tuple(CANONICAL_DOCKER_SERVICES),
-                "internal_only_ports": {
-                    _enum_value(service): port
-                    for service, port in INTERNAL_ONLY_PORTS.items()
-                },
-            },
+            metadata=metadata,
         )
 
     def assert_start_allowed(self, context: SecurityGateContext) -> SecurityGateResult:

@@ -13,6 +13,8 @@ Agent actions.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 # ---------------------------------------------------------------------
 # Page identity, action metadata, and render model types
 # ---------------------------------------------------------------------
@@ -109,20 +111,31 @@ from kx_manager.ui.page_status import (
 # FastAPI UI contract routes and labels
 # ---------------------------------------------------------------------
 
-UI_PAGE_ROUTES: tuple[str, ...] = (
-    "/ui",
-    "/ui/capsules",
-    "/ui/instances",
-    "/ui/security",
-    "/ui/network",
-    "/ui/backups",
-    "/ui/restore",
-    "/ui/logs",
-    "/ui/health",
-    "/ui/settings",
-    "/ui/about",
-    "/ui/targets",
-)
+
+class UiPage(StrEnum):
+    """Public FastAPI UI page route contract.
+
+    Values are route strings, not internal page ids. Keep this enum free of
+    dynamic route parameters so contract tests and route registration can treat
+    it as the finite public UI surface.
+    """
+
+    DASHBOARD = "/ui"
+    CAPSULES = "/ui/capsules"
+    INSTANCES = "/ui/instances"
+    SECURITY = "/ui/security"
+    NETWORK = "/ui/network"
+    BACKUPS = "/ui/backups"
+    RESTORE = "/ui/restore"
+    LOGS = "/ui/logs"
+    HEALTH = "/ui/health"
+    SETTINGS = "/ui/settings"
+    ABOUT = "/ui/about"
+    TARGETS = "/ui/targets"
+    DEPLOY = "/ui/deploy"
+
+
+UI_PAGE_ROUTES: tuple[str, ...] = tuple(page.value for page in UiPage)
 
 PAGE_ROUTES = UI_PAGE_ROUTES
 PAGES = UI_PAGE_ROUTES
@@ -164,6 +177,7 @@ UI_ACTION_ROUTES: tuple[str, ...] = (
     "/ui/actions/deploy-local",
     "/ui/actions/deploy-intranet",
     "/ui/actions/deploy-droplet",
+    "/ui/actions/bootstrap-droplet-agent",
     "/ui/actions/check-droplet-agent",
     "/ui/actions/copy-capsule-to-droplet",
     "/ui/actions/start-droplet-instance",
@@ -210,6 +224,7 @@ UI_ACTION_LABELS: dict[str, str] = {
     "deploy_local": "Deploy Local",
     "deploy_intranet": "Deploy Intranet",
     "deploy_droplet": "Deploy Droplet",
+    "bootstrap_droplet_agent": "Bootstrap Droplet Agent",
     "check_droplet_agent": "Check Droplet Agent",
     "copy_capsule_to_droplet": "Copy Capsule to Droplet",
     "start_droplet_instance": "Start Droplet Instance",
@@ -243,6 +258,7 @@ __all__ = [
     "UI_ACTION_ROUTES",
     "UI_PAGE_ROUTES",
     "UiAction",
+    "UiPage",
     "about_page_model",
     "backup_alerts",
     "backup_summary_row",

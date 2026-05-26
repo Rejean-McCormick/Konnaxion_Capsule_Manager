@@ -8,7 +8,6 @@ Agent instead of touching Docker, firewall, or host state directly.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -16,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from kx_manager.client import KonnaxionAgentClient
 from kx_manager.config import get_manager_config
 from kx_shared.errors import (
     CapsuleError,
@@ -40,15 +40,23 @@ except ImportError:  # pragma: no cover - route modules may be generated later.
 
 API_TITLE = MANAGER_NAME
 API_VERSION = "0.1.0"
+PUBLIC_API_VERSION = "v1"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load and validate Manager configuration during startup."""
+    """Load Manager configuration and attach the local Konnaxion Agent client."""
 
     config = get_manager_config()
+    agent_client = KonnaxionAgentClient.from_env()
+
     app.state.config = config
-    yield
+    app.state.agent_client = agent_client
+
+    try:
+        yield
+    finally:
+        await agent_client.aclose()
 
 
 def create_app() -> FastAPI:
@@ -90,18 +98,24 @@ def register_core_routes(app: FastAPI) -> None:
 
         return {
             "name": MANAGER_NAME,
+            "service": MANAGER_NAME,
             "api_version": API_VERSION,
+            "public_api_version": PUBLIC_API_VERSION,
             "app_version": APP_VERSION,
             "param_version": PARAM_VERSION,
         }
 
     @app.get("/health", tags=["system"])
-    async def health() -> dict[str, str]:
+    @app.get("/v1/health", tags=["system"])
+    async def health() -> dict[str, str | bool]:
         """Return Manager API health."""
 
         return {
+            "ok": True,
             "status": "ok",
+            "service": MANAGER_NAME,
             "name": MANAGER_NAME,
+            "api_version": PUBLIC_API_VERSION,
             "app_version": APP_VERSION,
             "param_version": PARAM_VERSION,
         }

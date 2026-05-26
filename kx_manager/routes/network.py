@@ -135,14 +135,20 @@ def set_network_profile(request: SetNetworkProfileRequest) -> SetNetworkProfileR
     """
 
     try:
+        requested_exposure_mode = (
+            request.exposure_mode
+            or get_network_profile(request.profile).exposure_mode
+        )
+        requested_public_mode_enabled = (
+            request.public_mode_enabled
+            if request.public_mode_enabled is not None
+            else get_network_profile(request.profile).public_mode_enabled
+        )
+
         spec = validate_profile_selection(
             request.profile,
-            exposure_mode=request.exposure_mode or get_network_profile(request.profile).exposure_mode,
-            public_mode_enabled=(
-                request.public_mode_enabled
-                if request.public_mode_enabled is not None
-                else get_network_profile(request.profile).public_mode_enabled
-            ),
+            exposure_mode=requested_exposure_mode,
+            public_mode_enabled=requested_public_mode_enabled,
             public_mode_expires_at=request.public_mode_expires_at,
         )
 
@@ -181,6 +187,9 @@ def set_network_profile(request: SetNetworkProfileRequest) -> SetNetworkProfileR
         instance_id=request.instance_id,
         kx_env=kx_env,
         profile_payload={
+            # Agent action handlers expect network_profile.
+            "network_profile": spec.profile.value,
+            # Keep profile as a compatibility alias for any older Manager client code.
             "profile": spec.profile.value,
             "exposure_mode": spec.exposure_mode.value,
             "public_mode_enabled": spec.public_mode_enabled,
@@ -197,7 +206,7 @@ def set_network_profile(request: SetNetworkProfileRequest) -> SetNetworkProfileR
         public_mode_expires_at=request.public_mode_expires_at,
         host=request.host,
         dry_run=False,
-        delegated_to_agent=agent_response.get("delegated_to_agent", False),
+        delegated_to_agent=bool(agent_response.get("delegated_to_agent", False)),
         status=str(agent_response.get("status", "pending")),
         kx_env=kx_env,
         warnings=warnings + list(agent_response.get("warnings", [])),
@@ -221,13 +230,18 @@ def get_instance_network_status(instance_id: str) -> NetworkStatusResponse:
 
     agent_status = _delegate_get_status_to_agent(instance_id)
     if agent_status:
-        profile = NetworkProfile(agent_status.get("profile", DEFAULT_NETWORK_PROFILE.value))
+        profile = NetworkProfile(
+            agent_status.get("network_profile")
+            or agent_status.get("profile", DEFAULT_NETWORK_PROFILE.value)
+        )
         spec = get_network_profile(profile)
         return NetworkStatusResponse(
             instance_id=instance_id,
             profile=spec.profile.value,
             exposure_mode=str(agent_status.get("exposure_mode", spec.exposure_mode.value)),
-            public_mode_enabled=bool(agent_status.get("public_mode_enabled", spec.public_mode_enabled)),
+            public_mode_enabled=bool(
+                agent_status.get("public_mode_enabled", spec.public_mode_enabled)
+            ),
             public_mode_expires_at=agent_status.get("public_mode_expires_at"),
             host=agent_status.get("host"),
             allowed_entry_ports=list(allowed_entry_ports_for(spec.profile)),

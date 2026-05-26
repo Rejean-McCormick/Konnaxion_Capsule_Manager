@@ -4,6 +4,7 @@ Tests for canonical Konnaxion instance and resource states.
 These tests prevent drift between:
 - kx_shared.konnaxion_constants
 - kx_agent.instances.model
+- kx_agent.instances.lifecycle
 - Manager/UI/API expectations
 
 They intentionally check exact canonical values.
@@ -22,6 +23,17 @@ from kx_shared.konnaxion_constants import (
     RollbackStatus,
     SecurityGateCheck,
     SecurityGateStatus,
+)
+
+from kx_agent.instances.lifecycle import (
+    RECOVERABLE_STATES,
+    ROLLBACKABLE_STATES,
+    STARTABLE_STATES,
+    STOPPABLE_STATES,
+    UPDATABLE_STATES,
+    allowed_next_states,
+    can_transition,
+    normalize_state,
 )
 
 from kx_agent.instances.model import (
@@ -94,6 +106,55 @@ EXPECTED_SECURITY_GATE_STATUSES = (
     "UNKNOWN",
 )
 
+EXPECTED_STARTABLE_STATES = frozenset(
+    {
+        InstanceState.CREATED,
+        InstanceState.READY,
+        InstanceState.STOPPED,
+        InstanceState.DEGRADED,
+    }
+)
+
+EXPECTED_STOPPABLE_STATES = frozenset(
+    {
+        InstanceState.RUNNING,
+        InstanceState.DEGRADED,
+        InstanceState.STARTING,
+    }
+)
+
+EXPECTED_UPDATABLE_STATES = frozenset(
+    {
+        InstanceState.READY,
+        InstanceState.RUNNING,
+        InstanceState.STOPPED,
+        InstanceState.DEGRADED,
+        InstanceState.FAILED,
+    }
+)
+
+EXPECTED_ROLLBACKABLE_STATES = frozenset(
+    {
+        InstanceState.RUNNING,
+        InstanceState.STOPPED,
+        InstanceState.DEGRADED,
+        InstanceState.FAILED,
+        InstanceState.UPDATING,
+    }
+)
+
+EXPECTED_RECOVERABLE_STATES = frozenset(
+    {
+        InstanceState.DEGRADED,
+        InstanceState.FAILED,
+        InstanceState.SECURITY_BLOCKED,
+    }
+)
+
+
+def _checked_at() -> datetime:
+    return datetime.now(UTC)
+
 
 def test_instance_state_values_are_canonical() -> None:
     assert tuple(state.value for state in InstanceState) == EXPECTED_INSTANCE_STATES
@@ -152,6 +213,51 @@ def test_can_start_is_allowed_only_for_safe_states(
     assert instance.can_start is expected_can_start
 
 
+def test_lifecycle_operation_state_sets_are_canonical() -> None:
+    assert STARTABLE_STATES == EXPECTED_STARTABLE_STATES
+    assert STOPPABLE_STATES == EXPECTED_STOPPABLE_STATES
+    assert UPDATABLE_STATES == EXPECTED_UPDATABLE_STATES
+    assert ROLLBACKABLE_STATES == EXPECTED_ROLLBACKABLE_STATES
+    assert RECOVERABLE_STATES == EXPECTED_RECOVERABLE_STATES
+
+
+@pytest.mark.parametrize("state", tuple(InstanceState))
+def test_lifecycle_startable_states_match_instance_model_can_start(
+    state: InstanceState,
+) -> None:
+    instance = InstanceModel(instance_id="demo-001", state=state)
+
+    assert (state in STARTABLE_STATES) is instance.can_start
+
+
+@pytest.mark.parametrize("state", sorted(EXPECTED_STARTABLE_STATES, key=lambda item: item.value))
+def test_lifecycle_allows_start_transition_from_every_startable_state(
+    state: InstanceState,
+) -> None:
+    assert can_transition(state, InstanceState.STARTING)
+    assert InstanceState.STARTING in allowed_next_states(state)
+
+
+@pytest.mark.parametrize(
+    "state",
+    tuple(state for state in InstanceState if state not in EXPECTED_STARTABLE_STATES),
+)
+def test_lifecycle_blocks_start_transition_from_non_startable_states(
+    state: InstanceState,
+) -> None:
+    assert not can_transition(state, InstanceState.STARTING)
+
+
+def test_lifecycle_normalize_state_accepts_enum_and_string() -> None:
+    assert normalize_state(InstanceState.READY) == InstanceState.READY
+    assert normalize_state("ready") == InstanceState.READY
+
+
+def test_lifecycle_normalize_state_rejects_invented_state() -> None:
+    with pytest.raises(Exception, match="Unknown Konnaxion Instance state"):
+        normalize_state("booting")
+
+
 def test_transition_to_running_sets_started_at() -> None:
     instance = InstanceModel(instance_id="demo-001", state=InstanceState.READY)
 
@@ -165,9 +271,10 @@ def test_transition_to_running_sets_started_at() -> None:
 
 
 def test_transition_to_stopped_sets_stopped_at() -> None:
-    running = InstanceModel(instance_id="demo-001", state=InstanceState.RUNNING).transition(
-        InstanceState.RUNNING
-    )
+    running = InstanceModel(
+        instance_id="demo-001",
+        state=InstanceState.RUNNING,
+    ).transition(InstanceState.RUNNING)
 
     stopped = running.transition(InstanceState.STOPPED)
 
@@ -190,6 +297,120 @@ def test_unknown_instance_state_is_rejected() -> None:
         InstanceModel(instance_id="demo-001", state="booting")
 
 
+def test_security_gate_summary_derives_fail_blocking_from_blocking_failure() -> None:
+    gate = SecurityGateSummary(
+        status=SecurityGateStatus.UNKNOWN,
+        checks=(
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.CAPSULE_SIGNATURE,
+                status=SecurityGateStatus.PASS,
+                message="Capsule signature verified.",
+                blocking=True,
+                checked_at=_checked_at(),
+            ),
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.MANIFEST_SCHEMA,
+                status=SecurityGateStatus.FAIL_BLOCKING,
+                message="Capsule manifest is missing required fields.",
+                blocking=True,
+                checked_at=_checked_at(),
+            ),
+        ),
+        checked_at=_checked_at(),
+    )
+
+    derived = gate.with_derived_status()
+
+    assert derived.status == SecurityGateStatus.FAIL_BLOCKING
+    assert derived.passed is False
+    assert len(derived.blocking_failures) == 1
+    assert derived.blocking_failures[0].check == SecurityGateCheck.MANIFEST_SCHEMA
+
+
+def test_security_gate_summary_derives_warn_without_blocking_failure() -> None:
+    gate = SecurityGateSummary(
+        status=SecurityGateStatus.UNKNOWN,
+        checks=(
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.CAPSULE_SIGNATURE,
+                status=SecurityGateStatus.PASS,
+                message="Capsule signature verified.",
+                blocking=True,
+                checked_at=_checked_at(),
+            ),
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.BACKUP_CONFIGURED,
+                status=SecurityGateStatus.WARN,
+                message="Backup policy warning.",
+                blocking=False,
+                checked_at=_checked_at(),
+            ),
+        ),
+        checked_at=_checked_at(),
+    )
+
+    derived = gate.with_derived_status()
+
+    assert derived.status == SecurityGateStatus.WARN
+    assert derived.passed is False
+    assert derived.blocking_failures == ()
+
+
+def test_security_gate_summary_derives_pass_from_pass_and_skipped_checks() -> None:
+    gate = SecurityGateSummary(
+        status=SecurityGateStatus.UNKNOWN,
+        checks=(
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.CAPSULE_SIGNATURE,
+                status=SecurityGateStatus.PASS,
+                message="Capsule signature verified.",
+                blocking=True,
+                checked_at=_checked_at(),
+            ),
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.BACKUP_CONFIGURED,
+                status=SecurityGateStatus.SKIPPED,
+                message="Backup check skipped.",
+                blocking=False,
+                checked_at=_checked_at(),
+            ),
+        ),
+        checked_at=_checked_at(),
+    )
+
+    derived = gate.with_derived_status()
+
+    assert derived.status == SecurityGateStatus.PASS
+    assert derived.passed is True
+    assert derived.blocking_failures == ()
+
+
+def test_security_gate_summary_round_trip_serialization_preserves_checks() -> None:
+    gate = SecurityGateSummary(
+        status=SecurityGateStatus.FAIL_BLOCKING,
+        checks=(
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.SECRETS_PRESENT,
+                status=SecurityGateStatus.FAIL_BLOCKING,
+                message="Required instance secrets are missing.",
+                blocking=True,
+                checked_at=_checked_at(),
+            ),
+        ),
+        checked_at=_checked_at(),
+    )
+
+    payload = gate.to_dict()
+    restored = SecurityGateSummary.from_dict(payload)
+
+    assert payload["status"] == "FAIL_BLOCKING"
+    assert restored.status == SecurityGateStatus.FAIL_BLOCKING
+    assert len(restored.checks) == 1
+    assert restored.checks[0].check == SecurityGateCheck.SECRETS_PRESENT
+    assert restored.checks[0].status == SecurityGateStatus.FAIL_BLOCKING
+    assert restored.checks[0].blocking is True
+
+
 def test_security_gate_blocking_failure_sets_security_blocked_state() -> None:
     instance = InstanceModel(instance_id="demo-001", state=InstanceState.READY)
 
@@ -201,10 +422,10 @@ def test_security_gate_blocking_failure_sets_security_blocked_state() -> None:
                 status=SecurityGateStatus.FAIL_BLOCKING,
                 message="Capsule signature invalid.",
                 blocking=True,
-                checked_at=datetime.now(UTC),
+                checked_at=_checked_at(),
             ),
         ),
-        checked_at=datetime.now(UTC),
+        checked_at=_checked_at(),
     )
 
     updated = instance.with_security_gate(gate)
@@ -227,17 +448,17 @@ def test_security_gate_pass_does_not_block_ready_instance() -> None:
                 status=SecurityGateStatus.PASS,
                 message="Capsule signature valid.",
                 blocking=True,
-                checked_at=datetime.now(UTC),
+                checked_at=_checked_at(),
             ),
             SecurityGateCheckResult(
                 check=SecurityGateCheck.IMAGE_CHECKSUMS,
                 status=SecurityGateStatus.PASS,
                 message="Image checksums valid.",
                 blocking=True,
-                checked_at=datetime.now(UTC),
+                checked_at=_checked_at(),
             ),
         ),
-        checked_at=datetime.now(UTC),
+        checked_at=_checked_at(),
     )
 
     updated = instance.with_security_gate(gate)
@@ -245,6 +466,39 @@ def test_security_gate_pass_does_not_block_ready_instance() -> None:
     assert updated.state == InstanceState.READY
     assert updated.security_gate.status == SecurityGateStatus.PASS
     assert updated.security_gate.passed is True
+    assert updated.can_start is True
+
+
+def test_security_gate_warn_does_not_block_ready_instance() -> None:
+    instance = InstanceModel(instance_id="demo-001", state=InstanceState.READY)
+
+    gate = SecurityGateSummary(
+        status=SecurityGateStatus.UNKNOWN,
+        checks=(
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.CAPSULE_SIGNATURE,
+                status=SecurityGateStatus.PASS,
+                message="Capsule signature valid.",
+                blocking=True,
+                checked_at=_checked_at(),
+            ),
+            SecurityGateCheckResult(
+                check=SecurityGateCheck.BACKUP_CONFIGURED,
+                status=SecurityGateStatus.WARN,
+                message="Backup configuration warning.",
+                blocking=False,
+                checked_at=_checked_at(),
+            ),
+        ),
+        checked_at=_checked_at(),
+    )
+
+    updated = instance.with_security_gate(gate)
+
+    assert updated.state == InstanceState.READY
+    assert updated.security_gate.status == SecurityGateStatus.WARN
+    assert updated.security_gate.passed is False
+    assert updated.security_gate.blocking_failures == ()
     assert updated.can_start is True
 
 
@@ -261,11 +515,11 @@ def test_running_instance_with_unhealthy_health_becomes_degraded() -> None:
                 running=True,
                 healthy=False,
                 message="Healthcheck failed.",
-                checked_at=datetime.now(UTC),
+                checked_at=_checked_at(),
             ),
         ),
         message="One service is unhealthy.",
-        checked_at=datetime.now(UTC),
+        checked_at=_checked_at(),
     )
 
     updated = instance.with_health(health)
@@ -287,10 +541,10 @@ def test_running_instance_with_healthy_health_remains_running() -> None:
                 desired=True,
                 running=True,
                 healthy=True,
-                checked_at=datetime.now(UTC),
+                checked_at=_checked_at(),
             ),
         ),
-        checked_at=datetime.now(UTC),
+        checked_at=_checked_at(),
     )
 
     updated = instance.with_health(health)

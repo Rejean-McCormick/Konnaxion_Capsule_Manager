@@ -3,18 +3,20 @@ Konnaxion Instance lifecycle state machine.
 
 This module owns the valid high-level lifecycle transitions for a
 Konnaxion Instance. It does not run Docker, mutate firewall rules, create
-backups, or write runtime files directly. Those operations belong to the
-Agent action layer and runtime modules.
+backups, load image archives, or write runtime files directly. Those operations
+belong to the Agent action layer and runtime modules.
 
-The purpose of this module is to keep every coded file aligned on the
-same canonical instance states and transition rules.
+Startup preparation, including loading capsule-owned OCI image archives before
+Docker Compose is recreated, is represented by the canonical STARTING state.
+The purpose of this module is to keep every coded file aligned on the same
+canonical instance states and transition rules.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Iterable
+from typing import Final, Iterable
 
 from kx_shared.konnaxion_constants import InstanceState, SecurityGateStatus
 
@@ -70,123 +72,172 @@ class LifecycleResult:
 # Terminal or intervention states such as FAILED, DEGRADED, and
 # SECURITY_BLOCKED may move back into a recovery path only through
 # explicit Agent actions.
-ALLOWED_TRANSITIONS: dict[InstanceState, frozenset[InstanceState]] = {
-    InstanceState.CREATED: frozenset({
-        InstanceState.IMPORTING,
-        InstanceState.VERIFYING,
-        InstanceState.READY,
-        InstanceState.FAILED,
-    }),
-    InstanceState.IMPORTING: frozenset({
-        InstanceState.VERIFYING,
-        InstanceState.READY,
-        InstanceState.FAILED,
-    }),
-    InstanceState.VERIFYING: frozenset({
-        InstanceState.READY,
-        InstanceState.SECURITY_BLOCKED,
-        InstanceState.FAILED,
-    }),
-    InstanceState.READY: frozenset({
-        InstanceState.STARTING,
-        InstanceState.UPDATING,
-        InstanceState.STOPPED,
-        InstanceState.FAILED,
-        InstanceState.SECURITY_BLOCKED,
-    }),
-    InstanceState.STARTING: frozenset({
-        InstanceState.RUNNING,
-        InstanceState.DEGRADED,
-        InstanceState.FAILED,
-        InstanceState.SECURITY_BLOCKED,
-    }),
-    InstanceState.RUNNING: frozenset({
-        InstanceState.STOPPING,
-        InstanceState.UPDATING,
-        InstanceState.DEGRADED,
-        InstanceState.FAILED,
-        InstanceState.ROLLING_BACK,
-    }),
-    InstanceState.STOPPING: frozenset({
-        InstanceState.STOPPED,
-        InstanceState.FAILED,
-    }),
-    InstanceState.STOPPED: frozenset({
-        InstanceState.STARTING,
-        InstanceState.UPDATING,
-        InstanceState.ROLLING_BACK,
-        InstanceState.FAILED,
-        InstanceState.SECURITY_BLOCKED,
-    }),
-    InstanceState.UPDATING: frozenset({
-        InstanceState.RUNNING,
-        InstanceState.STOPPED,
-        InstanceState.DEGRADED,
-        InstanceState.ROLLING_BACK,
-        InstanceState.FAILED,
-        InstanceState.SECURITY_BLOCKED,
-    }),
-    InstanceState.ROLLING_BACK: frozenset({
-        InstanceState.RUNNING,
-        InstanceState.STOPPED,
-        InstanceState.DEGRADED,
-        InstanceState.FAILED,
-        InstanceState.SECURITY_BLOCKED,
-    }),
-    InstanceState.DEGRADED: frozenset({
-        InstanceState.RUNNING,
-        InstanceState.STOPPING,
-        InstanceState.UPDATING,
-        InstanceState.ROLLING_BACK,
-        InstanceState.FAILED,
-        InstanceState.SECURITY_BLOCKED,
-    }),
-    InstanceState.FAILED: frozenset({
-        InstanceState.STOPPED,
-        InstanceState.UPDATING,
-        InstanceState.ROLLING_BACK,
-        InstanceState.VERIFYING,
-    }),
-    InstanceState.SECURITY_BLOCKED: frozenset({
-        InstanceState.VERIFYING,
-        InstanceState.STOPPED,
-        InstanceState.FAILED,
-    }),
+#
+# STARTING covers all pre-runtime-start work:
+# - loading capsule-owned images/*.oci.tar archives into Docker
+# - recreating containers from the freshly loaded tags
+# - starting Docker Compose services
+# - initial runtime health checks
+ALLOWED_TRANSITIONS: Final[dict[InstanceState, frozenset[InstanceState]]] = {
+    InstanceState.CREATED: frozenset(
+        {
+            InstanceState.IMPORTING,
+            InstanceState.VERIFYING,
+            InstanceState.READY,
+            InstanceState.STARTING,
+            InstanceState.FAILED,
+        }
+    ),
+    InstanceState.IMPORTING: frozenset(
+        {
+            InstanceState.VERIFYING,
+            InstanceState.READY,
+            InstanceState.FAILED,
+        }
+    ),
+    InstanceState.VERIFYING: frozenset(
+        {
+            InstanceState.READY,
+            InstanceState.SECURITY_BLOCKED,
+            InstanceState.FAILED,
+        }
+    ),
+    InstanceState.READY: frozenset(
+        {
+            InstanceState.STARTING,
+            InstanceState.UPDATING,
+            InstanceState.STOPPED,
+            InstanceState.ROLLING_BACK,
+            InstanceState.FAILED,
+            InstanceState.SECURITY_BLOCKED,
+        }
+    ),
+    InstanceState.STARTING: frozenset(
+        {
+            InstanceState.RUNNING,
+            InstanceState.STOPPED,
+            InstanceState.DEGRADED,
+            InstanceState.FAILED,
+            InstanceState.SECURITY_BLOCKED,
+        }
+    ),
+    InstanceState.RUNNING: frozenset(
+        {
+            InstanceState.STOPPING,
+            InstanceState.UPDATING,
+            InstanceState.DEGRADED,
+            InstanceState.FAILED,
+            InstanceState.ROLLING_BACK,
+        }
+    ),
+    InstanceState.STOPPING: frozenset(
+        {
+            InstanceState.STOPPED,
+            InstanceState.FAILED,
+        }
+    ),
+    InstanceState.STOPPED: frozenset(
+        {
+            InstanceState.STARTING,
+            InstanceState.UPDATING,
+            InstanceState.ROLLING_BACK,
+            InstanceState.FAILED,
+            InstanceState.SECURITY_BLOCKED,
+        }
+    ),
+    InstanceState.UPDATING: frozenset(
+        {
+            InstanceState.RUNNING,
+            InstanceState.STOPPED,
+            InstanceState.DEGRADED,
+            InstanceState.ROLLING_BACK,
+            InstanceState.FAILED,
+            InstanceState.SECURITY_BLOCKED,
+        }
+    ),
+    InstanceState.ROLLING_BACK: frozenset(
+        {
+            InstanceState.RUNNING,
+            InstanceState.STOPPED,
+            InstanceState.DEGRADED,
+            InstanceState.FAILED,
+            InstanceState.SECURITY_BLOCKED,
+        }
+    ),
+    InstanceState.DEGRADED: frozenset(
+        {
+            InstanceState.STARTING,
+            InstanceState.RUNNING,
+            InstanceState.STOPPING,
+            InstanceState.UPDATING,
+            InstanceState.ROLLING_BACK,
+            InstanceState.FAILED,
+            InstanceState.SECURITY_BLOCKED,
+        }
+    ),
+    InstanceState.FAILED: frozenset(
+        {
+            InstanceState.STOPPED,
+            InstanceState.UPDATING,
+            InstanceState.ROLLING_BACK,
+            InstanceState.VERIFYING,
+        }
+    ),
+    InstanceState.SECURITY_BLOCKED: frozenset(
+        {
+            InstanceState.VERIFYING,
+            InstanceState.STOPPED,
+            InstanceState.FAILED,
+        }
+    ),
 }
 
 
-STARTABLE_STATES = frozenset({
-    InstanceState.READY,
-    InstanceState.STOPPED,
-})
+STARTABLE_STATES: Final[frozenset[InstanceState]] = frozenset(
+    {
+        InstanceState.CREATED,
+        InstanceState.READY,
+        InstanceState.STOPPED,
+        InstanceState.DEGRADED,
+    }
+)
 
-STOPPABLE_STATES = frozenset({
-    InstanceState.RUNNING,
-    InstanceState.DEGRADED,
-    InstanceState.STARTING,
-})
+STOPPABLE_STATES: Final[frozenset[InstanceState]] = frozenset(
+    {
+        InstanceState.RUNNING,
+        InstanceState.DEGRADED,
+        InstanceState.STARTING,
+    }
+)
 
-UPDATABLE_STATES = frozenset({
-    InstanceState.READY,
-    InstanceState.RUNNING,
-    InstanceState.STOPPED,
-    InstanceState.DEGRADED,
-    InstanceState.FAILED,
-})
+UPDATABLE_STATES: Final[frozenset[InstanceState]] = frozenset(
+    {
+        InstanceState.READY,
+        InstanceState.RUNNING,
+        InstanceState.STOPPED,
+        InstanceState.DEGRADED,
+        InstanceState.FAILED,
+    }
+)
 
-ROLLBACKABLE_STATES = frozenset({
-    InstanceState.RUNNING,
-    InstanceState.STOPPED,
-    InstanceState.DEGRADED,
-    InstanceState.FAILED,
-    InstanceState.UPDATING,
-})
+ROLLBACKABLE_STATES: Final[frozenset[InstanceState]] = frozenset(
+    {
+        InstanceState.RUNNING,
+        InstanceState.STOPPED,
+        InstanceState.DEGRADED,
+        InstanceState.FAILED,
+        InstanceState.UPDATING,
+        InstanceState.READY,
+    }
+)
 
-RECOVERABLE_STATES = frozenset({
-    InstanceState.DEGRADED,
-    InstanceState.FAILED,
-    InstanceState.SECURITY_BLOCKED,
-})
+RECOVERABLE_STATES: Final[frozenset[InstanceState]] = frozenset(
+    {
+        InstanceState.DEGRADED,
+        InstanceState.FAILED,
+        InstanceState.SECURITY_BLOCKED,
+    }
+)
 
 
 def normalize_state(value: InstanceState | str) -> InstanceState:
@@ -261,6 +312,36 @@ def require_state_in(
         )
 
     return current
+
+
+def is_startable_state(state: InstanceState | str) -> bool:
+    """Return whether an operator may request instance start."""
+
+    return normalize_state(state) in STARTABLE_STATES
+
+
+def is_stoppable_state(state: InstanceState | str) -> bool:
+    """Return whether an operator may request instance stop."""
+
+    return normalize_state(state) in STOPPABLE_STATES
+
+
+def is_updatable_state(state: InstanceState | str) -> bool:
+    """Return whether an operator may request instance update."""
+
+    return normalize_state(state) in UPDATABLE_STATES
+
+
+def is_rollbackable_state(state: InstanceState | str) -> bool:
+    """Return whether an operator may request instance rollback."""
+
+    return normalize_state(state) in ROLLBACKABLE_STATES
+
+
+def is_recoverable_state(state: InstanceState | str) -> bool:
+    """Return whether an instance is in a recoverable intervention state."""
+
+    return normalize_state(state) in RECOVERABLE_STATES
 
 
 def state_after_security_gate(
@@ -368,11 +449,50 @@ class InstanceLifecycle:
             reason="Instance is ready to start.",
         )
 
-    def mark_starting(self) -> LifecycleResult:
+    def mark_starting(
+        self,
+        *,
+        reason: str = "Instance startup started.",
+    ) -> LifecycleResult:
         require_state_in(self.state, STARTABLE_STATES, operation="instance_start")
         return self.transition_to(
             InstanceState.STARTING,
-            reason="Instance startup started.",
+            reason=reason,
+        )
+
+    def mark_loading_images(self) -> LifecycleResult:
+        """Mark the start phase where capsule OCI archives are loaded.
+
+        This does not load images itself. It records that the startup path has
+        entered the phase where the Agent should load capsule-owned
+        images/*.oci.tar archives before recreating Docker Compose services.
+        """
+
+        if self.state == InstanceState.STARTING:
+            return self.transition_to(
+                InstanceState.STARTING,
+                reason="Capsule image loading is in progress.",
+            )
+
+        require_state_in(self.state, STARTABLE_STATES, operation="instance_start")
+        return self.transition_to(
+            InstanceState.STARTING,
+            reason="Capsule image loading started before runtime startup.",
+        )
+
+    def mark_runtime_starting(self) -> LifecycleResult:
+        """Record that image loading is complete and Compose startup is running."""
+
+        if self.state != InstanceState.STARTING:
+            require_state_in(self.state, STARTABLE_STATES, operation="instance_start")
+            return self.transition_to(
+                InstanceState.STARTING,
+                reason="Runtime startup started.",
+            )
+
+        return self.transition_to(
+            InstanceState.STARTING,
+            reason="Runtime startup is in progress.",
         )
 
     def mark_running(self) -> LifecycleResult:
@@ -427,14 +547,20 @@ class InstanceLifecycle:
     ) -> LifecycleResult:
         """Apply a Security Gate result to the lifecycle."""
 
+        status = (
+            security_status
+            if isinstance(security_status, SecurityGateStatus)
+            else SecurityGateStatus(security_status)
+        )
+
         next_state = state_after_security_gate(
             current_state=self.state,
-            security_status=security_status,
+            security_status=status,
         )
 
         return self.transition_to(
             next_state,
-            reason=f"Security Gate result: {next_state.value}.",
+            reason=f"Security Gate result: {status.value}.",
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -470,8 +596,14 @@ __all__ = [
     "LifecycleResult",
     "allowed_next_states",
     "can_transition",
+    "is_recoverable_state",
+    "is_rollbackable_state",
+    "is_startable_state",
+    "is_stoppable_state",
+    "is_updatable_state",
     "normalize_state",
     "require_state_in",
     "require_transition",
     "state_after_security_gate",
 ]
+

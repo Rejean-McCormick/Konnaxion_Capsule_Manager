@@ -1,0 +1,46 @@
+# kx_manager/ui/page_parts/security.py
+
+"""Security page body for the Konnaxion Capsule Manager GUI."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from kx_manager.ui.form_constants import DEFAULT_INSTANCE_ID
+from kx_manager.ui.page_parts.common import (
+    action_form,
+    context_value,
+    field,
+    instance_id_field,
+)
+from kx_manager.ui.render import render_card, render_grid
+
+
+def render(context: Mapping[str, Any]) -> str:
+    """Render the Security page body."""
+
+    form = action_form(
+        "run_security_check",
+        [
+            instance_id_field(context_value(context, "instance_id", default=DEFAULT_INSTANCE_ID)),
+            field("run_security_gate", "Blocking Security Gate", True, field_type="checkbox"),
+        ],
+        submit_label="Run Security Gate",
+    )
+
+    return render_grid(
+        [
+            render_card("Security Gate", form),
+            render_card(
+                "Policy",
+                (
+                    "<p>Security Gate should run before starts, updates, public exposure, "
+                    "restores, and deployment flows.</p>"
+                ),
+            ),
+        ]
+    )
+
+
+__all__ = ["render"]

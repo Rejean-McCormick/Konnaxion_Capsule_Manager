@@ -6,7 +6,7 @@ app_version: v14
 param_version: kx-param-2026.04.30
 status: draft
 owner: Konnaxion Architecture
-last_updated: 2026-04-30
+last_updated: 2026-05-01
 depends_on:
   - DOC-00_Konnaxion_Canonical_Variables.md
   - DOC-02_Konnaxion_Capsule_Architecture.md
@@ -22,11 +22,16 @@ related_docs:
   - DOC-11_Konnaxion_Box_Appliance_Image.md
   - DOC-13_Konnaxion_Threat_Model.md
   - DOC-14_Konnaxion_Operator_Guide.md
+  - DOC-16_Konnaxion_Manager_GUI_Technical_Contract.md
+  - DOC-17_Konnaxion_GUI_Action_Coverage_Contract.md
+  - DOC-17A_Konnaxion_GUI_Action_Payload_Contract.md
+  - DOC-19_Konnaxion_GUI_Page_Split_Droplet_Payload_Contract.md
 ---
 
 # DOC-12 — Konnaxion Install Runbook
 
 ---
+
 ## 1. Purpose
 
 This runbook defines the standard installation process for a **Konnaxion Capsule** on a **Konnaxion Box**, local demo server, intranet machine, or hardened VPS.
@@ -43,6 +48,12 @@ The goal is plug-and-play operation:
 ```
 
 The operator should not manually configure Docker Compose, Traefik, PostgreSQL, Redis, Celery, Django settings, Next.js runtime, certificates, ports, or firewall rules.
+
+For fresh public VPS or Droplet targets, the control plane must be bootstrapped before capsule deployment. In that case, the operator runs the GUI bootstrap action first:
+
+```text
+bootstrap_droplet_agent
+```
 
 ---
 
@@ -69,6 +80,8 @@ Capsule = app images + manifest + profiles + templates + checksums + signature
 Instance = secrets + database + media + logs + backups + runtime state
 ```
 
+A `.kxcap` file is an application artifact. It is not the installer for the Konnaxion Manager, Konnaxion Agent, systemd services, or host control-plane runtime.
+
 ---
 
 ## 3. Supported installation targets
@@ -81,6 +94,7 @@ Instance = secrets + database + media + logs + backups + runtime state
 | `Private remote demo host` | Access through Tailscale/VPN       | `private_tunnel`   |
 | `Temporary demo host`      | Short-lived public access          | `public_temporary` |
 | `Public VPS`               | Public production-style deployment | `public_vps`       |
+| `DigitalOcean Droplet`     | Public VPS-style deployment        | `public_vps`       |
 
 The default must never be public.
 
@@ -107,9 +121,9 @@ Media/static service: Nginx
 Runtime target: Docker Compose
 ```
 
-The v14 technical reference identifies Konnaxion as a Next.js frontend, Django + DRF backend, PostgreSQL primary database, and Celery + Redis background-processing stack. 
+The v14 technical reference identifies Konnaxion as a Next.js frontend, Django + DRF backend, PostgreSQL primary database, and Celery + Redis background-processing stack.
 
-The current production Docker environment includes Django, Postgres, Redis, Traefik, Celery worker, Celery beat, Flower, and Nginx for static/media handling. 
+The current production Docker environment includes Django, Postgres, Redis, Traefik, Celery worker, Celery beat, Flower, and Nginx for static/media handling.
 
 ---
 
@@ -129,9 +143,12 @@ Docker socket never exposed
 no privileged containers
 no host network mode
 public temporary mode expires automatically
+Konnaxion Agent local-only by default
 ```
 
-The previous Namecheap VPS incident included malicious Docker containers, miner activity, cron persistence, `/tmp/sshd`, `/dev/shm` executables, a `pakchoi` sudo backdoor attempt, and exposed secrets. The compromised VPS must not be trusted long-term and should not be cloned. 
+The previous Namecheap VPS incident included malicious Docker containers, miner activity, cron persistence, `/tmp/sshd`, `/dev/shm` executables, a `pakchoi` sudo backdoor attempt, and exposed secrets.
+
+The compromised VPS must not be trusted long-term and should not be cloned.
 
 ---
 
@@ -139,11 +156,11 @@ The previous Namecheap VPS incident included malicious Docker containers, miner 
 
 ### 6.1 Public or LAN entrypoints
 
-|  Port | Usage                  | Rule                                               |
-| ----: | ---------------------- | -------------------------------------------------- |
-| `443` | HTTPS through Traefik  | allowed according to profile                       |
-|  `80` | HTTP redirect to HTTPS | allowed for `public_vps`; optional for intranet    |
-|  `22` | SSH                    | allowed only for maintenance, restricted by IP/VPN |
+|  Port | Usage                  | Rule                                            |
+| ----: | ---------------------- | ----------------------------------------------- |
+| `443` | HTTPS through Traefik  | allowed according to profile                    |
+|  `80` | HTTP redirect to HTTPS | allowed for `public_vps`; optional for intranet |
+|  `22` | SSH                    | allowed only for maintenance, restricted        |
 
 ### 6.2 Forbidden public ports
 
@@ -156,10 +173,20 @@ These ports must never be exposed directly:
 5432/tcp  PostgreSQL
 6379/tcp  Redis
 8000/tcp  Django dev/server direct
+8765/tcp  Konnaxion Agent API
+8714/tcp  Konnaxion Manager API/UI
 Docker daemon TCP ports
 ```
 
-Security notes from the incident recovery plan explicitly identify `3000`, `5555`, `5432`, `6379`, `8000`, and Docker daemon ports as non-public surfaces; public traffic should reach only Traefik on `80/443`. 
+Security notes from the incident recovery plan explicitly identify `3000`, `5555`, `5432`, `6379`, `8000`, and Docker daemon ports as non-public surfaces; public traffic should reach only Traefik on `80/443`.
+
+The Konnaxion Agent health endpoint is local-only on the target host:
+
+```text
+http://127.0.0.1:8765/v1/health
+```
+
+Do not open `8765` publicly to make GUI checks pass.
 
 ---
 
@@ -173,7 +200,7 @@ Before installation, the operator must have:
 
 2. Konnaxion Capsule Manager installed or preloaded.
 
-3. Konnaxion Agent running.
+3. Konnaxion Agent running on the target host.
 
 4. Docker runtime available.
 
@@ -186,6 +213,88 @@ Before installation, the operator must have:
 ```
 
 The capsule file must be produced by **Konnaxion Capsule Builder** and signed before distribution.
+
+### 7.1 Control-plane bootstrap requirement
+
+A `.kxcap` file is an application deployment artifact. It is not the installer for the Konnaxion control plane.
+
+For any target that does not already include a preinstalled Konnaxion control plane, the target must be bootstrapped before capsule import or deployment.
+
+The control plane consists of:
+
+```text
+Konnaxion Capsule Manager code
+Konnaxion Agent code
+Agent runtime/config directory
+Shared Manager/Agent state directory
+systemd service for Konnaxion Agent
+Docker runtime availability
+canonical /opt/konnaxion directory layout
+```
+
+For public VPS or Droplet deployments, the GUI action is:
+
+```text
+bootstrap_droplet_agent
+```
+
+This action prepares the remote host over SSH before any capsule deployment action is allowed to succeed.
+
+The bootstrap action must create or validate:
+
+```text
+/opt/konnaxion/
+/opt/konnaxion/manager/
+/opt/konnaxion/agent/
+/opt/konnaxion/shared/
+/opt/konnaxion/capsules/
+/opt/konnaxion/instances/
+/opt/konnaxion/backups/
+/opt/konnaxion/releases/
+```
+
+The Agent must bind only to localhost on the Droplet:
+
+```env
+KX_AGENT_HOST=127.0.0.1
+KX_AGENT_PORT=8765
+```
+
+The Agent healthcheck is:
+
+```text
+http://127.0.0.1:8765/v1/health
+```
+
+Port `8765` must not be opened publicly. Public application traffic must reach only Traefik on `80/443`.
+
+### 7.2 Bootstrap artifact source
+
+For development builds, `bootstrap_droplet_agent` may copy the current local Konnaxion Capsule Manager repository to:
+
+```text
+/opt/konnaxion/manager
+```
+
+For production builds, bootstrap should use a trusted release artifact instead of copying a working tree.
+
+The bootstrap artifact must not include:
+
+```text
+.git/
+.venv/
+runtime/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+local secrets
+private SSH keys
+tokens
+.env files with production secrets
+```
 
 ---
 
@@ -211,7 +320,7 @@ Network: wired Ethernet
 Power: UPS for intranet installations
 ```
 
-The frontend deployment runbook confirms that `NODE_OPTIONS="--max-old-space-size=4096"` was required to avoid Next.js heap out-of-memory failures during production builds on limited-memory servers. 
+The frontend deployment runbook confirms that `NODE_OPTIONS="--max-old-space-size=4096"` was required to avoid Next.js heap out-of-memory failures during production builds on limited-memory servers.
 
 For capsule installs, the frontend should normally be prebuilt inside the capsule. The memory note remains relevant for build hosts and builder machines.
 
@@ -296,7 +405,7 @@ Minimum baseline:
 ```text
 Ubuntu Server LTS
 SSH key only
-root SSH disabled
+root SSH restricted or disabled after bootstrap
 password SSH disabled
 cloud firewall enabled
 UFW enabled
@@ -314,13 +423,89 @@ Allow 22/tcp only from admin IP or VPN
 Deny everything else
 ```
 
-The incident recovery guidance recommends a fresh VPS, no disk clone, clean source deploy, verified DB/media restore only, full secret rotation, SSH keys only, password login disabled, cloud firewall + UFW, and only ports `22`, `80`, and `443` public. 
+The incident recovery guidance recommends a fresh VPS, no disk clone, clean source deploy, verified DB/media restore only, full secret rotation, SSH keys only, password login disabled, cloud firewall + UFW, and only ports `22`, `80`, and `443` public.
+
+---
+
+## 9.4 Public VPS first-time bootstrap mode
+
+A fresh public VPS or Droplet normally does not have Konnaxion Agent or Manager code preinstalled.
+
+Expected starting point for a fresh Droplet:
+
+```text
+Ubuntu Server LTS
+SSH key access
+Docker installed or installable
+/opt/konnaxion may or may not exist
+Konnaxion Agent not running yet
+```
+
+Before `check_droplet_agent`, `copy_capsule_to_droplet`, or `deploy_droplet`, the operator must run:
+
+```text
+bootstrap_droplet_agent
+```
+
+The bootstrap action must:
+
+```text
+1. Connect to the Droplet over SSH.
+2. Create the canonical /opt/konnaxion directory layout.
+3. Copy or install the trusted Manager/Agent code on the Droplet.
+4. Install required Python/runtime tooling.
+5. Write a systemd service for Konnaxion Agent.
+6. Start Konnaxion Agent.
+7. Verify Agent health from inside the Droplet using localhost.
+```
+
+The bootstrap action must not:
+
+```text
+open Agent port 8765 publicly
+publish internal app service ports
+disable Security Gate
+install arbitrary third-party applications
+clone old compromised VPS disks
+copy local private keys or secrets into the capsule
+```
+
+The required successful healthcheck is:
+
+```bash
+curl --fail --max-time 10 http://127.0.0.1:8765/v1/health
+```
+
+After bootstrap succeeds, the GUI Droplet workflow is:
+
+```text
+1. Check Droplet Agent
+2. Copy Capsule to Droplet
+3. Deploy Droplet
+4. Start Droplet Instance only if needed
+```
+
+`Deploy Droplet` owns the normal deployment flow:
+
+```text
+prepare remote runtime
+check Droplet Agent
+import capsule
+create or update instance
+set public_vps network profile
+run Security Gate
+start instance
+```
 
 ---
 
 ## 10. First install flow
 
-The standard first-run flow is:
+The standard first-run flow depends on whether the target already has Konnaxion Manager and Konnaxion Agent installed.
+
+### 10.1 Targets with preinstalled Agent
+
+For Konnaxion Box, local demo host, or already-prepared intranet machines:
 
 ```text
 1. Open Konnaxion Capsule Manager.
@@ -342,17 +527,52 @@ The standard first-run flow is:
 17. Manager displays URL, status and backup health.
 ```
 
-The operator should only choose:
+### 10.2 Fresh public VPS or Droplet
+
+For a fresh public VPS or Droplet, the control plane must be bootstrapped first:
+
+```text
+1. Open local Konnaxion Capsule Manager.
+2. Go to Targets.
+3. Configure Droplet target.
+4. Go to Deploy.
+5. Run Bootstrap Droplet Agent.
+6. Run Check Droplet Agent.
+7. Build and verify .kxcap if not already done.
+8. Run Copy Capsule to Droplet.
+9. Run Deploy Droplet.
+10. Open generated public URL.
+```
+
+The operator should only provide:
 
 ```text
 Instance name
-Network profile
+Target mode or network profile
 Admin account option
+Droplet host
+SSH user
+SSH key path
+Remote KX root
+Remote capsule directory
+Domain
+Explicit public VPS confirmation
 ```
 
 Everything else is automatic.
 
-Install is complete only when the instance is running, the Security Gate is `PASS`, healthchecks pass, and the initial backup is verified.
+Install is complete only when:
+
+```text
+Konnaxion Agent healthcheck passes
+capsule verification passes
+Security Gate is PASS
+runtime starts successfully
+healthchecks pass
+backup root exists
+initial backup is created and verified
+public URL resolves when public_vps is selected
+```
 
 ---
 
@@ -475,7 +695,7 @@ tokens
 private keys
 ```
 
-The recovery notes specifically instruct rotating these credentials and avoiding `.env` leaks in logs or chat. 
+The recovery notes specifically instruct rotating these credentials and avoiding `.env` leaks in logs or chat.
 
 ---
 
@@ -531,9 +751,10 @@ Router ports: none
 
 ```text
 URL: https://domain
-Exposure: public 80/443
+Exposure: public 80/443 through Traefik only
 Cloud firewall: required
 SSH hardening: required
+Agent API: localhost-only
 ```
 
 ### 14.6 offline
@@ -571,6 +792,7 @@ no_host_network
 allowed_images_only
 admin_surface_private
 backup_configured
+agent_local_only
 ```
 
 Allowed statuses:
@@ -682,7 +904,7 @@ python manage.py makemigrations
 
 Migration files must already be included in the capsule.
 
-The existing backend workflow confirms the required operational pattern: build/start Docker services, generate migrations during development, apply `migrate`, verify service status, and optionally create a superuser. For capsule runtime, only `migrate` belongs in the install path. 
+The existing backend workflow confirms the required operational pattern: build/start Docker services, generate migrations during development, apply `migrate`, verify service status, and optionally create a superuser. For capsule runtime, only `migrate` belongs in the install path.
 
 ---
 
@@ -702,6 +924,20 @@ Healthchecks: PASS
 Backup: PASS
 Backup root: /opt/konnaxion/backups/demo-001
 Public mode: disabled
+```
+
+For public VPS or Droplet mode:
+
+```text
+Instance: demo-001
+State: running
+Network profile: public_vps
+Exposure: public
+Security Gate: PASS
+Healthchecks: PASS
+Backup: PASS
+Public URL: https://<domain>
+Agent API: local-only
 ```
 
 The install is not complete if backup status is missing, unverified, failed, quarantined, or unknown.
@@ -803,6 +1039,8 @@ There must be no public listeners for:
 0.0.0.0:5432
 0.0.0.0:6379
 0.0.0.0:8000
+0.0.0.0:8765
+0.0.0.0:8714
 ```
 
 For `public_vps`, expected external exposure:
@@ -814,6 +1052,20 @@ restricted:22
 ```
 
 For `intranet_private`, expected exposure is profile-specific and should be LAN-only.
+
+The Konnaxion Agent may listen on:
+
+```text
+127.0.0.1:8765
+```
+
+The Konnaxion Manager may listen locally on:
+
+```text
+127.0.0.1:8714
+```
+
+Neither Manager nor Agent should be public on a production VPS.
 
 ---
 
@@ -1065,16 +1317,48 @@ not cloned from compromised server
 cloud firewall configured
 SSH key-only authentication
 password login disabled
-root login disabled
+root login restricted or disabled after bootstrap
 UFW enabled
 Fail2Ban enabled
 unattended upgrades enabled
 backups/snapshots enabled
+Konnaxion Agent running on localhost only
 ```
 
 The new deployment must not reuse old secrets or old server state.
 
-The recovery plan recommends clean Git/source deployment, verified DB dump/media only, full secret rotation, firewall before app exposure, and validating access only through `80/443`. 
+The recovery plan recommends clean Git/source deployment, verified DB dump/media only, full secret rotation, firewall before app exposure, and validating access only through `80/443`.
+
+### 25.1 Public VPS control-plane bootstrap
+
+A fresh VPS must be bootstrapped before the first capsule deployment.
+
+Required GUI flow:
+
+```text
+Targets
+  → Set Droplet Target
+
+Deploy
+  → Bootstrap Droplet Agent
+  → Check Droplet Agent
+  → Copy Capsule to Droplet
+  → Deploy Droplet
+```
+
+The bootstrap action must use SSH and must not require public access to Agent port `8765`.
+
+Expected post-bootstrap check from inside the Droplet:
+
+```bash
+curl --fail --max-time 10 http://127.0.0.1:8765/v1/health
+```
+
+Expected public check from outside the Droplet:
+
+```text
+http://<droplet-ip>:8765/v1/health must not be reachable
+```
 
 ---
 
@@ -1174,6 +1458,7 @@ Postgres exposed publicly
 Redis exposed publicly
 firewall disabled
 public mode missing expiration
+Agent API exposed publicly
 ```
 
 Action:
@@ -1222,7 +1507,7 @@ missing production build
 memory-related build problem on builder
 ```
 
-The legacy frontend runbook notes that production frontend values are baked at build time and that `.next/BUILD_ID` must exist before starting Next.js. 
+The legacy frontend runbook notes that production frontend values are baked at build time and that `.next/BUILD_ID` must exist before starting Next.js.
 
 In capsule mode, frontend should be prebuilt during capsule build.
 
@@ -1300,7 +1585,49 @@ unexpected sudoers files
 unknown Docker containers
 ```
 
-These indicators match the previous compromise pattern. 
+These indicators match the previous compromise pattern.
+
+---
+
+## 28.7 Droplet Agent check fails
+
+Symptoms:
+
+```text
+Check Droplet Agent failed
+curl to public <droplet-ip>:8765 times out
+curl to 127.0.0.1:8765 on the Droplet fails
+no konnaxion-agent systemd service
+/opt/konnaxion/agent missing
+/opt/konnaxion/manager missing
+/opt/konnaxion/shared missing
+```
+
+Meaning:
+
+```text
+The Droplet control plane has not been bootstrapped.
+```
+
+Action:
+
+```text
+Run Bootstrap Droplet Agent from the Manager GUI Deploy page.
+```
+
+Do not fix this by opening port `8765` publicly.
+
+Expected successful local Droplet healthcheck:
+
+```bash
+curl --fail --max-time 10 http://127.0.0.1:8765/v1/health
+```
+
+Expected external state:
+
+```text
+http://<droplet-ip>:8765/v1/health is not reachable publicly
+```
 
 ---
 
@@ -1311,12 +1638,27 @@ Before install:
 ```text
 [ ] Host is fresh or trusted.
 [ ] Host is not cloned from compromised VPS.
-[ ] Konnaxion Capsule Manager installed.
-[ ] Konnaxion Agent running.
+[ ] Konnaxion Capsule Manager installed or available locally.
+[ ] Konnaxion Agent running on target host or bootstrap action available.
 [ ] Docker runtime available.
 [ ] Firewall enabled.
 [ ] .kxcap file available.
 [ ] Capsule source trusted.
+```
+
+For fresh public VPS or Droplet targets:
+
+```text
+[ ] Droplet target configured in Manager GUI.
+[ ] SSH key path exists on local Manager host.
+[ ] Remote KX root configured.
+[ ] Remote capsule directory configured.
+[ ] Domain configured.
+[ ] Public VPS confirmation checked.
+[ ] Bootstrap Droplet Agent completed.
+[ ] Check Droplet Agent completed.
+[ ] Agent is reachable on target localhost.
+[ ] Agent port 8765 is not public.
 ```
 
 During install:
@@ -1344,6 +1686,8 @@ After install:
 [ ] /admin/ responds.
 [ ] /media/ responds if media is present.
 [ ] No dangerous ports public.
+[ ] Agent API is not public.
+[ ] Manager API is not public.
 [ ] Backup root created.
 [ ] Initial backup created.
 [ ] Initial backup verified.
@@ -1391,6 +1735,39 @@ Restore readiness: PASS
 URL: https://konnaxion.local or generated LAN URL
 ```
 
+### 30.1 GUI quick path for fresh Droplet
+
+```text
+1. Start local Agent and Manager.
+2. Open http://127.0.0.1:8714/ui.
+3. Go to Capsules.
+4. Build capsule using Public VPS profile.
+5. Verify capsule.
+6. Go to Targets.
+7. Set Droplet Target.
+8. Go to Deploy.
+9. Bootstrap Droplet Agent.
+10. Check Droplet Agent.
+11. Copy Capsule to Droplet.
+12. Deploy Droplet.
+13. Open generated public URL.
+```
+
+Expected final state:
+
+```text
+Instance: demo-001
+State: running
+Network profile: public_vps
+Exposure: public
+Security Gate: PASS
+Backup health: PASS
+Restore readiness: PASS
+URL: https://<domain>
+Agent API: localhost-only
+Public ports: 80, 443, restricted 22 only
+```
+
 ---
 
 ## 31. Non-goals
@@ -1407,6 +1784,8 @@ Kubernetes deployment
 Recovering secrets from compromised hosts
 Cloning old VPS disks
 Running arbitrary third-party apps
+Opening Konnaxion Agent publicly
+Using public Agent API as a deployment transport
 ```
 
 Those are covered by other documents or explicitly out of scope.
@@ -1425,11 +1804,14 @@ capsule-driven
 repeatable
 rollback-capable
 operator-safe
+bootstrap-aware for fresh VPS targets
 ```
 
 The canonical install path is:
 
 ```text
+Bootstrap target control plane when missing
+Verify Konnaxion Agent health
 Import signed .kxcap
 Create Konnaxion Instance
 Generate secrets
@@ -1447,8 +1829,9 @@ The user should configure only:
 
 ```text
 Instance name
-Network profile
+Target mode or network profile
 Admin account option
+Droplet connection details only when using public_vps/Droplet mode
 ```
 
 Everything else is handled by the **Konnaxion Capsule Manager** and **Konnaxion Agent**.

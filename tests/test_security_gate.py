@@ -6,13 +6,15 @@ These tests enforce the canonical Security Gate contract:
 - public/internal port exposure is rejected
 - unsafe Docker runtime options are rejected
 - signed capsules and checksums are blocking requirements
+- runtime Security Gate context must use real capsule manifest data
+- runtime Security Gate context must use generated instance secrets
 """
 
 from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -153,6 +155,7 @@ def test_security_gate_module_exports_expected_api() -> None:
         "run_security_gate",
         "is_security_gate_passing",
         "assert_security_gate_passing",
+        "context_from_compose",
     ):
         assert hasattr(gate, name), f"kx_agent.security.gate missing {name}"
 
@@ -272,6 +275,182 @@ def test_security_gate_allows_warning_on_nonblocking_check() -> None:
     assert gate.is_security_gate_passing(gate_result) is True
 
 
+def test_security_gate_context_passes_with_real_manifest_and_generated_secrets() -> None:
+    """A realistic deploy/start context should pass manifest and secret checks."""
+
+    gate = importlib.import_module("kx_agent.security.gate")
+
+    context = _make_security_context(
+        gate,
+        compose=_safe_public_vps_compose(),
+        manifest=_valid_manifest(),
+        env=_valid_runtime_env(),
+    )
+
+    result = gate.run_security_gate(context)
+    results = _results_by_check(result)
+
+    assert gate.is_security_gate_passing(result) is True
+    assert _status_value(results["manifest_schema"]) == SecurityGateStatus.PASS.value
+    assert _status_value(results["secrets_present"]) == SecurityGateStatus.PASS.value
+    assert _status_value(results["secrets_not_default"]) == SecurityGateStatus.PASS.value
+
+
+def test_security_gate_context_fails_with_empty_manifest_and_empty_env() -> None:
+    """Regression: callers must not run Security Gate with manifest={} and env={}."""
+
+    gate = importlib.import_module("kx_agent.security.gate")
+
+    context = _make_security_context(
+        gate,
+        compose=_safe_public_vps_compose(),
+        manifest={},
+        env={},
+    )
+
+    result = gate.run_security_gate(context)
+    results = _results_by_check(result)
+
+    assert gate.is_security_gate_passing(result) is False
+    assert _status_value(results["manifest_schema"]) == SecurityGateStatus.FAIL_BLOCKING.value
+    assert _status_value(results["secrets_present"]) == SecurityGateStatus.FAIL_BLOCKING.value
+    assert _status_value(results["secrets_not_default"]) == SecurityGateStatus.FAIL_BLOCKING.value
+
+    manifest_details = _details(results["manifest_schema"])
+    secret_details = _details(results["secrets_present"])
+
+    assert "schema_version" in set(manifest_details.get("missing_fields", []))
+    assert "DATABASE_URL" in set(secret_details.get("missing", []))
+    assert "DJANGO_SECRET_KEY" in set(secret_details.get("missing", []))
+    assert "POSTGRES_PASSWORD" in set(secret_details.get("missing", []))
+
+
+def test_security_gate_context_fails_with_placeholder_secrets() -> None:
+    """Runtime env must contain generated non-placeholder secrets."""
+
+    gate = importlib.import_module("kx_agent.security.gate")
+
+    context = _make_security_context(
+        gate,
+        compose=_safe_public_vps_compose(),
+        manifest=_valid_manifest(),
+        env={
+            "DJANGO_SECRET_KEY": "<GENERATED_ON_INSTALL>",
+            "POSTGRES_USER": "konnaxion",
+            "POSTGRES_PASSWORD": "<POSTGRES_PASSWORD>",
+            "POSTGRES_DB": "konnaxion",
+            "DATABASE_URL": "postgres://konnaxion:<POSTGRES_PASSWORD>@postgres:5432/konnaxion",
+            "REDIS_URL": "redis://redis:6379/0",
+            "KX_INSTANCE_ID": "demo-001",
+            "KX_NETWORK_PROFILE": "public_vps",
+            "KX_EXPOSURE_MODE": "public",
+        },
+    )
+
+    result = gate.run_security_gate(context)
+    results = _results_by_check(result)
+
+    assert gate.is_security_gate_passing(result) is False
+    assert _status_value(results["manifest_schema"]) == SecurityGateStatus.PASS.value
+    assert _status_value(results["secrets_present"]) == SecurityGateStatus.PASS.value
+    assert _status_value(results["secrets_not_default"]) == SecurityGateStatus.FAIL_BLOCKING.value
+
+    details = _details(results["secrets_not_default"])
+    invalid_keys = set(details.get("invalid_keys", []))
+
+    assert "DJANGO_SECRET_KEY" in invalid_keys
+    assert "POSTGRES_PASSWORD" in invalid_keys
+    assert "DATABASE_URL" in invalid_keys
+
+
+def test_security_gate_context_rejects_missing_manifest_fields() -> None:
+    """The manifest check must report required missing capsule metadata."""
+
+    gate = importlib.import_module("kx_agent.security.gate")
+
+    incomplete_manifest = {
+        "runtime": {
+            "compose_file": "docker-compose.capsule.yml",
+            "images_dir": "images",
+        },
+    }
+
+    context = _make_security_context(
+        gate,
+        compose=_safe_public_vps_compose(),
+        manifest=incomplete_manifest,
+        env=_valid_runtime_env(),
+    )
+
+    result = gate.run_security_gate(context)
+    results = _results_by_check(result)
+
+    assert gate.is_security_gate_passing(result) is False
+    assert _status_value(results["manifest_schema"]) == SecurityGateStatus.FAIL_BLOCKING.value
+    assert _status_value(results["secrets_present"]) == SecurityGateStatus.PASS.value
+    assert _status_value(results["secrets_not_default"]) == SecurityGateStatus.PASS.value
+
+    details = _details(results["manifest_schema"])
+    missing = set(details.get("missing_fields", []))
+
+    assert {
+        "schema_version",
+        "app_name",
+        "app_version",
+        "capsule_id",
+        "capsule_version",
+        "channel",
+    }.issubset(missing)
+
+
+def test_security_gate_context_rejects_public_postgres_port() -> None:
+    """PostgreSQL must never be exposed publicly in rendered Compose."""
+
+    gate = importlib.import_module("kx_agent.security.gate")
+
+    compose = _safe_public_vps_compose()
+    compose["services"]["postgres"]["ports"] = ["5432:5432"]
+
+    context = _make_security_context(
+        gate,
+        compose=compose,
+        manifest=_valid_manifest(),
+        env=_valid_runtime_env(),
+        postgres_public=True,
+    )
+
+    result = gate.run_security_gate(context)
+    results = _results_by_check(result)
+
+    assert gate.is_security_gate_passing(result) is False
+    assert _status_value(results["dangerous_ports_blocked"]) == SecurityGateStatus.FAIL_BLOCKING.value
+    assert _status_value(results["postgres_not_public"]) == SecurityGateStatus.FAIL_BLOCKING.value
+
+
+def test_security_gate_context_rejects_public_redis_port() -> None:
+    """Redis must never be exposed publicly in rendered Compose."""
+
+    gate = importlib.import_module("kx_agent.security.gate")
+
+    compose = _safe_public_vps_compose()
+    compose["services"]["redis"]["ports"] = ["6379:6379"]
+
+    context = _make_security_context(
+        gate,
+        compose=compose,
+        manifest=_valid_manifest(),
+        env=_valid_runtime_env(),
+        redis_public=True,
+    )
+
+    result = gate.run_security_gate(context)
+    results = _results_by_check(result)
+
+    assert gate.is_security_gate_passing(result) is False
+    assert _status_value(results["dangerous_ports_blocked"]) == SecurityGateStatus.FAIL_BLOCKING.value
+    assert _status_value(results["redis_not_public"]) == SecurityGateStatus.FAIL_BLOCKING.value
+
+
 @pytest.mark.parametrize(
     "port",
     [3000, 5000, 5432, 6379, 5555, 8000],
@@ -351,6 +530,191 @@ def test_security_policy_rejects_host_network() -> None:
 
     with pytest.raises(Exception):
         policies.validate_runtime_policy(unsafe_policy)
+
+
+def _valid_manifest() -> dict[str, Any]:
+    return {
+        "schema_version": "kx-capsule-manifest/v1",
+        "app_name": "Konnaxion",
+        "app_version": "v14",
+        "param_version": "kx-param-2026.04.30",
+        "capsule_id": "konnaxion-v14-demo-2026.04.30",
+        "capsule_version": "2026.04.30-demo.1",
+        "channel": "demo",
+        "profile": "public_vps",
+        "runtime": {
+            "compose_file": "docker-compose.capsule.yml",
+            "images_dir": "images",
+        },
+    }
+
+
+def _valid_runtime_env() -> dict[str, str]:
+    postgres_password = "kx-postgres-password-2026-05-02-not-a-default-value"
+    return {
+        "DJANGO_SECRET_KEY": (
+            "kx-django-secret-key-2026-05-02-"
+            "not-a-default-placeholder-and-long-enough-for-runtime"
+        ),
+        "POSTGRES_USER": "konnaxion",
+        "POSTGRES_PASSWORD": postgres_password,
+        "POSTGRES_DB": "konnaxion",
+        "DATABASE_URL": (
+            "postgres://konnaxion:"
+            f"{postgres_password}"
+            "@postgres:5432/konnaxion"
+        ),
+        "REDIS_URL": "redis://redis:6379/0",
+        "KX_INSTANCE_ID": "demo-001",
+        "KX_NETWORK_PROFILE": "public_vps",
+        "KX_EXPOSURE_MODE": "public",
+    }
+
+
+def _safe_public_vps_compose() -> dict[str, Any]:
+    return {
+        "services": {
+            "traefik": {
+                "image": "traefik",
+                "ports": [
+                    "80:80",
+                    "443:443",
+                ],
+                "volumes": [],
+            },
+            "frontend-next": {
+                "image": "frontend-next",
+                "expose": ["3000"],
+                "depends_on": ["django-api"],
+            },
+            "django-api": {
+                "image": "django-api",
+                "expose": ["5000"],
+                "depends_on": ["postgres", "redis"],
+                "env_file": ["../env/runtime.env"],
+            },
+            "postgres": {
+                "image": "postgres",
+                "expose": ["5432"],
+                "volumes": ["postgres-data:/var/lib/postgresql/data"],
+            },
+            "redis": {
+                "image": "redis",
+                "expose": ["6379"],
+            },
+            "celeryworker": {
+                "image": "celeryworker",
+                "depends_on": ["django-api", "redis"],
+                "env_file": ["../env/runtime.env"],
+            },
+            "celerybeat": {
+                "image": "celerybeat",
+                "depends_on": ["django-api", "redis"],
+                "env_file": ["../env/runtime.env"],
+            },
+            "media-nginx": {
+                "image": "media-nginx",
+                "expose": ["8080"],
+            },
+        },
+        "volumes": {
+            "postgres-data": {},
+        },
+        "networks": {
+            "konnaxion-public": {},
+            "konnaxion-internal": {
+                "internal": True,
+            },
+        },
+    }
+
+
+def _make_security_context(
+    gate_module: Any,
+    *,
+    compose: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    env: Mapping[str, str],
+    **overrides: Any,
+) -> Any:
+    context_from_compose = getattr(gate_module, "context_from_compose")
+
+    kwargs: dict[str, Any] = {
+        "instance_id": "demo-001",
+        "compose": compose,
+        "manifest": manifest,
+        "env": env,
+        "capsule_signature_verified": True,
+        "image_checksums_verified": True,
+        "firewall_enabled": True,
+        "backup_configured": True,
+        "admin_surface_private": True,
+        "postgres_public": False,
+        "redis_public": False,
+    }
+    kwargs.update(overrides)
+
+    try:
+        return context_from_compose(**kwargs)
+    except TypeError:
+        compatibility_kwargs = dict(kwargs)
+        compatibility_kwargs["capsule_signature_valid"] = compatibility_kwargs.pop(
+            "capsule_signature_verified"
+        )
+        compatibility_kwargs["image_checksums_valid"] = compatibility_kwargs.pop(
+            "image_checksums_verified"
+        )
+        return context_from_compose(**compatibility_kwargs)
+
+
+def _results_by_check(gate_result: Any) -> dict[str, Any]:
+    results = _result_items(gate_result)
+    return {_check_value(item): item for item in results}
+
+
+def _result_items(gate_result: Any) -> list[Any]:
+    if isinstance(gate_result, Mapping):
+        raw = gate_result.get("results") or gate_result.get("checks") or []
+    else:
+        raw = getattr(gate_result, "results", None) or getattr(gate_result, "checks", None) or []
+
+    return list(raw)
+
+
+def _check_value(result: Any) -> str:
+    if isinstance(result, Mapping):
+        value = result.get("check")
+    else:
+        value = getattr(result, "check", None)
+
+    if hasattr(value, "value"):
+        return str(value.value)
+
+    return str(value)
+
+
+def _status_value(result: Any) -> str:
+    if isinstance(result, Mapping):
+        value = result.get("status")
+    else:
+        value = getattr(result, "status", None)
+
+    if hasattr(value, "value"):
+        return str(value.value)
+
+    return str(value)
+
+
+def _details(result: Any) -> Mapping[str, Any]:
+    if isinstance(result, Mapping):
+        value = result.get("details", {})
+    else:
+        value = getattr(result, "details", {})
+
+    if isinstance(value, Mapping):
+        return value
+
+    return {}
 
 
 def _make_check_result(

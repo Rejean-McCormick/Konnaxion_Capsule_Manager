@@ -466,6 +466,9 @@ class ManagerUiState:
     selected_instance_id: str | None = None
     instances: tuple[InstanceUiState, ...] = ()
     capsules: tuple[CapsuleUiState, ...] = ()
+    security: SecurityUiState = field(default_factory=SecurityUiState)
+    network: NetworkUiState = field(default_factory=NetworkUiState)
+    backups: tuple[BackupUiState, ...] = ()
     active_task: str | None = None
     global_errors: tuple[str, ...] = ()
     global_warnings: tuple[str, ...] = ()
@@ -497,10 +500,33 @@ class ManagerUiState:
         if selected is None and instances:
             selected = instances[0].instance_id
 
+        selected_instance = _select_instance(instances, selected)
+
+        security_data = data.get("security")
+        if isinstance(security_data, Mapping):
+            security = SecurityUiState.from_mapping(security_data)
+        elif selected_instance is not None:
+            security = selected_instance.security
+        else:
+            security = SecurityUiState()
+
+        network_data = data.get("network")
+        if isinstance(network_data, Mapping):
+            network = NetworkUiState.from_mapping(network_data)
+        elif selected_instance is not None:
+            network = selected_instance.network
+        else:
+            network = NetworkUiState()
+
+        backups = _manager_backups_from_mapping(data, selected_instance=selected_instance)
+
         return cls(
             selected_instance_id=selected,
             instances=instances,
             capsules=capsules,
+            security=security,
+            network=network,
+            backups=backups,
             active_task=_optional_str(data.get("active_task")),
             global_errors=_tuple_str(data.get("global_errors", ())),
             global_warnings=_tuple_str(data.get("global_warnings", ())),
@@ -511,19 +537,88 @@ class ManagerUiState:
     def selected_instance(self) -> InstanceUiState | None:
         """Return the selected instance object, if available."""
 
-        if not self.selected_instance_id:
-            return self.instances[0] if self.instances else None
-
-        for instance in self.instances:
-            if instance.instance_id == self.selected_instance_id:
-                return instance
-
-        return self.instances[0] if self.instances else None
+        return _select_instance(self.instances, self.selected_instance_id)
 
     def with_selected_instance(self, instance_id: str) -> "ManagerUiState":
         """Return a copy with the selected instance changed."""
 
-        return replace(self, selected_instance_id=instance_id)
+        selected_instance = _select_instance(self.instances, instance_id)
+        if selected_instance is None:
+            return replace(self, selected_instance_id=instance_id)
+
+        backups = self.backups
+        if not backups and _backup_has_data(selected_instance.latest_backup):
+            backups = (selected_instance.latest_backup,)
+
+        return replace(
+            self,
+            selected_instance_id=instance_id,
+            security=selected_instance.security,
+            network=selected_instance.network,
+            backups=backups,
+        )
+
+
+def _select_instance(
+    instances: Sequence[InstanceUiState],
+    selected_instance_id: str | None,
+) -> InstanceUiState | None:
+    """Return the selected instance, falling back to the first instance."""
+
+    if not instances:
+        return None
+
+    if not selected_instance_id:
+        return instances[0]
+
+    for instance in instances:
+        if instance.instance_id == selected_instance_id:
+            return instance
+
+    return instances[0]
+
+
+def _manager_backups_from_mapping(
+    data: Mapping[str, Any],
+    *,
+    selected_instance: InstanceUiState | None,
+) -> tuple[BackupUiState, ...]:
+    """Create top-level backup summaries for Manager UI state."""
+
+    backups = tuple(
+        BackupUiState.from_mapping(item)
+        for item in data.get("backups", ()) or ()
+        if isinstance(item, Mapping)
+    )
+    if backups:
+        return backups
+
+    latest_backup_data = data.get("latest_backup") or data.get("backup")
+    if isinstance(latest_backup_data, Mapping):
+        backup = BackupUiState.from_mapping(latest_backup_data)
+        return (backup,) if _backup_has_data(backup) else ()
+
+    if selected_instance is not None and _backup_has_data(selected_instance.latest_backup):
+        return (selected_instance.latest_backup,)
+
+    return ()
+
+
+def _backup_has_data(backup: BackupUiState) -> bool:
+    """Return whether a backup summary contains any concrete data."""
+
+    return any(
+        value not in {None, ""}
+        for value in (
+            backup.backup_id,
+            backup.status,
+            backup.backup_class,
+            backup.created_at,
+            backup.verified_at,
+            backup.size_bytes,
+            backup.path,
+        )
+    )
 
 
 def normalize_instance_state(value: Any) -> str:

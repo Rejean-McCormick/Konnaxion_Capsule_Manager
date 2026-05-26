@@ -7,7 +7,8 @@ Responsibilities:
 - Copy the capsule into canonical storage:
   /opt/konnaxion/capsules/<CAPSULE_ID>.kxcap
 - Optionally run capsule verification before accepting the import.
-- Prepare deterministic capsule work/extract directories.
+- Extract the capsule into canonical extracted storage:
+  /opt/konnaxion/shared/capsules/<CAPSULE_ID>
 - Return a typed import result for Manager/API/UI layers.
 
 This module must not:
@@ -24,21 +25,19 @@ artifacts used later by instance creation/update.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
-from pathlib import Path
 import hashlib
 import os
 import shutil
 import tempfile
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Mapping
 
 from kx_shared.paths import (
-    KonnaxionPathError,
     assert_under_root,
     capsule_extract_dir,
     capsule_file,
-    capsules_dir,
     ensure_dir,
     normalize_capsule_filename,
     validate_safe_id,
@@ -48,6 +47,16 @@ try:
     from kx_shared.konnaxion_constants import CAPSULE_EXTENSION
 except ImportError:  # pragma: no cover - defensive fallback during early scaffolding
     CAPSULE_EXTENSION = ".kxcap"
+
+
+REQUIRED_EXTRACTED_ROOT_FILES = frozenset(
+    {
+        "manifest.yaml",
+        "docker-compose.capsule.yml",
+        "checksums.txt",
+        "signature.sig",
+    }
+)
 
 
 class CapsuleImportError(RuntimeError):
@@ -62,6 +71,10 @@ class CapsuleVerificationUnavailableError(CapsuleImportError):
     """Raised when verification is required but the verifier module is unavailable."""
 
 
+class CapsuleExtractionError(CapsuleImportError):
+    """Raised when a capsule cannot be extracted into canonical storage."""
+
+
 @dataclass(frozen=True)
 class CapsuleImportOptions:
     """
@@ -72,7 +85,7 @@ class CapsuleImportOptions:
     overwrite:
         Replace an existing capsule with the same capsule id.
     prepare_extract_dir:
-        Create the deterministic capsule work/extract directory.
+        Extract the capsule into the deterministic capsule work/extract directory.
     capsule_id:
         Optional explicit capsule id. If omitted, it is derived from filename.
     """
@@ -96,6 +109,7 @@ class CapsuleImportResult:
     imported_at: str
     imported: bool = True
     verified: bool = False
+    extracted: bool = False
     verification_report: Mapping[str, Any] | None = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
@@ -105,6 +119,7 @@ class CapsuleImportResult:
 
 def utc_now_iso() -> str:
     """Return a stable UTC timestamp for audit/import records."""
+
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
@@ -115,6 +130,7 @@ def resolve_source_path(source_path: str | Path) -> Path:
     Source capsules may live outside /opt/konnaxion before import, because they
     can be selected by the user from downloads, removable media, or a build dir.
     """
+
     path = Path(source_path).expanduser().resolve(strict=False)
 
     if not path.exists():
@@ -131,10 +147,12 @@ def resolve_source_path(source_path: str | Path) -> Path:
     return path
 
 
-def derive_capsule_id(source_path: str | Path, explicit_capsule_id: str | None = None) -> str:
-    """
-    Derive the capsule id from an explicit value or from the `.kxcap` filename.
-    """
+def derive_capsule_id(
+    source_path: str | Path,
+    explicit_capsule_id: str | None = None,
+) -> str:
+    """Derive the capsule id from an explicit value or from the `.kxcap` filename."""
+
     if explicit_capsule_id is not None:
         return validate_safe_id(explicit_capsule_id, field_name="capsule_id")
 
@@ -149,6 +167,7 @@ def derive_capsule_id(source_path: str | Path, explicit_capsule_id: str | None =
 
 def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
     """Compute SHA-256 for a capsule file without loading it all into memory."""
+
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
@@ -163,6 +182,7 @@ def atomic_copy_file(source: Path, destination: Path, *, overwrite: bool = False
     The temporary file is created in the destination directory so os.replace()
     stays atomic on the same filesystem.
     """
+
     destination = assert_under_root(destination)
     ensure_dir(destination.parent)
 
@@ -204,6 +224,7 @@ def _verification_report_to_mapping(report: Any) -> Mapping[str, Any]:
     - plain dict/mapping
     - object with accepted/valid/status attributes
     """
+
     if report is None:
         return {}
 
@@ -230,6 +251,7 @@ def _verification_passed(report: Mapping[str, Any]) -> bool:
     Missing explicit failure fields are treated as pass only when a positive
     field is present.
     """
+
     for key in ("accepted", "valid", "verified"):
         if key in report:
             return bool(report[key])
@@ -255,6 +277,7 @@ def run_capsule_verifier(capsule_path: Path) -> tuple[bool, Mapping[str, Any]]:
     The verifier is imported lazily so this importer can be developed and tested
     before kx_agent.capsules.verifier.py exists.
     """
+
     try:
         from .verifier import verify_capsule  # type: ignore
     except ImportError as exc:
@@ -266,6 +289,105 @@ def run_capsule_verifier(capsule_path: Path) -> tuple[bool, Mapping[str, Any]]:
     report = verify_capsule(capsule_path)
     normalized = _verification_report_to_mapping(report)
     return _verification_passed(normalized), normalized
+
+
+def _extract_capsule_archive(capsule_path: Path, destination: Path) -> None:
+    """Extract a `.kxcap` archive into an empty destination directory."""
+
+    try:
+        from kx_builder.package import extract_capsule
+    except ImportError as exc:
+        raise CapsuleExtractionError(
+            "capsule extraction requires kx_builder.package.extract_capsule"
+        ) from exc
+
+    try:
+        extract_capsule(capsule_path, destination, overwrite=True)
+    except Exception as exc:
+        raise CapsuleExtractionError(
+            f"could not extract capsule {capsule_path} into {destination}: {exc}"
+        ) from exc
+
+
+def _validate_extracted_capsule_dir(extract_dir: Path) -> None:
+    """Validate minimum extracted capsule layout needed by runtime flows."""
+
+    missing = sorted(
+        filename
+        for filename in REQUIRED_EXTRACTED_ROOT_FILES
+        if not (extract_dir / filename).is_file()
+    )
+
+    if missing:
+        raise CapsuleExtractionError(
+            "extracted capsule is missing required root files: "
+            + ", ".join(missing)
+        )
+
+
+def _replace_directory_with_backup(source_dir: Path, destination_dir: Path) -> None:
+    """
+    Replace destination_dir with source_dir while preserving the old directory
+    until replacement succeeds.
+
+    This is not a perfect cross-filesystem atomic directory swap, but both paths
+    are created under the same parent, and the old extraction is restored if the
+    final move fails.
+    """
+
+    destination_dir = assert_under_root(destination_dir)
+    ensure_dir(destination_dir.parent)
+
+    backup_dir: Path | None = None
+
+    if destination_dir.exists():
+        backup_dir = destination_dir.parent / (
+            f".{destination_dir.name}.backup."
+            f"{os.getpid()}."
+            f"{utc_now_iso().replace(':', '-')}"
+        )
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+        shutil.move(str(destination_dir), str(backup_dir))
+
+    try:
+        shutil.move(str(source_dir), str(destination_dir))
+    except Exception:
+        if backup_dir is not None and backup_dir.exists() and not destination_dir.exists():
+            shutil.move(str(backup_dir), str(destination_dir))
+        raise
+    else:
+        if backup_dir is not None and backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def extract_capsule_to_work_dir(capsule_path: Path, capsule_id: str) -> Path:
+    """
+    Extract a stored capsule into its canonical work directory.
+
+    Extraction happens into a temporary sibling directory first. The final
+    extracted directory is only replaced after extraction and basic layout
+    validation succeed.
+    """
+
+    work_dir = assert_under_root(capsule_extract_dir(capsule_id))
+    ensure_dir(work_dir.parent)
+
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{work_dir.name}.extract.",
+            dir=str(work_dir.parent),
+        )
+    )
+
+    try:
+        _extract_capsule_archive(capsule_path, temp_dir)
+        _validate_extracted_capsule_dir(temp_dir)
+        _replace_directory_with_backup(temp_dir, work_dir)
+        return work_dir
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
 def import_capsule(
@@ -281,13 +403,12 @@ def import_capsule(
             CapsuleImportOptions(verify=True),
         )
     """
+
     options = options or CapsuleImportOptions()
 
     source = resolve_source_path(source_path)
     capsule_id = derive_capsule_id(source, options.capsule_id)
 
-    # Rebuild the target filename from the validated capsule id. This prevents
-    # odd but valid local filenames from becoming canonical storage names.
     canonical_filename = normalize_capsule_filename(capsule_id)
     target = capsule_file(canonical_filename)
 
@@ -298,6 +419,7 @@ def import_capsule(
         size_bytes = copied_path.stat().st_size
 
         verified = False
+        extracted = False
         verification_report: Mapping[str, Any] | None = None
         warnings: list[str] = []
 
@@ -314,8 +436,13 @@ def import_capsule(
             warnings.append("capsule verification skipped by options.verify=False")
 
         work_dir = capsule_extract_dir(capsule_id)
+
         if options.prepare_extract_dir:
+            work_dir = extract_capsule_to_work_dir(copied_path, capsule_id)
+            extracted = True
+        else:
             ensure_dir(work_dir)
+            warnings.append("capsule extraction skipped by options.prepare_extract_dir=False")
 
         return CapsuleImportResult(
             capsule_id=capsule_id,
@@ -327,15 +454,15 @@ def import_capsule(
             imported_at=utc_now_iso(),
             imported=True,
             verified=verified,
+            extracted=extracted,
             verification_report=verification_report,
             warnings=tuple(warnings),
         )
 
     except Exception:
-        # If the import fails after copy and this was a new import, remove the
-        # copied artifact so failed capsules do not remain accepted in storage.
         if not options.overwrite:
             copied_path.unlink(missing_ok=True)
+
         raise
 
 
@@ -369,6 +496,7 @@ class CapsuleImporter:
 
 __all__ = [
     "CapsuleAlreadyExistsError",
+    "CapsuleExtractionError",
     "CapsuleImportError",
     "CapsuleImportOptions",
     "CapsuleImportResult",
@@ -376,6 +504,7 @@ __all__ = [
     "CapsuleVerificationUnavailableError",
     "atomic_copy_file",
     "derive_capsule_id",
+    "extract_capsule_to_work_dir",
     "import_capsule",
     "resolve_source_path",
     "run_capsule_verifier",

@@ -9,6 +9,7 @@ Responsibilities:
 - locate a usable Docker Compose command
 - validate canonical service names before targeted operations
 - run compose lifecycle commands
+- load approved OCI/Docker image archives
 - inspect services, containers, images, volumes, networks, and logs
 - return structured command results for Manager/API/CLI layers
 
@@ -47,7 +48,9 @@ from kx_shared.validation import (
 
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+DEFAULT_IMAGE_LOAD_TIMEOUT_SECONDS = 900
 DEFAULT_LOG_LINES = 300
+ALLOWED_IMAGE_ARCHIVE_SUFFIXES = (".tar", ".oci", ".oci.tar")
 
 
 class DockerComposeBinary(StrEnum):
@@ -107,6 +110,7 @@ class DockerRuntimeConfig:
     working_dir: Path = KX_ROOT
     env: Mapping[str, str] = field(default_factory=dict)
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS
+    image_load_timeout_seconds: int = DEFAULT_IMAGE_LOAD_TIMEOUT_SECONDS
     compose_binary: DockerComposeBinary | None = None
     allow_outside_kx_root: bool = False
 
@@ -136,6 +140,18 @@ class DockerImageInfo:
     created: str | None = None
 
 
+@dataclass(frozen=True)
+class DockerImageLoadResult:
+    """Result for loading one Docker/OCI image archive."""
+
+    archive_path: Path
+    command: CommandResult
+
+    @property
+    def ok(self) -> bool:
+        return self.command.ok
+
+
 class DockerRuntimeError(RuntimeError):
     """Raised when a Docker runtime command fails."""
 
@@ -163,6 +179,7 @@ class DockerRuntime:
         *,
         project_name: str | None = None,
         timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        image_load_timeout_seconds: int = DEFAULT_IMAGE_LOAD_TIMEOUT_SECONDS,
     ) -> "DockerRuntime":
         """Create a DockerRuntime using the canonical instance compose path."""
 
@@ -171,6 +188,7 @@ class DockerRuntime:
                 compose_file=instance_compose_file(instance_id),
                 project_name=project_name or f"konnaxion-{instance_id}",
                 timeout_seconds=timeout_seconds,
+                image_load_timeout_seconds=image_load_timeout_seconds,
             )
         )
 
@@ -196,9 +214,21 @@ class DockerRuntime:
         detach: bool = True,
         services: Iterable[str] | None = None,
         build: bool = False,
+        no_build: bool = False,
+        force_recreate: bool = False,
         remove_orphans: bool = True,
+        wait: bool = False,
     ) -> CommandResult:
-        """Start the Compose stack or selected canonical services."""
+        """Start the Compose stack or selected canonical services.
+
+        `force_recreate=True` is important after loading a newer image archive
+        with the same canonical tag, for example `konnaxion/frontend-next:v14`.
+        Without force recreation, Compose may keep containers created from an
+        older image ID.
+        """
+
+        if build and no_build:
+            raise ValueError("build and no_build cannot both be true")
 
         service_list = self._validate_services(services)
         args = [ComposeAction.UP.value]
@@ -207,8 +237,14 @@ class DockerRuntime:
             args.append("-d")
         if build:
             args.append("--build")
+        if no_build:
+            args.append("--no-build")
+        if force_recreate:
+            args.append("--force-recreate")
         if remove_orphans:
             args.append("--remove-orphans")
+        if wait:
+            args.append("--wait")
 
         args.extend(service_list)
         return self._compose_args(args)
@@ -423,12 +459,19 @@ class DockerRuntime:
 
         import time
 
-        required = set(self._validate_services(required_services)) if required_services else set(CANONICAL_DOCKER_SERVICES)
+        required = (
+            set(self._validate_services(required_services))
+            if required_services
+            else set(CANONICAL_DOCKER_SERVICES)
+        )
         last_health: dict[str, ContainerHealth] = {}
 
         for _ in range(attempts):
             statuses = {status.service: status for status in self.ps() if status.service}
-            last_health = {service: statuses.get(service, ComposeServiceStatus(service=service)).health for service in required}
+            last_health = {
+                service: statuses.get(service, ComposeServiceStatus(service=service)).health
+                for service in required
+            }
 
             all_ready = True
             for service in required:
@@ -441,7 +484,11 @@ class DockerRuntime:
                 if status.health == ContainerHealth.UNHEALTHY:
                     all_ready = False
                     break
-                if status.health in {ContainerHealth.HEALTHY, ContainerHealth.NONE, ContainerHealth.UNKNOWN} and state == "running":
+                if (
+                    status.health
+                    in {ContainerHealth.HEALTHY, ContainerHealth.NONE, ContainerHealth.UNKNOWN}
+                    and state == "running"
+                ):
                     continue
                 all_ready = False
                 break
@@ -465,7 +512,10 @@ class DockerRuntime:
         try:
             rows = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
-            raise DockerRuntimeError(f"Could not parse docker image inspect output for {image}: {exc}", result) from exc
+            raise DockerRuntimeError(
+                f"Could not parse docker image inspect output for {image}: {exc}",
+                result,
+            ) from exc
 
         row = rows[0] if rows else {}
         return DockerImageInfo(
@@ -476,14 +526,54 @@ class DockerRuntime:
             created=_optional_str(row.get("Created")),
         )
 
+    def image_exists(self, image: str) -> bool:
+        """Return true if Docker can inspect the image."""
+
+        if not image or any(ch.isspace() for ch in image):
+            raise ValueError("image must be a non-empty image reference without whitespace")
+
+        result = self._run(["docker", "image", "inspect", image], timeout=30)
+        return result.ok
+
     def load_image_archive(self, archive_path: str | Path) -> CommandResult:
-        """Load an OCI/Docker image archive into the local Docker daemon."""
+        """Load an OCI/Docker image archive into the local Docker daemon.
 
-        path = Path(archive_path)
-        if not path.exists() or not path.is_file():
-            raise FileNotFoundError(f"Image archive does not exist: {path}")
+        This intentionally does not skip if an image with the same tag already
+        exists. Loading the archive is required to replace stale local tags with
+        the verified images embedded in the imported capsule.
+        """
 
-        return self._run(["docker", "load", "--input", str(path)])
+        path = self._require_image_archive_file(archive_path)
+        return self._run(
+            ["docker", "load", "--input", str(path)],
+            timeout=self.config.image_load_timeout_seconds,
+        )
+
+    def load_image_archives(
+        self,
+        archive_paths: Iterable[str | Path],
+        *,
+        stop_on_error: bool = True,
+    ) -> tuple[DockerImageLoadResult, ...]:
+        """Load multiple OCI/Docker image archives.
+
+        The archives are loaded in caller-provided order. This method is the
+        Docker adapter primitive used by instance lifecycle code before Compose
+        startup. It returns structured results for audit/API layers.
+        """
+
+        results: list[DockerImageLoadResult] = []
+
+        for archive_path in archive_paths:
+            path = self._require_image_archive_file(archive_path)
+            command = self.load_image_archive(path)
+            result = DockerImageLoadResult(archive_path=path, command=command)
+            results.append(result)
+
+            if stop_on_error and not command.ok:
+                break
+
+        return tuple(results)
 
     def create_network(self, name: str, *, driver: str = "bridge", internal: bool = False) -> CommandResult:
         """Create a Docker network if it does not already exist."""
@@ -601,6 +691,24 @@ class DockerRuntime:
                 )
             )
 
+        if self.config.timeout_seconds <= 0:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_timeout_seconds",
+                    message="timeout_seconds must be greater than zero.",
+                    field="timeout_seconds",
+                )
+            )
+
+        if self.config.image_load_timeout_seconds <= 0:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_image_load_timeout_seconds",
+                    message="image_load_timeout_seconds must be greater than zero.",
+                    field="image_load_timeout_seconds",
+                )
+            )
+
         self._validate_docker_name(self.config.project_name, field="project_name")
 
         if not self.config.allow_outside_kx_root:
@@ -657,6 +765,26 @@ class DockerRuntime:
                     ),
                 )
             )
+
+    def _require_image_archive_file(self, archive_path: str | Path) -> Path:
+        path = Path(archive_path).expanduser().resolve()
+
+        if not path.exists():
+            raise FileNotFoundError(f"Image archive does not exist: {path}")
+
+        if not path.is_file():
+            raise FileNotFoundError(f"Image archive is not a file: {path}")
+
+        if not _has_allowed_archive_suffix(path):
+            raise ValueError(
+                "Image archive must end with one of "
+                f"{', '.join(ALLOWED_IMAGE_ARCHIVE_SUFFIXES)}: {path}"
+            )
+
+        if not self.config.allow_outside_kx_root:
+            raise_if_issues(validate_path_under_root(path, KX_ROOT))
+
+        return path
 
     def _parse_json_lines_or_array(self, stdout: str) -> list[Any]:
         text = stdout.strip()
@@ -740,6 +868,11 @@ class DockerRuntime:
             raise DockerRuntimeError(message, result)
 
 
+def _has_allowed_archive_suffix(path: Path) -> bool:
+    text = str(path).lower()
+    return any(text.endswith(suffix) for suffix in ALLOWED_IMAGE_ARCHIVE_SUFFIXES)
+
+
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -755,7 +888,9 @@ def runtime_for_instance(instance_id: str, *, project_name: str | None = None) -
 
 __all__ = [
     "DEFAULT_COMMAND_TIMEOUT_SECONDS",
+    "DEFAULT_IMAGE_LOAD_TIMEOUT_SECONDS",
     "DEFAULT_LOG_LINES",
+    "ALLOWED_IMAGE_ARCHIVE_SUFFIXES",
     "DockerComposeBinary",
     "ComposeAction",
     "ContainerHealth",
@@ -763,6 +898,7 @@ __all__ = [
     "DockerRuntimeConfig",
     "ComposeServiceStatus",
     "DockerImageInfo",
+    "DockerImageLoadResult",
     "DockerRuntimeError",
     "DockerRuntime",
     "runtime_for_instance",

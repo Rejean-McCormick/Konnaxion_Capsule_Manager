@@ -1,5 +1,4 @@
-"""
-Capsule routes for Konnaxion Capsule Manager.
+"""Capsule routes for Konnaxion Capsule Manager.
 
 The Manager is the user-facing control layer. It must not directly unpack
 capsules, load Docker images, modify firewall rules, or start runtime services.
@@ -35,6 +34,7 @@ from kx_shared.konnaxion_constants import (
     CAPSULE_EXTENSION,
     DEFAULT_CHANNEL,
     DEFAULT_EXPOSURE_MODE,
+    DEFAULT_INSTANCE_ID,
     DEFAULT_NETWORK_PROFILE,
     ExposureMode,
     NetworkProfile,
@@ -60,14 +60,26 @@ def enum_value(value: Any) -> str:
 class AgentClientProtocol(Protocol):
     """Protocol expected from ``request.app.state.agent_client``."""
 
-    async def list_capsules(self) -> list[Mapping[str, Any]]:
-        """Return imported capsule summaries."""
+    async def list_capsules(self) -> Any:
+        """Return imported/local capsule summaries."""
 
     async def get_capsule(self, capsule_id: str) -> Mapping[str, Any]:
         """Return one capsule summary/detail."""
 
-    async def verify_capsule_path(self, path: str) -> Mapping[str, Any]:
+    async def verify_capsule(self, *, capsule_path: str) -> Mapping[str, Any]:
         """Verify a capsule already available to the Agent."""
+
+    async def verify_capsule_path(self, path: str) -> Mapping[str, Any]:
+        """Compatibility method for older route/client contracts."""
+
+    async def import_capsule(
+        self,
+        *,
+        capsule_path: str,
+        instance_id: str,
+        network_profile: str,
+    ) -> Mapping[str, Any]:
+        """Import a capsule path through the Agent."""
 
     async def import_capsule_upload(
         self,
@@ -78,7 +90,7 @@ class AgentClientProtocol(Protocol):
         network_profile: str,
         exposure_mode: str,
     ) -> Mapping[str, Any]:
-        """Import an uploaded capsule through the Agent."""
+        """Compatibility method for raw upload imports."""
 
     async def delete_capsule(self, capsule_id: str) -> Mapping[str, Any]:
         """Delete or forget an imported capsule through the Agent."""
@@ -168,15 +180,13 @@ class CapsuleDeleteResponse(BaseModel):
 @router.get("", response_model=list[CapsuleSummary])
 @router.get("/", response_model=list[CapsuleSummary])
 async def list_capsules(request: Request) -> list[CapsuleSummary]:
-    """List imported Konnaxion Capsules."""
+    """List imported or locally available Konnaxion Capsules."""
 
     agent = get_agent_client(request)
     payload = await agent.list_capsules()
+    items = normalize_capsule_list_response(payload)
 
-    if not isinstance(payload, list):
-        raise agent_response_error("Agent list_capsules response must be a list.")
-
-    return [CapsuleSummary(**as_mapping(item)) for item in payload]
+    return [CapsuleSummary(**normalize_capsule_summary(item)) for item in items]
 
 
 @router.get("/{capsule_id}", response_model=CapsuleDetail)
@@ -189,8 +199,27 @@ async def get_capsule(
     capsule_id = validate_capsule_id(capsule_id)
     agent = get_agent_client(request)
 
-    payload = await agent.get_capsule(capsule_id)
-    return CapsuleDetail(**as_mapping(payload))
+    get_capsule_method = getattr(agent, "get_capsule", None)
+    if callable(get_capsule_method):
+        payload = await get_capsule_method(capsule_id)
+        return CapsuleDetail(**normalize_capsule_summary(as_mapping(payload)))
+
+    payload = await agent.list_capsules()
+    items = normalize_capsule_list_response(payload)
+
+    for item in items:
+        data = normalize_capsule_summary(item)
+        if data.get("capsule_id") == capsule_id or data.get("id") == capsule_id:
+            return CapsuleDetail(**data)
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "ok": False,
+            "error": "capsule_not_found",
+            "message": f"Capsule not found: {capsule_id}",
+        },
+    )
 
 
 @router.post("/verify", response_model=CapsuleVerifyResponse)
@@ -201,11 +230,22 @@ async def verify_capsule(
     """Verify a capsule path already available to the Agent."""
 
     agent = get_agent_client(request)
-    payload = await agent.verify_capsule_path(request_body.capsule_path)
+
+    verify_capsule_path_method = getattr(agent, "verify_capsule_path", None)
+    if callable(verify_capsule_path_method):
+        payload = await verify_capsule_path_method(request_body.capsule_path)
+    else:
+        verify_capsule_method = getattr(agent, "verify_capsule", None)
+        if not callable(verify_capsule_method):
+            raise agent_response_error("Agent client does not support capsule verification.")
+        payload = await verify_capsule_method(capsule_path=request_body.capsule_path)
 
     data = as_mapping(payload)
     data.setdefault("ok", bool(data.get("valid", False)))
     data.setdefault("valid", bool(data.get("ok", False)))
+
+    if data.get("filename") is None:
+        data["filename"] = Path(request_body.capsule_path).name
 
     return CapsuleVerifyResponse(**data)
 
@@ -224,27 +264,56 @@ async def import_capsule(
             "Content-Disposition filename is provided."
         ),
     ),
+    capsule_path: str | None = Query(
+        default=None,
+        description="Existing local capsule path. If provided, raw upload body is optional.",
+    ),
+    instance_id: str = Query(default=enum_value(DEFAULT_INSTANCE_ID)),
     channel: str = Query(default=DEFAULT_CHANNEL),
     network_profile: str = Query(default=enum_value(DEFAULT_NETWORK_PROFILE)),
     exposure_mode: str = Query(default=enum_value(DEFAULT_EXPOSURE_MODE)),
 ) -> CapsuleImportResponse:
     """
-    Import an uploaded signed `.kxcap` through the Agent.
+    Import a signed `.kxcap` through the Agent.
 
-    The request body must be the raw `.kxcap` bytes.
+    Supported forms:
+    1. Existing path: POST /capsules/import?capsule_path=C:/.../file.kxcap
+    2. Raw upload body with filename metadata.
 
-    Filename resolution order:
+    Filename resolution order for raw uploads:
     1. `filename` query parameter
     2. `X-KX-Filename` request header
     3. `Content-Disposition` filename
     """
 
-    resolved_filename = resolve_upload_filename(request, filename)
-    validate_capsule_filename(resolved_filename)
-
     normalized_channel = validate_channel(channel)
     normalized_network_profile = validate_network_profile(network_profile)
     normalized_exposure_mode = validate_exposure_mode(exposure_mode)
+    normalized_instance_id = validate_capsule_id(instance_id)
+
+    agent = get_agent_client(request)
+
+    if capsule_path:
+        path = validate_capsule_path_string(capsule_path)
+
+        import_capsule_method = getattr(agent, "import_capsule", None)
+        if not callable(import_capsule_method):
+            raise agent_response_error("Agent client does not support capsule import.")
+
+        payload = await import_capsule_method(
+            capsule_path=path,
+            instance_id=normalized_instance_id,
+            network_profile=normalized_network_profile,
+        )
+
+        return build_import_response(
+            payload,
+            default_capsule_id=Path(path).stem,
+            default_filename=Path(path).name,
+        )
+
+    resolved_filename = resolve_upload_filename(request, filename)
+    resolved_filename = validate_capsule_filename(resolved_filename)
 
     content = await request.body()
     if not content:
@@ -257,24 +326,33 @@ async def import_capsule(
             },
         )
 
-    agent = get_agent_client(request)
+    import_capsule_upload_method = getattr(agent, "import_capsule_upload", None)
+    if callable(import_capsule_upload_method):
+        payload = await import_capsule_upload_method(
+            filename=resolved_filename,
+            content=content,
+            channel=normalized_channel,
+            network_profile=normalized_network_profile,
+            exposure_mode=normalized_exposure_mode,
+        )
 
-    payload = await agent.import_capsule_upload(
-        filename=resolved_filename,
-        content=content,
-        channel=normalized_channel,
-        network_profile=normalized_network_profile,
-        exposure_mode=normalized_exposure_mode,
+        return build_import_response(
+            payload,
+            default_capsule_id=Path(resolved_filename).stem,
+            default_filename=resolved_filename,
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "ok": False,
+            "error": "raw_upload_import_not_supported",
+            "message": (
+                "The current Agent client does not support raw capsule upload import. "
+                "Build the capsule to disk and call /capsules/import with capsule_path."
+            ),
+        },
     )
-
-    data = as_mapping(payload)
-    data.setdefault("ok", True)
-    data.setdefault("message", "Capsule import accepted.")
-
-    if data.get("capsule") is not None and not isinstance(data["capsule"], CapsuleSummary):
-        data["capsule"] = CapsuleSummary(**as_mapping(data["capsule"]))
-
-    return CapsuleImportResponse(**data)
 
 
 @router.delete("/{capsule_id}", response_model=CapsuleDeleteResponse)
@@ -282,12 +360,23 @@ async def delete_capsule(
     capsule_id: str,
     request: Request,
 ) -> CapsuleDeleteResponse:
-    """Delete or forget an imported capsule through the Agent."""
+    """Delete or forget an imported capsule through the Agent if supported."""
 
     capsule_id = validate_capsule_id(capsule_id)
     agent = get_agent_client(request)
 
-    payload = await agent.delete_capsule(capsule_id)
+    delete_capsule_method = getattr(agent, "delete_capsule", None)
+    if not callable(delete_capsule_method):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "ok": False,
+                "error": "delete_capsule_not_supported",
+                "message": "The current Agent client does not support capsule deletion.",
+            },
+        )
+
+    payload = await delete_capsule_method(capsule_id)
     data = as_mapping(payload)
 
     data.setdefault("ok", True)
@@ -316,6 +405,105 @@ def get_agent_client(request: Request) -> AgentClientProtocol:
         )
 
     return agent
+
+
+def normalize_capsule_list_response(payload: Any) -> list[dict[str, Any]]:
+    """Accept both list and wrapper-object capsule inventory responses."""
+
+    if isinstance(payload, list):
+        return [as_mapping(item) for item in payload]
+
+    if isinstance(payload, Mapping):
+        data = dict(payload)
+
+        for key in ("capsules", "items", "results"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [as_mapping(item) for item in value]
+
+        nested_data = data.get("data")
+        if isinstance(nested_data, list):
+            return [as_mapping(item) for item in nested_data]
+
+        if isinstance(nested_data, Mapping):
+            for key in ("capsules", "items", "results"):
+                value = nested_data.get(key)
+                if isinstance(value, list):
+                    return [as_mapping(item) for item in value]
+
+    raise agent_response_error(
+        "Agent list_capsules response must be a list or an object containing capsules/items."
+    )
+
+
+def normalize_capsule_summary(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize varied capsule inventory keys into CapsuleSummary fields."""
+
+    data = dict(item)
+
+    capsule_id = (
+        data.get("capsule_id")
+        or data.get("id")
+        or data.get("name")
+        or data.get("capsule_name")
+    )
+
+    filename = data.get("filename")
+    path_value = data.get("path") or data.get("capsule_file") or data.get("capsule_path")
+
+    if not capsule_id and filename:
+        capsule_id = Path(str(filename)).stem
+
+    if not capsule_id and path_value:
+        capsule_id = Path(str(path_value)).stem
+
+    if not filename and path_value:
+        filename = Path(str(path_value)).name
+
+    if not capsule_id:
+        raise agent_response_error("Capsule summary is missing capsule_id/id/name.")
+
+    data["capsule_id"] = str(capsule_id)
+    data.setdefault("filename", str(filename) if filename else None)
+    data.setdefault("verified", bool(data.get("valid", data.get("verified", False))))
+
+    return data
+
+
+def build_import_response(
+    payload: Any,
+    *,
+    default_capsule_id: str,
+    default_filename: str,
+) -> CapsuleImportResponse:
+    """Normalize Agent import response into CapsuleImportResponse."""
+
+    data = as_mapping(payload)
+    data.setdefault("ok", True)
+    data.setdefault("message", "Capsule import accepted.")
+
+    capsule_data: dict[str, Any] | None = None
+
+    if isinstance(data.get("capsule"), BaseModel):
+        capsule_data = data["capsule"].model_dump(mode="json")
+    elif isinstance(data.get("capsule"), Mapping):
+        capsule_data = dict(data["capsule"])
+    else:
+        capsule_data = {
+            "capsule_id": data.get("capsule_id") or default_capsule_id,
+            "capsule_version": data.get("capsule_version"),
+            "app_version": data.get("app_version"),
+            "channel": data.get("channel"),
+            "filename": data.get("filename") or default_filename,
+            "verified": bool(data.get("valid", data.get("verified", True))),
+        }
+
+    capsule_data = normalize_capsule_summary(capsule_data)
+
+    data["capsule"] = CapsuleSummary(**capsule_data)
+    data.setdefault("capsule_id", capsule_data["capsule_id"])
+
+    return CapsuleImportResponse(**data)
 
 
 def resolve_upload_filename(request: Request, explicit_filename: str | None) -> str:
@@ -394,6 +582,44 @@ def validate_capsule_filename(filename: str) -> str:
         )
 
     return basename
+
+
+def validate_capsule_path_string(value: str) -> str:
+    """Validate an existing capsule path string."""
+
+    normalized = value.strip()
+
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_capsule_path",
+                "message": "Capsule path cannot be empty.",
+            },
+        )
+
+    if Path(normalized).suffix != CAPSULE_EXTENSION:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "invalid_capsule_extension",
+                "message": f"Capsule path must end with {CAPSULE_EXTENSION}.",
+            },
+        )
+
+    if "\x00" in normalized:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "ok": False,
+                "error": "unsafe_capsule_path",
+                "message": "Capsule path contains a forbidden token.",
+            },
+        )
+
+    return normalized
 
 
 def validate_capsule_id(capsule_id: str) -> str:
@@ -514,16 +740,20 @@ __all__ = [
     "CapsuleVerifyResponse",
     "agent_response_error",
     "as_mapping",
+    "build_import_response",
     "delete_capsule",
     "enum_value",
     "get_agent_client",
     "get_capsule",
     "import_capsule",
     "list_capsules",
+    "normalize_capsule_list_response",
+    "normalize_capsule_summary",
     "resolve_upload_filename",
     "router",
     "validate_capsule_filename",
     "validate_capsule_id",
+    "validate_capsule_path_string",
     "validate_channel",
     "validate_exposure_mode",
     "validate_network_profile",
