@@ -227,7 +227,6 @@ ROLLBACKABLE_STATES: Final[frozenset[InstanceState]] = frozenset(
         InstanceState.DEGRADED,
         InstanceState.FAILED,
         InstanceState.UPDATING,
-        InstanceState.READY,
     }
 )
 
@@ -266,7 +265,7 @@ def can_transition(
 
     current = normalize_state(current_state)
     requested = normalize_state(requested_state)
-    return requested == current or requested in ALLOWED_TRANSITIONS[current]
+    return requested in ALLOWED_TRANSITIONS[current]
 
 
 def require_transition(
@@ -606,4 +605,3 @@ __all__ = [
     "require_transition",
     "state_after_security_gate",
 ]
-

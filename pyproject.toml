@@ -165,3 +165,8 @@ source = [
 show_missing = true
 skip_covered = true
 fail_under = 80
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+]
