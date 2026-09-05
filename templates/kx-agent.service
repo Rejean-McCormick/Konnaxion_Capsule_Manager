@@ -1,0 +1,37 @@
+[Unit]
+Description=Konnaxion Agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=kx-agent
+Group=kx-agent
+SupplementaryGroups=docker
+Environment=KX_AGENT_HOST=127.0.0.1
+Environment=KX_AGENT_PORT=8765
+Environment=KX_CAPSULE_PUBLIC_KEY_FILE=/opt/konnaxion/agent/keys/capsule-signing-public.pem
+ExecStart=/opt/konnaxion/venv/bin/kx-agent
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0027
+
+# The dedicated kx-agent service account is the privileged Docker boundary.
+# Human/operator accounts remain outside the docker group.
+# Agent needs controlled access to Docker and Konnaxion state.
+ReadWritePaths=/opt/konnaxion /var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

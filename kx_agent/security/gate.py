@@ -1528,6 +1528,7 @@ def context_from_compose(
     admin_surface_private: bool = True,
     postgres_public: bool = False,
     redis_public: bool = False,
+    allowed_images: Iterable[str] | None = None,
     policy: SecurityGatePolicy | None = None,
 ) -> SecurityGateContext:
     """
@@ -1575,6 +1576,7 @@ def context_from_compose(
         admin_surface_private=admin_surface_private,
         postgres_public=postgres_public,
         redis_public=redis_public,
+        allowed_images=frozenset(allowed_images) if allowed_images is not None else DEFAULT_ALLOWED_IMAGES,
         policy=policy or SecurityGatePolicy.from_env(hydrated_env),
         metadata=metadata,
     )

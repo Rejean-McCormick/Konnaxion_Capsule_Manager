@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 import hashlib
+import os
 import shutil
 import subprocess
 import tarfile
@@ -144,6 +145,8 @@ class CapsuleVerificationOptions:
     validate_manifest_schema: bool = True
     allow_unknown_services: bool = False
     allow_outside_kx_root: bool = False
+    trusted_public_key_file: Path | None = None
+    require_cryptographic_signature: bool = False
 
 
 @dataclass(frozen=True)
@@ -553,9 +556,40 @@ class CapsuleVerifier:
                 )
             )
 
-        # Cryptographic signature verification belongs to signature.py, where the
-        # project can choose minisign, cosign, OpenSSL, age, or Ed25519 bindings.
-        # This verifier enforces the signed-capsule boundary by default.
+        if present:
+            # Reject placeholders/malformed detached signatures even when the
+            # trusted public key is not available in this structural verifier.
+            try:
+                from kx_agent.capsules.signature import (
+                    SignatureEnvelope,
+                    verify_capsule_signature,
+                )
+
+                SignatureEnvelope.from_file(signature_path)
+
+                key_value = (
+                    str(self.options.trusted_public_key_file)
+                    if self.options.trusted_public_key_file is not None
+                    else os.getenv("KX_CAPSULE_PUBLIC_KEY_FILE", "").strip()
+                )
+                if key_value:
+                    verify_capsule_signature(root, Path(key_value))
+                elif self.options.require_cryptographic_signature:
+                    raise ValueError(
+                        "trusted capsule public key is required for cryptographic verification"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                issues.append(
+                    ValidationIssue(
+                        code="invalid_capsule_signature_envelope",
+                        message=(
+                            "Capsule signature cryptographic verification failed: "
+                            f"{exc}"
+                        ),
+                        field="signature.sig",
+                    )
+                )
+
         return present
 
     def _verify_checksums(self, root: Path, issues: list[ValidationIssue]) -> int:

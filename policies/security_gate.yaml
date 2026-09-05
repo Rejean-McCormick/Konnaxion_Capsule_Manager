@@ -4,9 +4,17 @@ app_version: v14
 param_version: kx-param-2026.04.30
 policy_id: konnaxion-security-gate-default
 default_status_on_error: FAIL_BLOCKING
+unknown_is_blocking: true
 private_by_default: true
 deny_by_default: true
 signed_capsules_only: true
+trusted_capsule_public_key:
+  env: KX_CAPSULE_PUBLIC_KEY_FILE
+  default_path: /opt/konnaxion/agent/keys/capsule-signing-public.pem
+security_evidence_export:
+  path: /opt/konnaxion/instances/<INSTANCE_ID>/state/security-gate.json
+  required_before_start: true
+  contains_secrets: false
 network_defaults:
   network_profile: intranet_private
   exposure_mode: private

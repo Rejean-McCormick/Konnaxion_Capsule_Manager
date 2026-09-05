@@ -1234,6 +1234,10 @@ def handle_security_check(request: ActionRequest) -> ActionResult:
         is_security_gate_passing,
         run_security_gate,
     )
+    from kx_agent.security.evidence import (
+        collect_runtime_security_evidence,
+        write_security_gate_evidence,
+    )
 
     runtime = runtime_for_instance(instance_id)
     compose_file = runtime.config.compose_file
@@ -1273,18 +1277,27 @@ def handle_security_check(request: ActionRequest) -> ActionResult:
     env = dict(inputs.get("env") or {})
     env_validation = dict(inputs.get("env_validation") or {})
 
+    runtime_evidence = collect_runtime_security_evidence(
+        instance_id=instance_id,
+        capsule_id=capsule_id,
+        compose=loaded_compose,
+        manifest=manifest,
+        env=env,
+    )
+
     context = context_from_compose(
         instance_id=instance_id,
         compose=loaded_compose,
         manifest=manifest,
         env=env,
-        capsule_signature_verified=True,
-        image_checksums_verified=True,
-        firewall_enabled=True,
-        backup_configured=True,
-        admin_surface_private=True,
-        postgres_public=False,
-        redis_public=False,
+        capsule_signature_verified=runtime_evidence.capsule_signature_verified,
+        image_checksums_verified=runtime_evidence.image_checksums_verified,
+        firewall_enabled=runtime_evidence.firewall_enabled,
+        backup_configured=runtime_evidence.backup_configured,
+        admin_surface_private=runtime_evidence.admin_surface_private,
+        postgres_public=runtime_evidence.postgres_public,
+        redis_public=runtime_evidence.redis_public,
+        allowed_images=runtime_evidence.allowed_images,
     )
 
     report = run_security_gate(context)
@@ -1308,8 +1321,52 @@ def handle_security_check(request: ActionRequest) -> ActionResult:
         "env_loaded": bool(env),
         "env_keys": sorted(str(key) for key in env),
         "env_validation": env_validation,
+        "runtime_evidence": dict(runtime_evidence.details),
         "report": data,
     }
+
+    try:
+        evidence_file = write_security_gate_evidence(
+            instance_id,
+            {
+                "instance_id": instance_id,
+                "capsule_id": capsule_id,
+                "security_status": status_value,
+                "status": status_value,
+                "compose_file": str(compose_file),
+                "results": [
+                    {
+                        "check": item.get("check"),
+                        "status": item.get("status"),
+                        "message": item.get("message", ""),
+                        "blocking": bool(item.get("blocking", False)),
+                    }
+                    for item in (data.get("results") or data.get("checks") or [])
+                    if isinstance(item, Mapping)
+                ],
+                "blocking_failures": [
+                    str(item.get("check") or item) if isinstance(item, Mapping) else str(item)
+                    for item in (data.get("blocking_failures") or [])
+                ],
+                "warnings": [
+                    str(item.get("check") or item) if isinstance(item, Mapping) else str(item)
+                    for item in (data.get("warnings") or [])
+                ],
+                "runtime_evidence": dict(runtime_evidence.details),
+            },
+        )
+        result_data["security_evidence_file"] = str(evidence_file)
+    except Exception as exc:  # noqa: BLE001
+        result_data["security_evidence_error"] = f"{type(exc).__name__}: {exc}"
+        if blocking:
+            return ActionResult(
+                action=request.normalized_action(),
+                status=ActionStatus.BLOCKED,
+                request_id=request.request_id,
+                message="Security Gate evidence could not be persisted.",
+                data=result_data,
+                error={"message": "Security Gate evidence could not be persisted."},
+            )
 
     if blocking and not ok:
         return ActionResult(

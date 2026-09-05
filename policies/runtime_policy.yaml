@@ -258,3 +258,16 @@ enforcement:
   reject_on_forbidden_mount: true
   reject_on_dangerous_container_feature: true
   reject_unsigned_capsules: true
+
+agent_boundary:
+  local_bind_only: true
+  allowed_bind_hosts:
+    - 127.0.0.1
+    - ::1
+  default_port: 8765
+  bearer_token_required: true
+  token_mode_max: "0640"
+  normal_users_in_docker_group_allowed: false
+  arbitrary_shell_allowed: false
+  arbitrary_docker_allowed: false
+  security_evidence_required: true

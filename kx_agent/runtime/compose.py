@@ -1533,11 +1533,32 @@ def validate_compose_spec(compose: Mapping[str, Any]) -> None:
         if service.get("network_mode") == "host":
             raise ComposeValidationError(f"service {service_name} must not use host networking")
 
+        if str(service.get("pid") or "").lower() == "host":
+            raise ComposeValidationError(f"service {service_name} must not use host PID namespace")
+
+        if str(service.get("ipc") or "").lower() == "host":
+            raise ComposeValidationError(f"service {service_name} must not use host IPC namespace")
+
         for volume in service.get("volumes", []) or []:
-            volume_text = str(volume)
-            if "/var/run/docker.sock" in volume_text or "/run/docker.sock" in volume_text:
+            if isinstance(volume, Mapping):
+                source = str(volume.get("source") or "").strip()
+            else:
+                volume_text = str(volume)
+                source = volume_text.split(":", 1)[0].strip()
+
+            lowered = source.lower()
+            if lowered in {"/var/run/docker.sock", "/run/docker.sock"}:
                 raise ComposeValidationError(
                     f"service {service_name} must not mount Docker socket"
+                )
+
+            # Named volumes are allowed. Absolute host bind mounts must stay
+            # inside the canonical Konnaxion root.
+            if source.startswith("/") and not (
+                source == "/opt/konnaxion" or source.startswith("/opt/konnaxion/")
+            ):
+                raise ComposeValidationError(
+                    f"service {service_name} uses forbidden host bind mount: {source}"
                 )
 
         ports = service.get("ports", []) or []

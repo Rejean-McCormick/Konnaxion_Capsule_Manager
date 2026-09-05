@@ -241,6 +241,11 @@ def validate_config(config: AgentRuntimeConfig) -> None:
     if not config.host:
         raise AgentStartupError("KX_AGENT_HOST cannot be empty.")
 
+    if config.host not in {"127.0.0.1", "::1", "localhost"}:
+        raise AgentStartupError(
+            "Konnaxion Agent is local-only; KX_AGENT_HOST must be loopback."
+        )
+
     if not 1 <= config.port <= 65535:
         raise AgentStartupError("KX_AGENT_PORT must be between 1 and 65535.")
 
