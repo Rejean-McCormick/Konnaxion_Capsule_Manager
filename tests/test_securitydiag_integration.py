@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from kx_agent import main as agent_main
+from kx_agent.runtime.compose import ComposeValidationError, validate_compose_spec
 from kx_agent.security import evidence
 from kx_agent.security.gate import context_from_compose, run_security_gate
 
@@ -83,7 +85,10 @@ def test_runtime_exposure_detects_internal_published_port() -> None:
     assert details["postgres_ports"]
 
 
-def test_security_gate_evidence_redacts_secret_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_security_gate_evidence_redacts_secret_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = tmp_path / "security-gate.json"
     monkeypatch.setattr(evidence, "instance_security_gate_file", lambda _: target)
     evidence.write_security_gate_evidence(
@@ -95,32 +100,65 @@ def test_security_gate_evidence_redacts_secret_keys(tmp_path: Path, monkeypatch:
     assert "<REDACTED>" in text
 
 
-def test_security_gate_evidence_is_non_secret_and_restricted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_security_gate_evidence_is_non_secret_and_restricted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = tmp_path / "security-gate.json"
     monkeypatch.setattr(evidence, "instance_security_gate_file", lambda _: target)
+
     path = evidence.write_security_gate_evidence(
         "demo",
-        {"status": "PASS", "results": [{"check": "capsule_signature", "status": "PASS"}]},
+        {
+            "status": "PASS",
+            "results": [
+                {
+                    "check": "capsule_signature",
+                    "status": "PASS",
+                }
+            ],
+        },
     )
+
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["schema"] == "kx-security-gate-evidence/v1"
     assert data["status"] == "PASS"
-    assert path.stat().st_mode & 0o777 == 0o640
 
-from kx_agent.runtime.compose import ComposeValidationError, validate_compose_spec
+    # POSIX permissions are meaningful on Linux/macOS only.
+    # Windows does not expose Unix permission bits consistently through stat().
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o640
 
 
 def _valid_compose_for_policy() -> dict:
     services = {
-        "traefik": {"image": "traefik:v3.1", "ports": ["80:80", "443:443"]},
-        "frontend-next": {"image": "konnaxion/frontend-next:v14"},
-        "django-api": {"image": "konnaxion/django-api:v14"},
-        "postgres": {"image": "postgres:16"},
-        "redis": {"image": "redis:7"},
-        "celeryworker": {"image": "konnaxion/django-api:v14"},
-        "celerybeat": {"image": "konnaxion/django-api:v14"},
-        "media-nginx": {"image": "nginx:1.27"},
+        "traefik": {
+            "image": "traefik:v3.1",
+            "ports": ["80:80", "443:443"],
+        },
+        "frontend-next": {
+            "image": "konnaxion/frontend-next:v14",
+        },
+        "django-api": {
+            "image": "konnaxion/django-api:v14",
+        },
+        "postgres": {
+            "image": "postgres:16",
+        },
+        "redis": {
+            "image": "redis:7",
+        },
+        "celeryworker": {
+            "image": "konnaxion/django-api:v14",
+        },
+        "celerybeat": {
+            "image": "konnaxion/django-api:v14",
+        },
+        "media-nginx": {
+            "image": "nginx:1.27",
+        },
     }
+
     return {
         "services": services,
         "networks": {
@@ -134,6 +172,7 @@ def _valid_compose_for_policy() -> dict:
 def test_compose_policy_rejects_host_pid_namespace() -> None:
     compose = _valid_compose_for_policy()
     compose["services"]["django-api"]["pid"] = "host"
+
     with pytest.raises(ComposeValidationError, match="host PID"):
         validate_compose_spec(compose)
 
@@ -141,5 +180,6 @@ def test_compose_policy_rejects_host_pid_namespace() -> None:
 def test_compose_policy_rejects_host_bind_outside_konnaxion_root() -> None:
     compose = _valid_compose_for_policy()
     compose["services"]["django-api"]["volumes"] = ["/etc:/host-etc:ro"]
+
     with pytest.raises(ComposeValidationError, match="forbidden host bind mount"):
         validate_compose_spec(compose)
